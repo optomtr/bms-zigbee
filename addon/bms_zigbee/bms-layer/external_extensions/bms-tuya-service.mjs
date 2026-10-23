@@ -109,7 +109,14 @@ export default class BmsTuyaService {
         this.eventBus.onDeviceMessage(this, (data) => this.onDeviceMessage(data));
         // После интервью известны производитель и описание. deviceJoined не слушаем: он приходит до
         // интервью, производителя ещё нет, а за ним всё равно идёт интервью.
-        this.eventBus.onDeviceInterview(this, (data) => (data.status === "successful" ? this.sendMagicPacket(data.device) : undefined));
+        // «Интервью успешно» приходит один раз на интервью: от zigbee-herdsman после подключения неопрошенного
+        // устройства (controller.ts:896) и после повторного интервью по запросу (Z2M model/device.ts:86).
+        // Повторное подключение опрошенного устройства его не даёт (controller.ts:902 — интервью не запускается).
+        this.eventBus.onDeviceInterview(this, async (data) => {
+            if (data.status !== "successful") return;
+            await this.sendMagicPacket(data.device);
+            await this.clearForeignGroups(data.device);
+        });
         // Повторное подключение известного устройства: интервью уже не будет, пакет шлём здесь.
         this.eventBus.onDeviceAnnounce(this, (data) => (data.device.interviewed ? this.sendMagicPacket(data.device) : undefined));
         this.eventBus.onMQTTMessage(this, (data) => this.onMqttMessage(data));
@@ -190,6 +197,40 @@ export default class BmsTuyaService {
         } catch (error) {
             // Спящее устройство может не ответить на чтение — это не авария, при следующем объявлении повторим.
             this.logger.warning(`Магический пакет Tuya для '${device.name}' не прошёл (${error.message})`, NS);
+        }
+    }
+
+    /**
+     * Хаб Tuya оставляет на устройстве свои записи в таблице групп, и с ними genGroups.add от Z2M таймаутит
+     * (живая сеть: 2 из 18 TS0502B, перенесённых с хаба; помог remove_all). Чистим таблицу после интервью,
+     * но только если по базе Z2M устройство не входит ни в одну группу: настроенные владельцем группы не трогаем.
+     */
+    async clearForeignGroups(device) {
+        if (!isTuyaMaker(device)) return;
+        const endpoints = device.zh.endpoints;
+        const has = (clusters, name) => clusters.some((c) => c.name === name);
+        // Пульт и кнопка сцен сами шлют вкл/выкл (клиентский genOnOff): их группы — в таблице привязок, а не в членстве.
+        if (endpoints.some((e) => has(e.getOutputClusters(), "genOnOff"))) return;
+        // Членство — как его видит Z2M: группы базы zigbee-herdsman и их участники (lib/zigbee.ts:400, model/group.ts:32).
+        for (const _group of this.zigbee.groupsIterator((g) => g.members.some((e) => e.deviceIeeeAddress === device.zh.ieeeAddr))) {
+            this.logger.debug(`BMS: '${device.name}' уже в группе Z2M — таблицу групп не трогаем`, NS);
+            return;
+        }
+        // Только серверный genGroups: у endpoint без него таблицы групп нет.
+        const targets = endpoints.filter((e) => has(e.getInputClusters(), "genGroups"));
+        const cleared = [];
+        for (const endpoint of targets) {
+            try {
+                // Та же команда, что шлёт Z2M на remove_all (endpoint.removeFromAllGroups), но без правки базы групп:
+                // базу не трогаем вовсе, даже если владелец добавит устройство в группу, пока команда в пути.
+                await endpoint.command("genGroups", "removeAll", {}, {disableDefaultResponse: true});
+                cleared.push(endpoint.ID);
+            } catch (error) {
+                this.logger.warning(`BMS: таблицу групп на '${device.name}' (endpoint ${endpoint.ID}) очистить не удалось: ${error.message}`, NS);
+            }
+        }
+        if (cleared.length > 0) {
+            this.logger.info(`BMS: очищена таблица групп на '${device.name}' (endpoint ${cleared.join(", ")}) — старые записи хаба Tuya, в группах Z2M устройства нет`, NS);
         }
     }
 }

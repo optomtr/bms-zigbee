@@ -30,6 +30,9 @@ const DEVICES = {
     known_bab: {ieee: "0x00000000000000a3", manufacturerName: "_TZE204_g2ki0ejr"},
     // У converters для этого отпечатка своё описание (SMART-HEAT10) — YAML должен его перекрыть.
     overridden: {ieee: "0x00000000000000a4", manufacturerName: "_TZE200_8daqwrsj"},
+    // Контроллеры света как TS0502B с хаба Tuya: серверный genGroups на endpoint 1; второй уже в группе Z2M.
+    tuya_light: {ieee: "0x00000000000000a5", manufacturerName: "_TZ3210_bmslight", modelID: "TS0502B", type: "Router", endpoints: [{ID: 1, input: ["genBasic", "genGroups", "genOnOff", "lightingColorCtrl"]}]},
+    tuya_light_grouped: {ieee: "0x00000000000000a6", manufacturerName: "_TZ3210_bmslight", modelID: "TS0502B", type: "Router", endpoints: [{ID: 1, input: ["genBasic", "genGroups", "genOnOff", "lightingColorCtrl"]}]},
 };
 
 // Папка данных как у дополнения, но ссылку node_modules не кладём: её должен сделать сам Z2M.
@@ -60,8 +63,11 @@ const ext = (name) => requireZ2M(`./dist/extension/${name}.js`).default;
 
 const eventBus = new EventBus();
 const coordinatorEndpoint = {ID: 1};
-const devices = Object.entries(DEVICES).map(([, d]) => new Device(new ZhDevice({ieeeAddr: d.ieee, manufacturerName: d.manufacturerName})));
+const devices = Object.entries(DEVICES).map(([, {ieee, ...d}]) => new Device(new ZhDevice({ieeeAddr: ieee, ...d})));
 const dev = (name) => devices.find((d) => d.name === name);
+const Group = requireZ2M("./dist/model/group.js").default;
+// Группы базы zigbee-herdsman (zh.Group: groupID + участники-endpoint); обёртка — настоящая Group из Z2M.
+const zhGroups = [{groupID: 5, members: [dev("tuya_light_grouped").zh.endpoints[0]]}];
 const zigbee = {
     async resolveDevicesDefinitions(ignoreCache) {
         for (const d of devices) await d.resolveDefinition(ignoreCache);
@@ -72,6 +78,10 @@ const zigbee = {
         return {ID: id, entity, endpointID: undefined, endpoint: entity?.endpoint()};
     },
     firstCoordinatorEndpoint: () => coordinatorEndpoint,
+    // Как lib/zigbee.ts:400: предикат получает zh.Group, наружу — Group из Z2M.
+    *groupsIterator(predicate = () => true) {
+        for (const g of zhGroups.filter(predicate)) yield new Group(g, (ieee) => zigbee.resolveEntity(ieee));
+    },
     *devicesIterator() {
         yield* devices;
     },
@@ -164,4 +174,17 @@ test("магический пакет после интервью: неопис�
     const reads = (name) => dev(name).zh.endpoints[0].reads.filter((r) => r.cluster === "genBasic" && r.attributes.includes(0xfffe));
     assert.equal(reads("unknown_tze").length, 1);
     assert.equal(reads("yaml_curtain").length, 0);
+});
+
+test("таблица групп после интервью: устройству Tuya без групп — removeAll и строка BMS, состоящему в группе — ничего", async () => {
+    eventBus.emitDeviceInterview({device: dev("tuya_light"), status: "successful"});
+    eventBus.emitDeviceInterview({device: dev("tuya_light_grouped"), status: "successful"});
+    eventBus.emitDeviceAnnounce({device: dev("tuya_light_grouped")});
+    await settle();
+    const removeAll = (name) => sent(name, "removeAll").filter((s) => s.cluster === "genGroups");
+    assert.equal(removeAll("tuya_light").length, 1);
+    assert.equal(removeAll("tuya_light_grouped").length, 0);
+    const lines = log.filter((l) => l.namespace === "bms:tuya" && l.message.startsWith("BMS: ")).map((l) => `${l.level} ${l.message}`);
+    assert.ok(lines.includes("info BMS: очищена таблица групп на 'tuya_light' (endpoint 1) — старые записи хаба Tuya, в группах Z2M устройства нет"), lines.join("\n"));
+    assert.ok(lines.some((l) => /^debug BMS: 'tuya_light_grouped' уже в группе Z2M/.test(l)), lines.join("\n"));
 });

@@ -49,13 +49,18 @@ export function captureZhcLog() {
 
 // Имена классов важны: converters различают сущности по constructor.name (utils.isDevice / isEndpoint).
 export class Endpoint {
-    constructor(device, ID = 1) {
+    /** input / output — имена серверных и клиентских кластеров, как их отдаёт zigbee-herdsman. */
+    constructor(device, ID = 1, {input = [], output = []} = {}) {
         this.ID = ID;
         this.deviceIeeeAddress = device.ieeeAddr;
         this.sent = [];
         this.reads = [];
+        this.input = input;
+        this.output = output;
+        this.failOn = undefined; // имя команды, на которой «устройство не отвечает»
     }
     async command(cluster, command, payload) {
+        if (command === this.failOn) throw new Error(`Timeout - ${this.deviceIeeeAddress}, ${this.ID}, ${cluster}.${command}`);
         this.sent.push({cluster, command, payload});
     }
     async read(cluster, attributes) {
@@ -63,17 +68,23 @@ export class Endpoint {
         return {};
     }
     getInputClusters() {
-        return [];
+        return this.input.map((name) => ({name}));
+    }
+    supportsInputCluster(name) {
+        return this.input.includes(name);
+    }
+    supportsOutputCluster(name) {
+        return this.output.includes(name);
     }
     getOutputClusters() {
-        return [];
+        return this.output.map((name) => ({name}));
     }
 }
 
 export class Device {
-    constructor({ieeeAddr, manufacturerName, modelID = "TS0601", type = "EndDevice"}) {
+    constructor({ieeeAddr, manufacturerName, modelID = "TS0601", type = "EndDevice", endpoints = [{ID: 1}]}) {
         Object.assign(this, {ieeeAddr, manufacturerName, modelID, type, interviewState: "SUCCESSFUL", meta: {}, customClusters: {}});
-        this.endpoints = [new Endpoint(this)];
+        this.endpoints = endpoints.map(({ID, ...clusters}) => new Endpoint(this, ID, clusters));
     }
     getEndpoint(ID) {
         return this.endpoints.find((e) => e.ID === ID);
@@ -84,11 +95,12 @@ export class Device {
 
 let ieee = 0;
 /** Устройство так, как его видит расширение Z2M (lib/model/device.ts): zh, definition, options, isSupported. */
-export async function z2mDevice(manufacturerName, {modelID = "TS0601", options = {}, definition} = {}) {
-    const zh = new Device({ieeeAddr: `0x00000000000000${(++ieee).toString(16).padStart(2, "0")}`, manufacturerName, modelID});
+export async function z2mDevice(manufacturerName, {modelID = "TS0601", options = {}, definition, endpoints, type} = {}) {
+    const zh = new Device({ieeeAddr: `0x00000000000000${(++ieee).toString(16).padStart(2, "0")}`, manufacturerName, modelID, endpoints, type});
     const def = definition === undefined ? await zhc.findByDevice(zh, true) : definition;
     return {
         zh,
+        ieeeAddr: zh.ieeeAddr,
         definition: def,
         options,
         name: `dev${ieee}`,

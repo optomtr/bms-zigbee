@@ -12,12 +12,19 @@ const noop = async () => {};
 const JAN_2000 = Date.UTC(2000, 0, 1);
 let seq = 1;
 
-async function start(devices = []) {
+/** groups — группы базы zigbee-herdsman ({groupID, members: [endpoint]}); groupsIterator — как lib/zigbee.ts:400. */
+async function start(devices = [], groups = []) {
     const bus = fakeBus();
     const log = fakeLogger();
     const published = [];
     const byName = new Map(devices.map((d) => [d.name, d]));
-    const zigbee = {resolveEntity: (name) => byName.get(name), firstCoordinatorEndpoint: () => ({ID: 1})};
+    const zigbee = {
+        resolveEntity: (name) => byName.get(name),
+        firstCoordinatorEndpoint: () => ({ID: 1}),
+        *groupsIterator(predicate = () => true) {
+            yield* groups.filter(predicate);
+        },
+    };
     const settings = {get: () => ({mqtt: {base_topic: "zigbee2mqtt"}})};
     const service = new Service(zigbee, {}, {}, async (d, payload) => published.push({name: d.name, payload}), bus, noop, noop, noop, settings, log);
     await service.start();
@@ -260,4 +267,63 @@ test("магический пакет: шлём, только если опис�
     await bus.h.deviceAnnounce({device: fresh});
     await bus.h.deviceInterview({device: fresh, status: "failed"});
     assert.equal(fresh.zh.endpoints[0].reads.length, 0);
+});
+
+// Контроллер света, как TS0502B: серверный genGroups на endpoint 1 и 2, у 242 (Green Power) его нет.
+const LIGHT = [
+    {ID: 1, input: ["genBasic", "genIdentify", "genGroups", "genScenes", "genOnOff", "genLevelCtrl", "lightingColorCtrl"], output: ["genOta", "genTime"]},
+    {ID: 2, input: ["genGroups", "genOnOff"]},
+    {ID: 242, output: ["greenPower"]},
+];
+const light = (manufacturerName = "_TZ3210_bmslight", options = {}) => z2mDevice(manufacturerName, {modelID: "TS0502B", type: "Router", endpoints: LIGHT, ...options});
+const removeAllOn = (dev) => dev.zh.endpoints.filter((e) => e.sent.some((s) => s.cluster === "genGroups" && s.command === "removeAll")).map((e) => e.ID);
+
+test("таблица групп: новое устройство Tuya без групп — removeAll на каждом endpoint с серверным genGroups", async () => {
+    const dev = await light();
+    const {bus, log} = await start([dev]);
+    await bus.h.deviceInterview({device: dev, status: "successful"});
+    assert.deepEqual(removeAllOn(dev), [1, 2]);
+    const line = log.lines.find((l) => l.level === "info" && l.msg.startsWith("BMS: "));
+    assert.match(line?.msg ?? "", new RegExp(`очищена таблица групп на '${dev.name}' \\(endpoint 1, 2\\)`));
+    // Только после интервью: повторное подключение и неудачное интервью не чистят.
+    const again = await light("_TYZB01_bmslight");
+    const {bus: bus2} = await start([again]);
+    await bus2.h.deviceAnnounce({device: again});
+    await bus2.h.deviceInterview({device: again, status: "failed"});
+    await bus2.h.deviceInterview({device: again, status: "started"});
+    assert.deepEqual(removeAllOn(again), []);
+    await bus2.h.deviceInterview({device: again, status: "successful"});
+    assert.deepEqual(removeAllOn(again), [1, 2], "_TY… — тоже Tuya");
+});
+
+test("таблица групп: устройство уже в группе Z2M (на любом endpoint) — ничего", async () => {
+    const dev = await light();
+    const {bus, log} = await start([dev], [{groupID: 7, members: [dev.zh.endpoints[1]]}]);
+    await bus.h.deviceInterview({device: dev, status: "successful"});
+    assert.deepEqual(removeAllOn(dev), []);
+    assert.ok(log.lines.some((l) => l.level === "debug" && /уже в группе Z2M/.test(l.msg)));
+});
+
+test("таблица групп: не-Tuya, без серверного genGroups, пульт с клиентским genOnOff — ничего", async () => {
+    // Описание задаём сами: поиск converters для подставной лампы здесь не нужен (чистка от описания не зависит).
+    const notTuya = await light("IKEA of Sweden", {modelID: "TRADFRI bulb", definition: {model: "TRADFRI", vendor: "IKEA", fromZigbee: [], toZigbee: []}});
+    const noGroups = await z2mDevice("_TZE200_bmsnogrp", {endpoints: [{ID: 1, input: ["genBasic", "manuSpecificTuya"], output: ["genGroups"]}]});
+    const remote = await z2mDevice("_TZ3000_bmsremot", {
+        modelID: "TS004F",
+        endpoints: [{ID: 1, input: ["genBasic", "genPowerCfg", "genIdentify", "genGroups", "genOnOff"], output: ["genGroups", "genScenes", "genOnOff", "genLevelCtrl"]}],
+    });
+    const {bus, log} = await start([notTuya, noGroups, remote]);
+    for (const device of [notTuya, noGroups, remote]) await bus.h.deviceInterview({device, status: "successful"});
+    assert.deepEqual([notTuya, noGroups, remote].flatMap(removeAllOn), []);
+    assert.equal(log.lines.filter((l) => l.msg.startsWith("BMS: ")).length, 0);
+});
+
+test("таблица групп: ошибка команды — строка в журнале, остальные endpoint чистятся, без исключения", async () => {
+    const dev = await light();
+    dev.zh.endpoints[0].failOn = "removeAll";
+    const {bus, log} = await start([dev]);
+    await bus.h.deviceInterview({device: dev, status: "successful"}); // не бросает
+    assert.deepEqual(removeAllOn(dev), [2]);
+    assert.ok(log.lines.some((l) => l.level === "warning" && /^BMS: таблицу групп на .*endpoint 1\) очистить не удалось: Timeout/.test(l.msg)));
+    assert.ok(log.lines.some((l) => l.level === "info" && /endpoint 2\)/.test(l.msg)));
 });
