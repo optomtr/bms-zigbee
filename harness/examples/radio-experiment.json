@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "status": "not_run",
+  "hypothesis": null,
+  "supporting_capture": null,
+  "build_manifest_sha": null,
+  "ncp_firmware": null,
+  "channel": null,
+  "device_fingerprints_and_positions": [],
+  "changed_variable": null,
+  "offered_command_stream_sha256": null,
+  "acceptance_before_run": {
+    "min_physically_executed_fraction": null,
+    "max_p95_ms": null,
+    "max_order_violations": 0,
+    "max_recovery_seconds": null,
+    "stop_conditions": [],
+    "rollback_procedure": null
+  },
+  "alternating_runs": [],
+  "decision": "insufficient_evidence"
+}
