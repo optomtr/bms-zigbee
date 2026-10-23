@@ -12,6 +12,7 @@
 //
 // Команды:
 //   get-channel        напечатать advanced.channel из configuration.yaml (пусто, если файла или ключа нет)
+//   get-serial-port    напечатать serial.port из configuration.yaml (пусто, если файла или ключа нет)
 //   new [канал]        создать configuration.yaml для НОВОЙ установки: как Z2M при первом запуске
 //                      + наши настройки по умолчанию + (если дан) канал; без мастера настройки
 //   set-channel канал  записать канал в уже существующий configuration.yaml
@@ -40,6 +41,19 @@ function main() {
                 const channel = settings.getPersistedSettings().advanced?.channel;
                 if (channel !== undefined && channel !== null) {
                     console.log(String(channel));
+                }
+            }
+            return;
+        }
+        case 'get-serial-port': {
+            // Нужен режиму auto, чтобы не затереть адрес, который владелец вписал в файл сам
+            // (docker-entrypoint.sh / coordinator.sh). Читаем только файл: окружение на этот ответ
+            // влиять не должно, поэтому на всякий случай убираем из него serial.port, который выставил entrypoint.
+            delete process.env.ZIGBEE2MQTT_CONFIG_SERIAL_PORT;
+            if (fs.existsSync(CONFIG)) {
+                const port = settings.getPersistedSettings().serial?.port;
+                if (port !== undefined && port !== null) {
+                    console.log(String(port));
                 }
             }
             return;

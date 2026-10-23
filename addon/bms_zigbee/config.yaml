@@ -7,7 +7,7 @@ name: BMS Zigbee                       # BMS: своё имя
 # BMS: версия = <версия Z2M из versions.json>-bms.<номер нашей сборки>.
 # Часть до «-» Dockerfile берёт как версию Zigbee2MQTT (${BUILD_VERSION%-*}), поэтому
 # менять её руками нельзя: stage.sh сам подтягивает её из versions.json.
-version: 2.14.2-bms.1
+version: 2.14.2-bms.2
 slug: bms_zigbee                       # BMS: свой slug, чтобы жить рядом с официальным Z2M
 description: Zigbee2MQTT с нашим Zigbee-ядром и слоем Tuya для координатора SMLIGHT SLZB-06M
 url: https://github.com/optomtr/bms-zigbee  # BMS: наш репозиторий вместо официального
@@ -16,6 +16,10 @@ udev: true
 startup: application
 services:
   - mqtt:need
+# BMS: hassio_api нужен и официальному дополнению (часовой пояс), и нам: режим serial.port = auto спрашивает у
+# Supervisor список сетей (GET /network/info), чтобы искать координатор. Больше ничего не нужно: роль
+# hassio_role по умолчанию (default) пускает на любой «/…/info», а без hassio_api запрос получает 403.
+# Выше роль (manager и т.д.) не просим — лишние права дополнению ни к чему.
 hassio_api: true
 arch:
   - aarch64
@@ -61,11 +65,12 @@ options:
     log: false
   mqtt: {}
   serial:
-    # BMS: по умолчанию — наш координатор SLZB-06M по сети. Вместо IP_SLZB надо вписать
-    # IP-адрес координатора (например tcp://192.168.1.50:6638). Пока там заглушка, запуск
-    # останавливается с понятным сообщением (проверка в rootfs/docker-entrypoint.sh).
+    # BMS: port: auto — дополнение само находит координатор SLZB-06M в сети Home Assistant и ждёт его
+    # появления; владельцу ничего вписывать не нужно (rootfs/opt/bms/coordinator.sh). Нужен свой адрес —
+    # впишите вместо auto, например tcp://192.168.1.50:6638 или mdns://slzb-06m: он будет использован как есть.
+    # Прежняя заглушка tcp://IP_SLZB:6638 у тех, у кого она осталась в настройках, считается за auto.
     adapter: ember
-    port: tcp://IP_SLZB:6638
+    port: auto
 schema:
   data_path: str
   socat:

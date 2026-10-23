@@ -8,12 +8,9 @@ bashio::log.info "Preparing to start..."
 # - https://github.com/zigbee2mqtt/hassio-zigbee2mqtt/issues/387
 bashio::config.require 'data_path'
 
-# BMS: в настройках по умолчанию стоит заглушка вместо IP координатора (см. config.yaml).
-# Без этой проверки Z2M запустился бы и через минуту упал на «getaddrinfo ENOTFOUND IP_SLZB» —
-# для человека не из мира IT это непонятно. Говорим прямо, что делать.
-if [[ "$(bashio::config 'serial.port')" == *IP_SLZB* ]]; then
-    bashio::exit.nok "В настройках дополнения не указан адрес координатора: Настройки -> serial -> port стоит заглушка 'IP_SLZB'. Впишите IP-адрес SLZB-06M, например tcp://192.168.1.50:6638, сохраните и запустите дополнение снова."
-fi
+# BMS: раньше здесь запуск останавливался, пока в serial.port стояла заглушка IP_SLZB («впишите IP»).
+# Теперь по умолчанию serial.port = auto: дополнение само ищет координатор SLZB-06M в сети и ждёт его
+# появления (rootfs/opt/bms/coordinator.sh, вызывается ниже, после export_config 'serial').
 
 # Socat
 if bashio::config.true 'socat.enabled'; then
@@ -147,13 +144,22 @@ if (bashio::config.is_empty 'mqtt' || ! (bashio::config.has_value 'mqtt.server' 
     export ZIGBEE2MQTT_CONFIG_MQTT_PASSWORD="$(bashio::services 'mqtt' 'password')"
 fi
 
+# BMS: адрес координатора ------------------------------------------------------------------------
+# serial.port = auto -> ищем SLZB-06M в сетях Home Assistant, ждём его, проверяем прошивку; найденный
+# адрес уходит Z2M через окружение (ZIGBEE2MQTT_CONFIG_SERIAL_PORT), как у официального дополнения.
+# Явный адрес владельца работает как есть. Блок стоит ПОСЛЕ export_config 'serial': он переопределяет
+# выставленное там «auto». Итог — BMS_SERIAL_PORT (его же берёт замер эфира ниже). Подробности — в coordinator.sh.
+BMS_SEED="node /opt/bms/seed-config.js"
+# shellcheck source=opt/bms/coordinator.sh
+source /opt/bms/coordinator.sh
+bms_coordinator_setup
+
 # BMS: настройки новой установки и выбор канала -------------------------------------------------
-# Хотим, чтобы владелец вписал только IP, а остальное работало как у шлюза Tuya: мощность,
+# Хотим, чтобы владелец ничего не вписывал, а всё работало как у шлюза Tuya: мощность,
 # проверка «живо ли» и самый тихий канал. Сами значения и почему они такие — в seed-config.js;
 # здесь только решение, когда их записывать. Блок стоит ПОСЛЕ export_config выше: seed-config.js
 # использует тот же Z2M-код, что при первом запуске, и этот код берёт serial/mqtt из окружения —
 # иначе в новый configuration.yaml не попал бы адрес координатора.
-BMS_SEED="node /opt/bms/seed-config.js"
 BMS_CONF="$ZIGBEE2MQTT_DATA/configuration.yaml"
 # Что выбрали мы: «<канал> scanned» (замерили) или «<канал> fallback» (замер не вышел, взяли запасной).
 # Нужна, чтобы отличить наш канал в configuration.yaml от канала, который вписал владелец.
@@ -177,7 +183,9 @@ bms_scan_channel() {
     bms_channel="$BMS_FALLBACK_CHANNEL"
     bms_kind=fallback
 
-    if ! bashio::config.has_value 'serial.port'; then
+    # Адрес берём из bms_coordinator_setup (в режиме auto — найденный), а не из настроек дополнения:
+    # там может стоять «auto», а замеру нужен настоящий tcp://IP:порт.
+    if [[ -z "$BMS_SERIAL_PORT" ]]; then
         bashio::log.warning "BMS: адрес координатора не задан, замерить эфир нельзя — ставлю запасной канал $bms_channel (между Wi-Fi 1 и 6)."
         return 0
     fi
@@ -190,7 +198,7 @@ bms_scan_channel() {
         return 0
     fi
 
-    port="$(bashio::config 'serial.port')"
+    port="$BMS_SERIAL_PORT"
     bashio::log.info "BMS: первый запуск — измеряю загрузку эфира, как это делает шлюз Tuya (обычно несколько секунд)..."
     err_file="$(mktemp)"
     out="$(timeout "$BMS_SCAN_TIMEOUT" node "$BMS_SCAN_CLI" "$port" 2>"$err_file")" || rc=$?

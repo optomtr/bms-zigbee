@@ -172,6 +172,9 @@ tar -tzf "$TGZ" | grep -qx 'package/dist/index.js' || die "в tgz нет package
 # Контракт с дополнением: оно зовёт энергоскан по этому пути внутри пакета (патч 0003, см. README).
 tar -tzf "$TGZ" | grep -qx 'package/dist/adapter/ember/bms/energyScanCli.js' \
     || die "в tgz нет package/dist/adapter/ember/bms/energyScanCli.js (контракт энергоскана с дополнением)"
+# И поиск координатора в сети по этому пути (патч 0004, см. README).
+tar -tzf "$TGZ" | grep -qx 'package/dist/adapter/ember/bms/coordinatorCli.js' \
+    || die "в tgz нет package/dist/adapter/ember/bms/coordinatorCli.js (контракт поиска координатора с дополнением)"
 
 if command -v shasum >/dev/null 2>&1; then SHA="$(shasum -a 256 "$TGZ")"; else SHA="$(sha256sum "$TGZ")"; fi
 log "Готово: $TGZ"

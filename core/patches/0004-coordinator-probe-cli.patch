@@ -1,0 +1,1248 @@
+BMS 0004: поиск координатора в сети и проверка его прошивки (модуль + CLI для дополнения)
+
+Зачем: владелец ставит дополнение «BMS Zigbee» и втыкает координатор (SLZB-06M,
+EmberZNet по EZSP поверх TCP, порт 6638) в сеть — IP он вводить не должен.
+Дополнение до запуска Z2M перебирает свои сети (discover) и проверяет найденное (probe).
+
+Что добавляет (новые файлы, upstream-код не меняется):
+- src/adapter/ember/bms/ezspSession.ts — общее для обоих CLI: сброс NCP по ASH и
+  согласование версии EZSP как EmberAdapter.initEzsp/emberVersion, сеанс с
+  обязательным ezsp.stop() (и по таймауту), Ezsp для CLI, обвязка процесса
+  (журнал в stderr, выход после записи stdout). energyScan/energyScanCli
+  переведены на него; их поведение и контракт не менялись.
+- src/adapter/ember/bms/coordinatorProbe.ts — probe: только сброс ASH, VERSION,
+  GET_VALUE(VERSION_INFO) и GET_EUI64 (как адаптер при старте); при протоколе вне
+  13..19 — ok с реальным протоколом, версией из ответа VERSION и eui64 null, больше
+  ничего не шлёт. discover: CIDR /22../32 (больше 1024 адресов — пропуск),
+  TCP-подключение 400 мс по 64 сразу, probe открытых по очереди, фильтр EUI64.
+- src/adapter/ember/bms/coordinatorCli.ts — КОНТРАКТ с дополнением:
+  node <пакет>/dist/adapter/ember/bms/coordinatorCli.js probe tcp://<ip>:<порт>
+    {"ok":true,"path":…,"ezspProtocol":13,"stackVersion":"7.4.4.0","eui64":"0x…"} код 0;
+    {"ok":false,"path":…,"error":…} код 3;
+  node <пакет>/dist/adapter/ember/bms/coordinatorCli.js discover <cidr>… [--port N] [--eui64 0x…]
+    {"found":[…]} код 0 (найден) / 3 (никого); неверные аргументы — код 2, stdout пуст.
+- test/adapter/ember/coordinatorProbe.test.ts — на поддельном Ezsp (любое обращение
+  к чему-то кроме сброса/VERSION/VERSION_INFO/EUI64 — ошибка теста), поддельном сокете
+  и настоящем локальном TCP-сервере.
+
+diff --git a/src/adapter/ember/bms/coordinatorCli.ts b/src/adapter/ember/bms/coordinatorCli.ts
+new file mode 100644
+index 0000000..dd42d21
+--- /dev/null
++++ b/src/adapter/ember/bms/coordinatorCli.ts
+@@ -0,0 +1,150 @@
++/**
++ * BMS: поиск и проверка координатора из командной строки — для дополнения «BMS Zigbee» (до запуска Z2M).
++ *
++ * КОНТРАКТ с дополнением (не менять без дополнения):
++ *   node <пакет>/dist/adapter/ember/bms/coordinatorCli.js probe tcp://<ip>:<порт>
++ *     stdout — ОДНА строка: {"ok":true,"path":"tcp://…","ezspProtocol":13,"stackVersion":"7.4.4.0","eui64":"0x…"}, код 0;
++ *     по адресу не EZSP-координатор (порт закрыт / не EZSP / таймаут): {"ok":false,"path":"…","error":"…"}, код 3.
++ *   node <пакет>/dist/adapter/ember/bms/coordinatorCli.js discover <cidr> [<cidr> …] [--port 6638] [--eui64 0x…]
++ *     stdout — ОДНА строка: {"found":[{"path":"tcp://…","ezspProtocol":13,"stackVersion":"…","eui64":"…"}, …]};
++ *     код 0 — найден хоть один, 3 — никого.
++ *   Неверные аргументы / внутренняя ошибка: код 2, текст в stderr, stdout пуст.
++ * Журнал ядра и заметки поиска уходят в stderr (info/debug — только при BMS_DEBUG=1).
++ */
++import {
++    DEFAULT_COORDINATOR_PORT,
++    discoverCoordinators,
++    type Ipv4Network,
++    isTcpCoordinatorPath,
++    isTcpPortOpen,
++    type PortCheck,
++    type ProbeEzsp,
++    parseCidr,
++    probeCoordinator,
++} from "./coordinatorProbe";
++import {type CliOutput, createCliEzsp, runCliMain} from "./ezspSession";
++
++export const EXIT_OK = 0;
++export const EXIT_ERROR = 2;
++export const EXIT_NOT_FOUND = 3;
++
++export const USAGE = [
++    "Usage:",
++    "  node coordinatorCli.js probe tcp://<ip>:<port>",
++    `  node coordinatorCli.js discover <cidr> [<cidr> ...] [--port ${DEFAULT_COORDINATOR_PORT}] [--eui64 0x<16 hex digits>]`,
++].join("\n");
++
++export type CoordinatorCliIo = CliOutput & {
++    createEzsp: (path: string) => ProbeEzsp;
++    checkPort: PortCheck;
++};
++
++type DiscoverArgs = {networks: Ipv4Network[]; port: number; eui64?: string};
++
++/** Разбор аргументов discover. Строка — текст ошибки для stderr. */
++export function parseDiscoverArgs(args: readonly string[]): DiscoverArgs | string {
++    const networks: Ipv4Network[] = [];
++    let port = DEFAULT_COORDINATOR_PORT;
++    let eui64: string | undefined;
++
++    for (let i = 0; i < args.length; i++) {
++        const arg = args[i];
++
++        if (arg === "--port") {
++            const value = args[++i];
++
++            if (value === undefined || !/^\d{1,5}$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
++                return `Invalid --port: ${value ?? "(missing)"}`;
++            }
++
++            port = Number(value);
++        } else if (arg === "--eui64") {
++            const value = args[++i];
++
++            if (value === undefined || !/^0x[0-9a-f]{16}$/i.test(value)) {
++                return `Invalid --eui64: ${value ?? "(missing)"} (expected 0x and 16 hex digits)`;
++            }
++
++            // ядро отдаёт EUI64 в нижнем регистре — сравниваем так же
++            eui64 = value.toLowerCase();
++        } else {
++            const network = parseCidr(arg);
++
++            if (network === undefined) {
++                return `Invalid network: ${arg} (expected IPv4 CIDR, e.g. 192.168.1.0/24)`;
++            }
++
++            networks.push(network);
++        }
++    }
++
++    if (networks.length === 0) {
++        return "No network given.";
++    }
++
++    return {networks, port, eui64};
++}
++
++async function runProbe(args: readonly string[], io: CoordinatorCliIo): Promise<number> {
++    if (args.length !== 1 || !isTcpCoordinatorPath(args[0])) {
++        io.stderr(`Invalid probe arguments: ${JSON.stringify(args)}\n${USAGE}`);
++        return EXIT_ERROR;
++    }
++
++    const result = await probeCoordinator(io.createEzsp(args[0]), args[0]);
++
++    io.stdout(JSON.stringify(result));
++
++    return result.ok ? EXIT_OK : EXIT_NOT_FOUND;
++}
++
++async function runDiscover(args: readonly string[], io: CoordinatorCliIo): Promise<number> {
++    const parsed = parseDiscoverArgs(args);
++
++    if (typeof parsed === "string") {
++        io.stderr(`${parsed}\n${USAGE}`);
++        return EXIT_ERROR;
++    }
++
++    const found = await discoverCoordinators({
++        ...parsed,
++        checkPort: io.checkPort,
++        probe: (path) => probeCoordinator(io.createEzsp(path), path),
++        log: io.stderr,
++    });
++
++    io.stdout(JSON.stringify({found}));
++
++    return found.length > 0 ? EXIT_OK : EXIT_NOT_FOUND;
++}
++
++export async function runCoordinatorCli(args: readonly string[], io: CoordinatorCliIo): Promise<number> {
++    try {
++        switch (args[0]) {
++            case "probe":
++                return await runProbe(args.slice(1), io);
++            case "discover":
++                return await runDiscover(args.slice(1), io);
++            default:
++                io.stderr(USAGE);
++                return EXIT_ERROR;
++        }
++    } catch (error) {
++        // сюда попадает только неожиданное (probe сам ошибок не бросает) — по контракту это код 2 и пустой stdout
++        io.stderr(`BMS coordinator ${args[0]} failed: ${(error as Error).message}`);
++
++        return EXIT_ERROR;
++    }
++}
++
++/* v8 ignore start */
++if (require.main === module) {
++    runCliMain("BMS coordinator CLI failed", (output) =>
++        runCoordinatorCli(process.argv.slice(2), {
++            ...output,
++            createEzsp: createCliEzsp,
++            checkPort: (host, port) => isTcpPortOpen(host, port),
++        }),
++    );
++}
++/* v8 ignore stop */
+diff --git a/src/adapter/ember/bms/coordinatorProbe.ts b/src/adapter/ember/bms/coordinatorProbe.ts
+new file mode 100644
+index 0000000..a681e8f
+--- /dev/null
++++ b/src/adapter/ember/bms/coordinatorProbe.ts
+@@ -0,0 +1,241 @@
++/**
++ * BMS: найти координатор (SLZB-06M и подобные: EmberZNet по EZSP поверх TCP) в локальной сети и узнать его прошивку.
++ *
++ * Зачем: владелец ставит дополнение «BMS Zigbee» и втыкает координатор в сеть — IP он вводить не должен.
++ * Дополнение перебирает адреса своих сетей (discover), а найденный адрес проверяет (probe) — до запуска Z2M.
++ *
++ * Координатор не меняется: probe делает только то, с чего начинает сам ember-адаптер — сброс NCP по ASH, VERSION,
++ * чтение версии стека (GET_VALUE VERSION_INFO) и EUI64. Сеть не создаётся и не трогается; EZSP закрывается всегда.
++ */
++import {Socket} from "node:net";
++import {logger} from "../../../utils/logger";
++import type {Eui64} from "../../../zspec/tstypes";
++import {SLStatus} from "../enums";
++import type {Ezsp} from "../ezsp/ezsp";
++import {type EzspSessionEzsp, type NcpVersion, withEzspSession} from "./ezspSession";
++
++const NS = "zh:ember:bms";
++
++/** Порт EZSP-по-TCP у SMLIGHT SLZB-06M (и у Z2M в примерах) по умолчанию. */
++export const DEFAULT_COORDINATOR_PORT = 6638;
++/**
++ * Сколько ждём весь probe. Сброс ASH на живом NCP занимает ~1 с, upstream ждёт RSTACK до 5 с на попытку:
++ * 15 с — это две полные попытки и сами команды. Дольше ждать незачем: так отвечает не координатор.
++ */
++export const PROBE_TIMEOUT_MSEC = 15000;
++/** TCP-подключение в своей сети отвечает за миллисекунды; 400 мс — запас на Wi-Fi, при этом /24 обходится за ~2 с. */
++export const CONNECT_TIMEOUT_MSEC = 400;
++/** Сколько адресов проверяем одновременно: столько сокетов не упрётся в лимиты ОС и не забьёт домашний роутер. */
++export const CONNECT_CONCURRENCY = 64;
++/** Больше /22 не перебираем: это уже не домашняя сеть, а перебор займёт минуты и похож на сканирование. */
++export const MAX_NETWORK_ADDRESSES = 1024;
++
++export type CoordinatorInfo = {
++    ezspProtocol: number;
++    stackVersion: string;
++    /** null — прошивка со слишком старым (или новым) протоколом: дальше VERSION с ней не говорим */
++    eui64: Eui64 | null;
++};
++
++export type ProbeResult = ({ok: true; path: string} & CoordinatorInfo) | {ok: false; path: string; error: string};
++
++/** Только то, что probe берёт у Ezsp: тест подставляет сюда поддельный (любое другое обращение — ошибка теста). */
++export type ProbeEzsp = EzspSessionEzsp & Pick<Ezsp, "ezspGetVersionStruct" | "ezspGetEui64">;
++
++/** Версия стека из ответа VERSION: 0x7440 -> "7.4.4.0" (по полубайту на major.minor.patch.special). */
++export function formatStackVersion(stackVersion: number): string {
++    return [12, 8, 4, 0].map((shift) => (stackVersion >> shift) & 0x0f).join(".");
++}
++
++async function readCoordinatorInfo(ezsp: ProbeEzsp, version: NcpVersion): Promise<CoordinatorInfo> {
++    if (!version.supported) {
++        // С таким протоколом хост дальше VERSION не умеет (Z2M с ним тоже не заработает) — не шлём ничего лишнего;
++        // версию стека берём из ответа VERSION: дополнению этого хватит, чтобы сказать «обновите прошивку».
++        return {ezspProtocol: version.protocolVersion, stackVersion: formatStackVersion(version.stackVersion), eui64: null};
++    }
++
++    // как EmberAdapter.emberVersion: полная версия — из VERSION_INFO (в ответе VERSION на каждое число лишь полубайт)
++    const [status, versionStruct] = await ezsp.ezspGetVersionStruct();
++    const stackVersion =
++        status === SLStatus.OK
++            ? `${versionStruct.major}.${versionStruct.minor}.${versionStruct.patch}.${versionStruct.special}`
++            : formatStackVersion(version.stackVersion);
++    // как EmberAdapter.initEzsp: EUI64 координатора — тот же, что Z2M покажет как адрес координатора
++    const eui64 = await ezsp.ezspGetEui64();
++
++    return {ezspProtocol: version.protocolVersion, stackVersion, eui64};
++}
++
++/**
++ * Проверить, отвечает ли по адресу EZSP-координатор, и прочитать его версию и EUI64. Не бросает: ошибка -> ok:false.
++ */
++export async function probeCoordinator(ezsp: ProbeEzsp, path: string, timeout = PROBE_TIMEOUT_MSEC): Promise<ProbeResult> {
++    try {
++        const info = await withEzspSession(ezsp, (version) => readCoordinatorInfo(ezsp, version), timeout);
++
++        return {ok: true, path, ...info};
++    } catch (error) {
++        return {ok: false, path, error: (error as Error).message};
++    }
++}
++
++/** Адрес вида tcp://<хост>:<порт> — другой путь probe не принимает (контракт с дополнением). */
++export function isTcpCoordinatorPath(path: string): boolean {
++    try {
++        const url = new URL(path);
++        const port = Number(url.port);
++
++        return (
++            url.protocol === "tcp:" &&
++            url.hostname !== "" &&
++            port >= 1 &&
++            (url.pathname === "" || url.pathname === "/") &&
++            url.search === "" &&
++            url.hash === "" &&
++            url.username === ""
++        );
++    } catch {
++        return false;
++    }
++}
++
++export type Ipv4Network = {cidr: string; network: number; prefix: number; size: number};
++
++function parseIpv4(text: string): number | undefined {
++    const parts = text.split(".");
++
++    if (parts.length !== 4 || !parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)) {
++        return undefined;
++    }
++
++    // >>> 0 — чтобы адрес оставался беззнаковым 32-битным числом (сдвиг в JS знаковый)
++    return parts.reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
++}
++
++export function formatIpv4(address: number): string {
++    return [24, 16, 8, 0].map((shift) => (address >>> shift) & 0xff).join(".");
++}
++
++/**
++ * Разобрать IPv4 CIDR. Адрес может быть адресом интерфейса (192.168.1.37/24, так его отдаёт Home Assistant) —
++ * берём сеть. undefined — не CIDR.
++ */
++export function parseCidr(cidr: string): Ipv4Network | undefined {
++    const match = /^([\d.]+)\/(\d{1,2})$/.exec(cidr);
++
++    if (!match) {
++        return undefined;
++    }
++
++    const address = parseIpv4(match[1]);
++    const prefix = Number(match[2]);
++
++    if (address === undefined || prefix > 32) {
++        return undefined;
++    }
++
++    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
++
++    return {cidr, network: (address & mask) >>> 0, prefix, size: 2 ** (32 - prefix)};
++}
++
++/** Адреса узлов сети: без адреса сети и широковещательного; в /31 и /32 их нет (RFC 3021) — берём все. */
++export function networkHosts(network: Ipv4Network): string[] {
++    const hosts: string[] = [];
++    const [first, last] = network.prefix >= 31 ? [0, network.size - 1] : [1, network.size - 2];
++
++    for (let i = first; i <= last; i++) {
++        hosts.push(formatIpv4(network.network + i));
++    }
++
++    return hosts;
++}
++
++/** Открыт ли TCP-порт. Подключились — сразу закрываем: этим подключением ничего не шлём, NCP его не заметит. */
++export function isTcpPortOpen(host: string, port: number, timeout = CONNECT_TIMEOUT_MSEC, createSocket = () => new Socket()): Promise<boolean> {
++    return new Promise((resolve) => {
++        const socket = createSocket();
++        let timer: NodeJS.Timeout | undefined;
++        const finish = (open: boolean): void => {
++            clearTimeout(timer);
++            socket.removeAllListeners();
++            // ошибка после destroy (ECONNRESET и т.п.) уже не важна, но без слушателя она уронила бы процесс
++            socket.on("error", () => {});
++            socket.destroy();
++            resolve(open);
++        };
++
++        timer = setTimeout(() => finish(false), timeout);
++        socket.once("connect", () => finish(true));
++        socket.once("error", () => finish(false));
++        socket.connect(port, host);
++    });
++}
++
++export type PortCheck = (host: string, port: number) => Promise<boolean>;
++
++/** Хосты с открытым портом, в порядке исходного списка (подключения идут параллельно, до `concurrency` сразу). */
++export async function findOpenPorts(hosts: readonly string[], port: number, check: PortCheck, concurrency = CONNECT_CONCURRENCY): Promise<string[]> {
++    const open = new Array<boolean>(hosts.length).fill(false);
++    let next = 0;
++    const worker = async (): Promise<void> => {
++        while (next < hosts.length) {
++            const i = next++;
++            open[i] = await check(hosts[i], port);
++        }
++    };
++
++    await Promise.all(Array.from({length: Math.min(concurrency, hosts.length)}, worker));
++
++    return hosts.filter((_host, i) => open[i]);
++}
++
++export type DiscoverOptions = {
++    networks: readonly Ipv4Network[];
++    port: number;
++    /** только координатор с этим EUI64 (нижний регистр, 0x + 16 цифр) */
++    eui64?: string;
++    checkPort: PortCheck;
++    probe: (path: string) => Promise<ProbeResult>;
++    log: (line: string) => void;
++};
++
++export type DiscoveredCoordinator = {path: string} & CoordinatorInfo;
++
++/**
++ * Перебрать сети: открытые порты ищем параллельно, а probe по ним — по очереди (каждый probe сбрасывает NCP,
++ * и одному координатору незачем получать сразу несколько сбросов).
++ */
++export async function discoverCoordinators(options: DiscoverOptions): Promise<DiscoveredCoordinator[]> {
++    const hosts = new Set<string>();
++
++    for (const network of options.networks) {
++        if (network.size > MAX_NETWORK_ADDRESSES) {
++            options.log(`Skipping network ${network.cidr}: ${network.size} addresses, more than ${MAX_NETWORK_ADDRESSES}.`);
++            continue;
++        }
++
++        for (const host of networkHosts(network)) {
++            hosts.add(host);
++        }
++    }
++
++    const openHosts = await findOpenPorts([...hosts], options.port, options.checkPort);
++    const found: DiscoveredCoordinator[] = [];
++
++    logger.debug(`Discover: ${hosts.size} addresses, port ${options.port} open on [${openHosts.join(", ")}].`, NS);
++
++    for (const host of openHosts) {
++        const result = await options.probe(`tcp://${host}:${options.port}`);
++
++        if (!result.ok) {
++            options.log(`${result.path}: no EZSP coordinator (${result.error})`);
++        } else if (options.eui64 !== undefined && result.eui64 !== options.eui64) {
++            options.log(`${result.path}: EUI64 ${result.eui64} does not match ${options.eui64}, skipping.`);
++        } else {
++            found.push({path: result.path, ezspProtocol: result.ezspProtocol, stackVersion: result.stackVersion, eui64: result.eui64});
++        }
++    }
++
++    return found;
++}
+diff --git a/src/adapter/ember/bms/energyScan.ts b/src/adapter/ember/bms/energyScan.ts
+index 020baf8..40c858f 100644
+--- a/src/adapter/ember/bms/energyScan.ts
++++ b/src/adapter/ember/bms/energyScan.ts
+@@ -9,9 +9,9 @@
+  */
+ import {logger} from "../../../utils/logger";
+ import {channelsToUInt32Mask} from "../../../zspec/utils";
+-import {EzspNetworkScanType, EzspStatus, SLStatus} from "../enums";
+-import {EZSP_MIN_PROTOCOL_VERSION, EZSP_PROTOCOL_VERSION, EZSP_STACK_TYPE_MESH} from "../ezsp/consts";
++import {EzspNetworkScanType, SLStatus} from "../enums";
+ import type {Ezsp} from "../ezsp/ezsp";
++import {unsupportedProtocolMessage, withEzspSession} from "./ezspSession";
+ 
+ const NS = "zh:ember:bms";
+ 
+@@ -51,27 +51,6 @@ export function pickBestChannel(results: readonly EnergyScanChannelResult[]): nu
+     return sorted[0].channel;
+ }
+ 
+-/**
+- * Согласовать версию EZSP, как EmberAdapter.emberVersion: без неё NCP не примет ни одной другой команды.
+- */
+-async function negotiateVersion(ezsp: EnergyScanEzsp): Promise<void> {
+-    let [protocolVersion, stackType] = await ezsp.ezspVersion(EZSP_PROTOCOL_VERSION);
+-
+-    if (stackType !== EZSP_STACK_TYPE_MESH) {
+-        throw new Error(`Stack type ${stackType} is not expected.`);
+-    }
+-
+-    if (protocolVersion < EZSP_PROTOCOL_VERSION && protocolVersion >= EZSP_MIN_PROTOCOL_VERSION) {
+-        [protocolVersion] = await ezsp.ezspVersion(protocolVersion);
+-    } else if (protocolVersion !== EZSP_PROTOCOL_VERSION) {
+-        throw new Error(
+-            `Adapter EZSP protocol version (${protocolVersion}) is not supported [${EZSP_MIN_PROTOCOL_VERSION}-${EZSP_PROTOCOL_VERSION}].`,
+-        );
+-    }
+-
+-    ezsp.setProtocolVersion(protocolVersion);
+-}
+-
+ /**
+  * Запустить EZSP, сделать ENERGY_SCAN по каналам и вернуть результат с лучшим каналом. EZSP останавливается всегда.
+  */
+@@ -81,15 +60,11 @@ export async function energyScan(
+     duration = ENERGY_SCAN_DURATION,
+     timeout = ENERGY_SCAN_TIMEOUT_MSEC,
+ ): Promise<EnergyScanResult> {
+-    try {
+-        const startStatus = await ezsp.start();
+-
+-        if (startStatus !== EzspStatus.SUCCESS) {
+-            throw new Error(`Failed to start EZSP layer with status=${EzspStatus[startStatus]}.`);
++    return await withEzspSession(ezsp, async (version) => {
++        if (!version.supported) {
++            throw new Error(unsupportedProtocolMessage(version.protocolVersion));
+         }
+ 
+-        await negotiateVersion(ezsp);
+-
+         const maxRssi = new Map<number, number>();
+         let complete!: (error?: Error) => void;
+         const scanDone = new Promise<void>((resolve, reject) => {
+@@ -138,7 +113,5 @@ export async function energyScan(
+         }
+ 
+         return {results, best: pickBestChannel(results)};
+-    } finally {
+-        await ezsp.stop();
+-    }
++    });
+ }
+diff --git a/src/adapter/ember/bms/energyScanCli.ts b/src/adapter/ember/bms/energyScanCli.ts
+index 29e32d2..8c6a7eb 100644
+--- a/src/adapter/ember/bms/energyScanCli.ts
++++ b/src/adapter/ember/bms/energyScanCli.ts
+@@ -7,16 +7,13 @@
+  *   любая ошибка: код выхода 2 и понятный текст в stderr.
+  * Журнал ядра уходит в stderr (info/debug — только при BMS_DEBUG=1), чтобы stdout оставался одной строкой JSON.
+  */
+-import {setLogger} from "../../../utils/logger";
+-import {Ezsp} from "../ezsp/ezsp";
+ import {type EnergyScanEzsp, energyScan} from "./energyScan";
++import {type CliOutput, createCliEzsp, runCliMain} from "./ezspSession";
+ 
+ export const EXIT_OK = 0;
+ export const EXIT_ERROR = 2;
+ 
+-export type EnergyScanCliIo = {
+-    stdout: (line: string) => void;
+-    stderr: (line: string) => void;
++export type EnergyScanCliIo = CliOutput & {
+     createEzsp: (portPath: string) => EnergyScanEzsp;
+ };
+ 
+@@ -41,28 +38,6 @@ export async function runEnergyScanCli(args: readonly string[], io: EnergyScanCl
+ 
+ /* v8 ignore start */
+ if (require.main === module) {
+-    const toStderr = (message: string | (() => string), namespace: string): void => {
+-        process.stderr.write(`[${new Date().toISOString()}] ${namespace}: ${typeof message === "function" ? message() : message}\n`);
+-    };
+-    const quiet = (): void => {};
+-    const verbose = process.env.BMS_DEBUG === "1";
+-
+-    setLogger({debug: verbose ? toStderr : quiet, info: verbose ? toStderr : quiet, warning: toStderr, error: toStderr});
+-
+-    void runEnergyScanCli(process.argv.slice(2), {
+-        stdout: (line) => process.stdout.write(`${line}\n`),
+-        stderr: (line) => process.stderr.write(`${line}\n`),
+-        // скорость важна только для последовательного порта (как в Z2M по умолчанию); для tcp:// не используется
+-        createEzsp: (portPath) => new Ezsp({path: portPath, baudRate: 115200, rtscts: false, adapter: "ember"}),
+-    })
+-        .catch((error) => {
+-            process.stderr.write(`BMS energy scan failed: ${error}\n`);
+-            return EXIT_ERROR;
+-        })
+-        .then((code) => {
+-            // stdout в канал (pipe) на части систем пишется асинхронно: выходим, только когда строка ушла.
+-            // Выход явный: после стопа EZSP могут остаться таймеры ASH, ждать их незачем.
+-            process.stdout.write("", () => process.exit(code));
+-        });
++    runCliMain("BMS energy scan failed", (output) => runEnergyScanCli(process.argv.slice(2), {...output, createEzsp: createCliEzsp}));
+ }
+ /* v8 ignore stop */
+diff --git a/src/adapter/ember/bms/ezspSession.ts b/src/adapter/ember/bms/ezspSession.ts
+new file mode 100644
+index 0000000..45d7ab0
+--- /dev/null
++++ b/src/adapter/ember/bms/ezspSession.ts
+@@ -0,0 +1,125 @@
++/**
++ * BMS: общее для наших CLI (энергоскан, поиск координатора) — открыть EZSP так же, как ember-адаптер, и всегда закрыть.
++ *
++ * Почему отдельный модуль: оба CLI подключаются к координатору ДО Z2M и должны делать первые шаги ровно как
++ * EmberAdapter.initEzsp/emberVersion (сброс NCP по ASH, затем VERSION) и всегда отпускать порт — иначе следом
++ * не подключится Z2M. Одна реализация на оба, чтобы они не разошлись.
++ */
++import {setLogger} from "../../../utils/logger";
++import {EzspStatus} from "../enums";
++import {EZSP_MIN_PROTOCOL_VERSION, EZSP_PROTOCOL_VERSION, EZSP_STACK_TYPE_MESH} from "../ezsp/consts";
++import {Ezsp} from "../ezsp/ezsp";
++
++/** Только то, что сеанс берёт у Ezsp: тесты подставляют сюда поддельный. */
++export type EzspSessionEzsp = Pick<Ezsp, "start" | "stop" | "ezspVersion" | "setProtocolVersion">;
++
++export type NcpVersion = {
++    /** версия протокола EZSP, на которой работает NCP */
++    protocolVersion: number;
++    /** версия стека из ответа VERSION: 4 полубайта major.minor.patch.special */
++    stackVersion: number;
++    /** хост (этот ember-адаптер) умеет говорить с NCP дальше VERSION */
++    supported: boolean;
++};
++
++/**
++ * Запустить EZSP (сброс NCP по ASH) и согласовать версию — как EmberAdapter.initEzsp + emberVersion.
++ * На неподдерживаемом протоколе не бросает: решает вызывающий (энергоскан — ошибка, поиск — «прошивка старая»).
++ * Версия хоста выставляется только для поддерживаемого протокола: с другим NCP мы дальше VERSION не говорим.
++ */
++export async function startEzspSession(ezsp: EzspSessionEzsp): Promise<NcpVersion> {
++    const startStatus = await ezsp.start();
++
++    if (startStatus !== EzspStatus.SUCCESS) {
++        throw new Error(`Failed to start EZSP layer with status=${EzspStatus[startStatus]}.`);
++    }
++
++    let [protocolVersion, stackType, stackVersion] = await ezsp.ezspVersion(EZSP_PROTOCOL_VERSION);
++
++    if (stackType !== EZSP_STACK_TYPE_MESH) {
++        throw new Error(`Stack type ${stackType} is not expected.`);
++    }
++
++    if (protocolVersion < EZSP_PROTOCOL_VERSION && protocolVersion >= EZSP_MIN_PROTOCOL_VERSION) {
++        [protocolVersion, , stackVersion] = await ezsp.ezspVersion(protocolVersion);
++    }
++
++    const supported = protocolVersion >= EZSP_MIN_PROTOCOL_VERSION && protocolVersion <= EZSP_PROTOCOL_VERSION;
++
++    if (supported) {
++        ezsp.setProtocolVersion(protocolVersion);
++    }
++
++    return {protocolVersion, stackVersion, supported};
++}
++
++export function unsupportedProtocolMessage(protocolVersion: number): string {
++    return `Adapter EZSP protocol version (${protocolVersion}) is not supported [${EZSP_MIN_PROTOCOL_VERSION}-${EZSP_PROTOCOL_VERSION}].`;
++}
++
++/**
++ * Открыть сеанс EZSP, выполнить работу и закрыть EZSP ВСЕГДА — и при ошибке, и по таймауту (порт освобождается для Z2M).
++ * Таймаут нужен поиску: TCP-подключение к адресу, где пакеты молча теряются, само не кончается, а сброс ASH
++ * на чужом (не EZSP) порту ждёт RSTACK до 5 попыток по 5 с.
++ */
++export async function withEzspSession<T>(ezsp: EzspSessionEzsp, work: (version: NcpVersion) => Promise<T>, timeout?: number): Promise<T> {
++    let timer: NodeJS.Timeout | undefined;
++
++    try {
++        const session = startEzspSession(ezsp).then(work);
++
++        if (timeout === undefined) {
++            return await session;
++        }
++
++        // поздний отказ брошенного по таймауту сеанса не всплывёт как Unhandled Rejection: race уже подписан на него
++        const expired = new Promise<never>((_resolve, reject) => {
++            timer = setTimeout(() => reject(new Error(`No EZSP answer within ${timeout}ms.`)), timeout);
++        });
++
++        return await Promise.race([session, expired]);
++    } finally {
++        clearTimeout(timer);
++        await ezsp.stop();
++    }
++}
++
++/** Ezsp для CLI. Скорость важна только для последовательного порта (как в Z2M по умолчанию); для tcp:// не используется. */
++export function createCliEzsp(portPath: string): Ezsp {
++    return new Ezsp({path: portPath, baudRate: 115200, rtscts: false, adapter: "ember"});
++}
++
++export type CliOutput = {
++    stdout: (line: string) => void;
++    stderr: (line: string) => void;
++};
++
++/* v8 ignore start */
++/**
++ * Обвязка процесса для наших CLI: журнал ядра — в stderr (info/debug — только при BMS_DEBUG=1), чтобы stdout оставался
++ * одной строкой JSON по контракту с дополнением; неожиданная ошибка — код 2 (у обоих CLI это «ошибка»).
++ */
++export function runCliMain(errorPrefix: string, run: (output: CliOutput) => Promise<number>): void {
++    const toStderr = (message: string | (() => string), namespace: string): void => {
++        process.stderr.write(`[${new Date().toISOString()}] ${namespace}: ${typeof message === "function" ? message() : message}\n`);
++    };
++    const quiet = (): void => {};
++    const verbose = process.env.BMS_DEBUG === "1";
++
++    setLogger({debug: verbose ? toStderr : quiet, info: verbose ? toStderr : quiet, warning: toStderr, error: toStderr});
++
++    void run({
++        stdout: (line) => process.stdout.write(`${line}\n`),
++        stderr: (line) => process.stderr.write(`${line}\n`),
++    })
++        .catch((error) => {
++            process.stderr.write(`${errorPrefix}: ${error}\n`);
++            return 2;
++        })
++        .then((code) => {
++            // stdout в канал (pipe) на части систем пишется асинхронно: выходим, только когда строка ушла.
++            // Выход явный: после стопа EZSP могут остаться таймеры ASH (и брошенный по таймауту сеанс), ждать их незачем.
++            process.stdout.write("", () => process.exit(code));
++        });
++}
++/* v8 ignore stop */
+diff --git a/test/adapter/ember/coordinatorProbe.test.ts b/test/adapter/ember/coordinatorProbe.test.ts
+new file mode 100644
+index 0000000..e120066
+--- /dev/null
++++ b/test/adapter/ember/coordinatorProbe.test.ts
+@@ -0,0 +1,556 @@
++import {EventEmitter} from "node:events";
++import {type AddressInfo, createServer, type Socket} from "node:net";
++import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
++import {EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, parseDiscoverArgs, runCoordinatorCli, USAGE} from "../../../src/adapter/ember/bms/coordinatorCli";
++import {
++    CONNECT_CONCURRENCY,
++    CONNECT_TIMEOUT_MSEC,
++    DEFAULT_COORDINATOR_PORT,
++    discoverCoordinators,
++    findOpenPorts,
++    formatStackVersion,
++    isTcpCoordinatorPath,
++    isTcpPortOpen,
++    MAX_NETWORK_ADDRESSES,
++    networkHosts,
++    PROBE_TIMEOUT_MSEC,
++    type ProbeEzsp,
++    type ProbeResult,
++    parseCidr,
++    probeCoordinator,
++} from "../../../src/adapter/ember/bms/coordinatorProbe";
++import {createCliEzsp} from "../../../src/adapter/ember/bms/ezspSession";
++import {EmberVersionType, EzspStatus, SLStatus} from "../../../src/adapter/ember/enums";
++import {EZSP_MIN_PROTOCOL_VERSION, EZSP_PROTOCOL_VERSION, EZSP_STACK_TYPE_MESH} from "../../../src/adapter/ember/ezsp/consts";
++import {Ezsp} from "../../../src/adapter/ember/ezsp/ezsp";
++import {EzspError} from "../../../src/adapter/ember/ezspError";
++
++vi.mock("../../../src/adapter/ember/uart/ash");
++
++const EUI64 = "0x1122334455667788";
++const PATH = "tcp://192.168.1.50:6638";
++/** EmberZNet 7.4.4.0 build 77 GA — так отвечает SLZB-06M */
++const VERSION_STRUCT = {build: 77, major: 7, minor: 4, patch: 4, special: 0, type: EmberVersionType.GA};
++
++/**
++ * Поддельный Ezsp: NCP отвечает протоколом `ncpProtocol`; хост, как настоящий, согласует версию (второй VERSION).
++ * Любое обращение к чему-то кроме сброса, VERSION, VERSION_INFO и EUI64 — ошибка теста: probe не должен трогать координатор.
++ */
++function makeFakeEzsp(ncpProtocol: number, stackVersion = 0x7440) {
++    const fake = {
++        start: vi.fn().mockResolvedValue(EzspStatus.SUCCESS),
++        stop: vi.fn().mockResolvedValue(undefined),
++        // как настоящий NCP: на любой запрос отвечает своей версией протокола
++        ezspVersion: vi.fn().mockImplementation(() => [ncpProtocol, EZSP_STACK_TYPE_MESH, stackVersion]),
++        setProtocolVersion: vi.fn(),
++        ezspGetVersionStruct: vi.fn().mockResolvedValue([SLStatus.OK, VERSION_STRUCT]),
++        ezspGetEui64: vi.fn().mockResolvedValue(EUI64),
++    };
++    const guarded = new Proxy(fake, {
++        get(target, prop) {
++            if (!(prop in target)) {
++                throw new Error(`Unexpected Ezsp access: ${String(prop)}`);
++            }
++
++            return target[prop as keyof typeof target];
++        },
++        set(_target, prop) {
++            throw new Error(`Unexpected Ezsp write: ${String(prop)}`);
++        },
++    });
++
++    return {fake, ezsp: guarded as unknown as ProbeEzsp};
++}
++
++describe("BMS coordinator probe", () => {
++    beforeEach(() => {
++        vi.useFakeTimers();
++    });
++
++    afterEach(() => {
++        vi.useRealTimers();
++    });
++
++    describe("probeCoordinator", () => {
++        it("reads protocol, stack version and EUI64 from an EmberZNet 7.4 (EZSP v13) coordinator, then stops", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13);
++
++            await expect(probeCoordinator(ezsp, PATH)).resolves.toStrictEqual({
++                ok: true,
++                path: PATH,
++                ezspProtocol: 13,
++                stackVersion: "7.4.4.0",
++                eui64: EUI64,
++            });
++            // как EmberAdapter.emberVersion: сначала своя версия, затем версия NCP
++            expect(fake.ezspVersion.mock.calls).toStrictEqual([[EZSP_PROTOCOL_VERSION], [13]]);
++            expect(fake.setProtocolVersion).toHaveBeenCalledWith(13);
++            expect(fake.start).toHaveBeenCalledTimes(1);
++            expect(fake.ezspGetVersionStruct).toHaveBeenCalledTimes(1);
++            expect(fake.ezspGetEui64).toHaveBeenCalledTimes(1);
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++            expect(fake.stop.mock.invocationCallOrder[0]).toBeGreaterThan(fake.ezspGetEui64.mock.invocationCallOrder[0]);
++            expect(vi.getTimerCount()).toStrictEqual(0);
++        });
++
++        it("does not re-negotiate when the NCP speaks the host protocol", async () => {
++            const {fake, ezsp} = makeFakeEzsp(EZSP_PROTOCOL_VERSION);
++
++            await expect(probeCoordinator(ezsp, PATH)).resolves.toMatchObject({ok: true, ezspProtocol: EZSP_PROTOCOL_VERSION, eui64: EUI64});
++            expect(fake.ezspVersion).toHaveBeenCalledTimes(1);
++        });
++
++        it.each([
++            ["old EmberZNet 6.10 (EZSP v8)", 8, 0x6a30, "6.10.3.0"],
++            ["just below the minimum", EZSP_MIN_PROTOCOL_VERSION - 1, 0x7100, "7.1.0.0"],
++            ["newer than the host", EZSP_PROTOCOL_VERSION + 1, 0x9000, "9.0.0.0"],
++        ])(
++            "reports %s as found, with its real protocol and no EUI64, sending nothing after VERSION",
++            async (_name, protocol, stack, stackVersion) => {
++                const {fake, ezsp} = makeFakeEzsp(protocol, stack);
++
++                await expect(probeCoordinator(ezsp, PATH)).resolves.toStrictEqual({
++                    ok: true,
++                    path: PATH,
++                    ezspProtocol: protocol,
++                    stackVersion,
++                    eui64: null,
++                });
++                expect(fake.ezspVersion).toHaveBeenCalledTimes(1);
++                expect(fake.setProtocolVersion).toHaveBeenCalledTimes(0);
++                expect(fake.ezspGetVersionStruct).toHaveBeenCalledTimes(0);
++                expect(fake.ezspGetEui64).toHaveBeenCalledTimes(0);
++                expect(fake.stop).toHaveBeenCalledTimes(1);
++            },
++        );
++
++        it("falls back to the VERSION stack version when VERSION_INFO is refused", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13, 0x7430);
++            fake.ezspGetVersionStruct.mockResolvedValueOnce([SLStatus.ZIGBEE_EZSP_ERROR, VERSION_STRUCT]);
++
++            await expect(probeCoordinator(ezsp, PATH)).resolves.toMatchObject({ok: true, stackVersion: "7.4.3.0", eui64: EUI64});
++        });
++
++        it("fails (closed port / not EZSP) when EZSP does not start, and stops", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13);
++            fake.start.mockResolvedValueOnce(EzspStatus.HOST_FATAL_ERROR);
++
++            await expect(probeCoordinator(ezsp, PATH)).resolves.toStrictEqual({
++                ok: false,
++                path: PATH,
++                error: "Failed to start EZSP layer with status=HOST_FATAL_ERROR.",
++            });
++            expect(fake.ezspVersion).toHaveBeenCalledTimes(0);
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("fails on a non-mesh stack", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13);
++            fake.ezspVersion.mockResolvedValueOnce([13, 0x01, 0x7440]);
++
++            await expect(probeCoordinator(ezsp, PATH)).resolves.toStrictEqual({ok: false, path: PATH, error: "Stack type 1 is not expected."});
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("fails when reading EUI64 fails", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13);
++            fake.ezspGetEui64.mockRejectedValueOnce(new EzspError(EzspStatus.ASH_ERROR_TIMEOUTS));
++
++            await expect(probeCoordinator(ezsp, PATH)).resolves.toStrictEqual({ok: false, path: PATH, error: "ASH_ERROR_TIMEOUTS"});
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("times out when nothing answers, stops, and a late answer does not leak", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13);
++            let lateStart!: (status: EzspStatus) => void;
++            fake.start.mockReturnValueOnce(
++                new Promise((resolve) => {
++                    lateStart = resolve;
++                }),
++            );
++            const p = probeCoordinator(ezsp, PATH);
++
++            await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MSEC - 1);
++            expect(fake.stop).toHaveBeenCalledTimes(0);
++            await vi.advanceTimersByTimeAsync(1);
++            await expect(p).resolves.toStrictEqual({ok: false, path: PATH, error: `No EZSP answer within ${PROBE_TIMEOUT_MSEC}ms.`});
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++            expect(vi.getTimerCount()).toStrictEqual(0);
++
++            // брошенный сеанс всё же «ответил» и упал — ни отказа без обработчика, ни второго стопа
++            fake.ezspVersion.mockRejectedValueOnce(new EzspError(EzspStatus.NOT_CONNECTED));
++            lateStart(EzspStatus.SUCCESS);
++            await vi.advanceTimersByTimeAsync(10);
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++    });
++
++    describe("helpers", () => {
++        it("formats the VERSION stack version by nibbles", () => {
++            expect(formatStackVersion(0x7440)).toStrictEqual("7.4.4.0");
++            expect(formatStackVersion(0x6a31)).toStrictEqual("6.10.3.1");
++        });
++
++        it.each(["tcp://192.168.1.50:6638", "tcp://slzb-06m.local:6638", "tcp://10.0.0.1:1/"])("accepts probe path %s", (path) => {
++            expect(isTcpCoordinatorPath(path)).toStrictEqual(true);
++        });
++
++        it.each([
++            "192.168.1.50:6638",
++            "tcp://192.168.1.50",
++            "tcp://192.168.1.50:0",
++            "tcp://192.168.1.50:70000",
++            "http://192.168.1.50:6638",
++            "tcp://192.168.1.50:6638/x",
++            "tcp://192.168.1.50:6638?a=1",
++            "tcp://192.168.1.50:6638#a",
++            "tcp://user@192.168.1.50:6638",
++            "/dev/ttyUSB0",
++            "",
++        ])("rejects probe path %j", (path) => {
++            expect(isTcpCoordinatorPath(path)).toStrictEqual(false);
++        });
++
++        it("parses CIDR, taking the network of an interface address", () => {
++            expect(parseCidr("192.168.1.37/24")).toStrictEqual({cidr: "192.168.1.37/24", network: 0xc0a80100, prefix: 24, size: 256});
++            expect(parseCidr("10.20.30.40/32")).toStrictEqual({cidr: "10.20.30.40/32", network: 0x0a141e28, prefix: 32, size: 1});
++            expect(parseCidr("172.16.5.9/22")).toMatchObject({network: 0xac100400, size: MAX_NETWORK_ADDRESSES});
++            expect(parseCidr("172.16.5.9/21")).toMatchObject({size: 2048});
++            expect(parseCidr("255.255.255.255/0")).toMatchObject({network: 0, size: 2 ** 32});
++        });
++
++        it.each([
++            "192.168.1.0",
++            "192.168.1.0/33",
++            "192.168.1.256/24",
++            "192.168.1/24",
++            "192.168.1.0.1/24",
++            "a.b.c.d/24",
++            "192.168.1.0/",
++            "/24",
++            "fe80::1/64",
++        ])("rejects CIDR %j", (cidr) => {
++            expect(parseCidr(cidr)).toStrictEqual(undefined);
++        });
++
++        it("lists hosts without network and broadcast addresses, except /31 and /32", () => {
++            const hosts24 = networkHosts(parseCidr("192.168.1.37/24")!);
++
++            expect(hosts24.length).toStrictEqual(254);
++            expect(hosts24[0]).toStrictEqual("192.168.1.1");
++            expect(hosts24[253]).toStrictEqual("192.168.1.254");
++            expect(networkHosts(parseCidr("192.168.1.5/30")!)).toStrictEqual(["192.168.1.5", "192.168.1.6"]);
++            expect(networkHosts(parseCidr("192.168.1.5/31")!)).toStrictEqual(["192.168.1.4", "192.168.1.5"]);
++            expect(networkHosts(parseCidr("127.0.0.1/32")!)).toStrictEqual(["127.0.0.1"]);
++            const hosts22 = networkHosts(parseCidr("10.0.7.1/22")!);
++            expect(hosts22.length).toStrictEqual(1022);
++            expect(hosts22[0]).toStrictEqual("10.0.4.1");
++            expect(hosts22[1021]).toStrictEqual("10.0.7.254");
++        });
++    });
++
++    describe("TCP port check", () => {
++        class FakeSocket extends EventEmitter {
++            connect = vi.fn();
++            destroy = vi.fn();
++        }
++
++        const check = (socket: FakeSocket) => isTcpPortOpen("192.168.1.50", 6638, undefined, () => socket as unknown as Socket);
++
++        it("is open on connect, and closes the socket right away", async () => {
++            const socket = new FakeSocket();
++            const p = check(socket);
++
++            expect(socket.connect).toHaveBeenCalledWith(6638, "192.168.1.50");
++            socket.emit("connect");
++            await expect(p).resolves.toStrictEqual(true);
++            expect(socket.destroy).toHaveBeenCalledTimes(1);
++            // ошибка после закрытия не роняет процесс
++            expect(() => socket.emit("error", new Error("ECONNRESET"))).not.toThrow();
++            expect(vi.getTimerCount()).toStrictEqual(0);
++        });
++
++        it("is closed on error (connection refused)", async () => {
++            const socket = new FakeSocket();
++            const p = check(socket);
++
++            socket.emit("error", new Error("ECONNREFUSED"));
++            await expect(p).resolves.toStrictEqual(false);
++            expect(socket.destroy).toHaveBeenCalledTimes(1);
++            expect(vi.getTimerCount()).toStrictEqual(0);
++        });
++
++        it("is closed on timeout (no host), and a late connect changes nothing", async () => {
++            const socket = new FakeSocket();
++            const p = check(socket);
++
++            await vi.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MSEC);
++            await expect(p).resolves.toStrictEqual(false);
++            expect(socket.destroy).toHaveBeenCalledTimes(1);
++            socket.emit("connect");
++            expect(socket.destroy).toHaveBeenCalledTimes(1);
++        });
++
++        it("works with a real socket: open port, then refused after the server is gone", async () => {
++            vi.useRealTimers();
++            const server = createServer((socket) => socket.destroy());
++            await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++            const {port} = server.address() as AddressInfo;
++
++            await expect(isTcpPortOpen("127.0.0.1", port)).resolves.toStrictEqual(true);
++            await new Promise((resolve) => server.close(resolve));
++            await expect(isTcpPortOpen("127.0.0.1", port)).resolves.toStrictEqual(false);
++        });
++
++        it("finds open ports in parallel, at most `concurrency` at once, keeping address order", async () => {
++            const hosts = Array.from({length: 200}, (_v, i) => `10.0.0.${i + 1}`);
++            let running = 0;
++            let maxRunning = 0;
++            const portCheck = vi.fn(async (host: string, port: number) => {
++                running++;
++                maxRunning = Math.max(maxRunning, running);
++                // ответы приходят вразнобой: дальние адреса отвечают раньше ближних
++                await new Promise((resolve) => setTimeout(resolve, 300 - (Number(host.split(".")[3]) % 7) * 40));
++                running--;
++                return port === 6638 && (host === "10.0.0.3" || host === "10.0.0.150" || host === "10.0.0.9");
++            });
++            const p = findOpenPorts(hosts, 6638, portCheck);
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await expect(p).resolves.toStrictEqual(["10.0.0.3", "10.0.0.9", "10.0.0.150"]);
++            expect(portCheck).toHaveBeenCalledTimes(200);
++            expect(maxRunning).toStrictEqual(CONNECT_CONCURRENCY);
++            await expect(findOpenPorts([], 6638, portCheck)).resolves.toStrictEqual([]);
++        });
++    });
++
++    describe("discoverCoordinators", () => {
++        const okResult = (path: string, eui64: string | null = EUI64): ProbeResult => ({
++            ok: true,
++            path,
++            ezspProtocol: 13,
++            stackVersion: "7.4.4.0",
++            eui64: eui64 as `0x${string}` | null,
++        });
++
++        it("probes open ports one by one and returns only EZSP coordinators", async () => {
++            const log = vi.fn();
++            let probing = 0;
++            const probe = vi.fn(async (path: string): Promise<ProbeResult> => {
++                // каждый probe сбрасывает NCP: два сразу быть не должно
++                expect(probing).toStrictEqual(0);
++                probing++;
++                await Promise.resolve();
++                probing--;
++                return path === "tcp://192.168.1.20:6638" ? okResult(path) : {ok: false, path, error: "No EZSP answer within 15000ms."};
++            });
++            const found = await discoverCoordinators({
++                networks: [parseCidr("192.168.1.0/24")!, parseCidr("192.168.1.20/32")!],
++                port: 6638,
++                checkPort: async (host) => host === "192.168.1.20" || host === "192.168.1.7",
++                probe,
++                log,
++            });
++
++            expect(found).toStrictEqual([{path: "tcp://192.168.1.20:6638", ezspProtocol: 13, stackVersion: "7.4.4.0", eui64: EUI64}]);
++            // адрес из двух сетей проверяется один раз
++            expect(probe.mock.calls).toStrictEqual([["tcp://192.168.1.7:6638"], ["tcp://192.168.1.20:6638"]]);
++            expect(log).toHaveBeenCalledWith("tcp://192.168.1.7:6638: no EZSP coordinator (No EZSP answer within 15000ms.)");
++        });
++
++        it("filters by EUI64", async () => {
++            const log = vi.fn();
++            const found = await discoverCoordinators({
++                networks: [parseCidr("10.1.1.0/29")!],
++                port: 7000,
++                eui64: "0xaabbccddeeff0011",
++                checkPort: async (host) => host !== "10.1.1.2",
++                probe: async (path) =>
++                    okResult(path, path === "tcp://10.1.1.4:7000" ? "0xaabbccddeeff0011" : path === "tcp://10.1.1.5:7000" ? null : EUI64),
++                log,
++            });
++
++            expect(found).toStrictEqual([{path: "tcp://10.1.1.4:7000", ezspProtocol: 13, stackVersion: "7.4.4.0", eui64: "0xaabbccddeeff0011"}]);
++            expect(log).toHaveBeenCalledWith(`tcp://10.1.1.1:7000: EUI64 ${EUI64} does not match 0xaabbccddeeff0011, skipping.`);
++            expect(log).toHaveBeenCalledWith("tcp://10.1.1.5:7000: EUI64 null does not match 0xaabbccddeeff0011, skipping.");
++        });
++
++        it("skips networks with more than 1024 addresses", async () => {
++            const log = vi.fn();
++            const checkPort = vi.fn().mockResolvedValue(false);
++            const found = await discoverCoordinators({
++                networks: [parseCidr("10.0.0.0/21")!, parseCidr("10.8.0.0/22")!],
++                port: 6638,
++                checkPort,
++                probe: vi.fn(),
++                log,
++            });
++
++            expect(found).toStrictEqual([]);
++            expect(log).toHaveBeenCalledWith("Skipping network 10.0.0.0/21: 2048 addresses, more than 1024.");
++            expect(checkPort).toHaveBeenCalledTimes(1022);
++            expect(checkPort).not.toHaveBeenCalledWith("10.0.0.1", 6638);
++        });
++    });
++
++    describe("CLI", () => {
++        const makeIo = (probeEzsp?: ProbeEzsp, openHosts: string[] = []) => ({
++            stdout: vi.fn(),
++            stderr: vi.fn(),
++            createEzsp: vi.fn().mockReturnValue(probeEzsp),
++            checkPort: vi.fn(async (host: string, _port: number) => openHosts.includes(host)),
++        });
++
++        it("exit codes are fixed by the contract", () => {
++            expect([EXIT_OK, EXIT_ERROR, EXIT_NOT_FOUND]).toStrictEqual([0, 2, 3]);
++        });
++
++        it.each([[[]], [["scan"]], [["--help"]]])("exits 2 with usage on unknown command %j", async (args) => {
++            const io = makeIo();
++
++            await expect(runCoordinatorCli(args, io)).resolves.toStrictEqual(EXIT_ERROR);
++            expect(io.stderr).toHaveBeenCalledWith(USAGE);
++            expect(io.stdout).toHaveBeenCalledTimes(0);
++        });
++
++        it.each([[[]], [[PATH, "extra"]], [["192.168.1.50:6638"]], [["tcp://192.168.1.50"]], [["/dev/ttyUSB0"]]])(
++            "probe exits 2 on bad arguments %j, stdout empty",
++            async (args) => {
++                const io = makeIo();
++
++                await expect(runCoordinatorCli(["probe", ...args], io)).resolves.toStrictEqual(EXIT_ERROR);
++                expect(io.stderr).toHaveBeenCalledWith(expect.stringContaining(USAGE));
++                expect(io.stdout).toHaveBeenCalledTimes(0);
++                expect(io.createEzsp).toHaveBeenCalledTimes(0);
++            },
++        );
++
++        it("probe prints ONE line of JSON and exits 0 on a coordinator", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13);
++            const io = makeIo(ezsp);
++
++            await expect(runCoordinatorCli(["probe", PATH], io)).resolves.toStrictEqual(EXIT_OK);
++            expect(io.createEzsp).toHaveBeenCalledWith(PATH);
++            expect(io.stdout).toHaveBeenCalledTimes(1);
++            expect(io.stdout).toHaveBeenCalledWith(`{"ok":true,"path":"${PATH}","ezspProtocol":13,"stackVersion":"7.4.4.0","eui64":"${EUI64}"}`);
++            expect(io.stderr).toHaveBeenCalledTimes(0);
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("probe prints ok:false and exits 3 when there is no coordinator", async () => {
++            const {fake, ezsp} = makeFakeEzsp(13);
++            fake.start.mockResolvedValueOnce(EzspStatus.HOST_FATAL_ERROR);
++            const io = makeIo(ezsp);
++
++            await expect(runCoordinatorCli(["probe", PATH], io)).resolves.toStrictEqual(EXIT_NOT_FOUND);
++            expect(io.stdout).toHaveBeenCalledTimes(1);
++            expect(io.stdout).toHaveBeenCalledWith(
++                `{"ok":false,"path":"${PATH}","error":"Failed to start EZSP layer with status=HOST_FATAL_ERROR."}`,
++            );
++        });
++
++        it("probe reports an old coordinator as ok with eui64 null", async () => {
++            const {ezsp} = makeFakeEzsp(8, 0x6a30);
++            const io = makeIo(ezsp);
++
++            await expect(runCoordinatorCli(["probe", PATH], io)).resolves.toStrictEqual(EXIT_OK);
++            expect(io.stdout).toHaveBeenCalledWith(`{"ok":true,"path":"${PATH}","ezspProtocol":8,"stackVersion":"6.10.3.0","eui64":null}`);
++        });
++
++        it("parses discover arguments", () => {
++            expect(parseDiscoverArgs(["192.168.1.37/24"])).toStrictEqual({
++                networks: [parseCidr("192.168.1.37/24")],
++                port: DEFAULT_COORDINATOR_PORT,
++                eui64: undefined,
++            });
++            expect(parseDiscoverArgs(["--eui64", "0xAABBCCDDEEFF0011", "10.0.0.0/24", "--port", "7000", "10.0.1.0/24"])).toStrictEqual({
++                networks: [parseCidr("10.0.0.0/24"), parseCidr("10.0.1.0/24")],
++                port: 7000,
++                eui64: "0xaabbccddeeff0011",
++            });
++            // слишком большая сеть — не ошибка аргументов: её пропустит сам поиск
++            expect(parseDiscoverArgs(["10.0.0.0/8"])).toMatchObject({networks: [{prefix: 8}]});
++        });
++
++        it.each([
++            [[], "No network given."],
++            [["--port", "6638"], "No network given."],
++            [["192.168.1.0/24", "--port"], "Invalid --port: (missing)"],
++            [["192.168.1.0/24", "--port", "0"], "Invalid --port: 0"],
++            [["192.168.1.0/24", "--port", "65536"], "Invalid --port: 65536"],
++            [["192.168.1.0/24", "--port", "66x"], "Invalid --port: 66x"],
++            [["192.168.1.0/24", "--eui64"], "Invalid --eui64: (missing)"],
++            [["192.168.1.0/24", "--eui64", "1122334455667788"], "Invalid --eui64: 1122334455667788"],
++            [["192.168.1.0/24", "--eui64", "0x11223344556677"], "Invalid --eui64: 0x11223344556677"],
++            [["192.168.1.0/33"], "Invalid network: 192.168.1.0/33"],
++            [["192.168.1.0/24", "--verbose"], "Invalid network: --verbose"],
++        ])("discover exits 2 on bad arguments %j, stdout empty", async (args, message) => {
++            const io = makeIo();
++
++            expect(parseDiscoverArgs(args)).toStrictEqual(expect.stringContaining(message));
++            await expect(runCoordinatorCli(["discover", ...args], io)).resolves.toStrictEqual(EXIT_ERROR);
++            expect(io.stderr).toHaveBeenCalledWith(expect.stringContaining(message));
++            expect(io.stdout).toHaveBeenCalledTimes(0);
++            expect(io.checkPort).toHaveBeenCalledTimes(0);
++        });
++
++        it("discover prints ONE line with what was found and exits 0", async () => {
++            const {ezsp} = makeFakeEzsp(13);
++            const io = makeIo(ezsp, ["192.168.1.50"]);
++
++            await expect(runCoordinatorCli(["discover", "192.168.1.37/24"], io)).resolves.toStrictEqual(EXIT_OK);
++            expect(io.checkPort).toHaveBeenCalledTimes(254);
++            expect(io.checkPort).toHaveBeenCalledWith("192.168.1.50", 6638);
++            expect(io.createEzsp).toHaveBeenCalledTimes(1);
++            expect(io.createEzsp).toHaveBeenCalledWith(PATH);
++            expect(io.stdout).toHaveBeenCalledTimes(1);
++            expect(io.stdout).toHaveBeenCalledWith(`{"found":[{"path":"${PATH}","ezspProtocol":13,"stackVersion":"7.4.4.0","eui64":"${EUI64}"}]}`);
++        });
++
++        it("discover with --eui64 keeps only the matching coordinator", async () => {
++            const io = makeIo(makeFakeEzsp(13).ezsp, ["192.168.1.50"]);
++
++            await expect(runCoordinatorCli(["discover", "192.168.1.0/24", "--eui64", "0xAABBCCDDEEFF0011"], io)).resolves.toStrictEqual(
++                EXIT_NOT_FOUND,
++            );
++            expect(io.stdout).toHaveBeenCalledWith('{"found":[]}');
++
++            const io2 = makeIo(makeFakeEzsp(13).ezsp, ["192.168.1.50"]);
++
++            await expect(runCoordinatorCli(["discover", "192.168.1.0/24", "--eui64", EUI64], io2)).resolves.toStrictEqual(EXIT_OK);
++            expect(io2.stdout).toHaveBeenCalledWith(expect.stringContaining(`"eui64":"${EUI64}"`));
++        });
++
++        it("discover prints an empty list and exits 3 when nobody is there", async () => {
++            const io = makeIo(undefined, []);
++
++            await expect(runCoordinatorCli(["discover", "127.0.0.1/32", "--port", "16641"], io)).resolves.toStrictEqual(EXIT_NOT_FOUND);
++            expect(io.checkPort).toHaveBeenCalledWith("127.0.0.1", 16641);
++            expect(io.createEzsp).toHaveBeenCalledTimes(0);
++            expect(io.stdout).toHaveBeenCalledTimes(1);
++            expect(io.stdout).toHaveBeenCalledWith('{"found":[]}');
++        });
++
++        it("discover of a too large network only: skip note, empty list, exit 3", async () => {
++            const io = makeIo();
++
++            await expect(runCoordinatorCli(["discover", "10.0.0.0/16"], io)).resolves.toStrictEqual(EXIT_NOT_FOUND);
++            expect(io.stderr).toHaveBeenCalledWith("Skipping network 10.0.0.0/16: 65536 addresses, more than 1024.");
++            expect(io.checkPort).toHaveBeenCalledTimes(0);
++            expect(io.stdout).toHaveBeenCalledWith('{"found":[]}');
++        });
++
++        it("exits 2 with stdout empty on an internal error", async () => {
++            const io = makeIo();
++            io.checkPort.mockRejectedValueOnce(new Error("EMFILE: too many open files"));
++
++            await expect(runCoordinatorCli(["discover", "127.0.0.1/32"], io)).resolves.toStrictEqual(EXIT_ERROR);
++            expect(io.stderr).toHaveBeenCalledWith("BMS coordinator discover failed: EMFILE: too many open files");
++            expect(io.stdout).toHaveBeenCalledTimes(0);
++        });
++
++        it("creates a real Ezsp for the CLI", () => {
++            expect(createCliEzsp("tcp://127.0.0.1:6638")).toBeInstanceOf(Ezsp);
++        });
++    });
++});
