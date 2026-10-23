@@ -1,0 +1,681 @@
+BMS: ограничитель групповых команд (накладывается после 0001-group-coalescing).
+
+Зачем: групповая команда Zigbee — широковещание; его пересылает каждый повторитель (до 3 раз), и каждый
+узел держит о нём запись в таблице широковещаний (BTT, в EmberZNet по умолчанию 15 записей) около 9 с.
+На живой сети (28 повторителей) ползунок яркости/цвета группы в HA давал несколько групповых в секунду:
+до 49 сообщений/с, NCP отвечал BUSY, 12 ROUTE_ERROR за минуту, одноадресные команды реле висели по 10 с.
+
+Что делает (и для прямых <base>/<группа>/set, и для склеенных из 0001):
+- на группу — не чаще одной команды за bms_group_throttle_window (1000 мс): примерно столько длится
+  волна одного широковещания по сети с повторами; следующая раньше — лишь удваивает эфир;
+- на всю сеть — не больше bms_broadcast_budget (8) групповых за bms_broadcast_budget_window (9000 мс,
+  время жизни записи BTT): около половины таблицы, остальное — запросам маршрутов, ZDO, устройствам;
+- пока ограничение действует, новые команды группе не копятся: сливаются в одну отложенную (последнее
+  значение каждого поля побеждает; OFF отбрасывает более ранние яркость/цвет, яркость > 0 без state
+  отменяет более ранний OFF), по истечении уходит одна; state не теряется;
+- состояния Z2M обновляются только при фактической отправке (тот же publishParsed);
+- toggle, сцены, эффекты, *_move/*_step — сразу (перед ними уходит отложенная той же группы), но в учёт;
+- команды отдельным устройствам не трогаются;
+- журнал: "BMS: групповая к '<группа>' отложена на N мс (…)" / "объединена с отложенной (…)",
+  не чаще раза в секунду на группу.
+
+Настройки: advanced.bms_group_throttle (true), bms_group_throttle_window, bms_broadcast_budget,
+bms_broadcast_budget_window. Тесты: test/extensions/bmsGroupThrottle.test.ts; в publish/groups/
+bmsGroupCoalescing.test.ts ограничитель выключен (они про другое), в bridge.test.ts — новые настройки.
+
+diff --git a/lib/extension/publish.ts b/lib/extension/publish.ts
+index e406aba..f9429e5 100644
+--- a/lib/extension/publish.ts
++++ b/lib/extension/publish.ts
+@@ -3,6 +3,7 @@ import type * as zhc from "zigbee-herdsman-converters";
+ import Device from "../model/device";
+ import Group from "../model/group";
+ import {GroupCoalescer} from "../util/bmsGroupCoalescing";
++import {GroupThrottle} from "../util/bmsGroupThrottle";
+ import logger from "../util/logger";
+ import * as settings from "../util/settings";
+ import {stringify} from "../util/stringify";
+@@ -27,8 +28,11 @@ interface ParsedTopic {
+ }
+ 
+ export default class Publish extends Extension {
++    // BMS: ограничитель частоты групповых команд (широковещаний) — lib/util/bmsGroupThrottle.ts.
++    private throttle = new GroupThrottle(this.zigbee, this.publishParsed, this.parseMessage.bind(this));
+     // BMS: одинаковые команды нескольким устройствам → одна групповая (lib/util/bmsGroupCoalescing.ts).
+-    private coalescer = new GroupCoalescer(this.zigbee, this.publishParsed, this.parseMessage.bind(this));
++    // Её групповые команды идут через ограничитель так же, как прямые команды на группу.
++    private coalescer = new GroupCoalescer(this.zigbee, this.publishOrThrottle, this.parseMessage.bind(this));
+ 
+     // biome-ignore lint/suspicious/useAwait: API
+     override async start(): Promise<void> {
+@@ -39,6 +43,7 @@ export default class Publish extends Extension {
+     override async stop(): Promise<void> {
+         await super.stop();
+         await this.coalescer.stop();
++        await this.throttle.stop();
+     }
+ 
+     parseTopic(topic: string): ParsedTopic | undefined {
+@@ -105,7 +110,13 @@ export default class Publish extends Extension {
+             return;
+         }
+ 
+-        await this.publishParsed(parsedTopic, data);
++        await this.publishOrThrottle(parsedTopic, data);
++    }
++
++    @bind async publishOrThrottle(parsedTopic: ParsedTopic, data: eventdata.MQTTMessage): Promise<void> {
++        if (!this.throttle.offer(parsedTopic, data)) {
++            await this.publishParsed(parsedTopic, data);
++        }
+     }
+ 
+     @bind async publishParsed(parsedTopic: ParsedTopic, data: eventdata.MQTTMessage): Promise<void> {
+diff --git a/lib/types/api.ts b/lib/types/api.ts
+index d7dcbb4..18191b0 100644
+--- a/lib/types/api.ts
++++ b/lib/types/api.ts
+@@ -222,6 +222,14 @@ export type Zigbee2MQTTSettings = {
+         bms_group_coalescing: boolean;
+         /** BMS: окно склейки, мс */
+         bms_group_coalescing_window: number;
++        /** BMS: ограничитель групповых команд (lib/util/bmsGroupThrottle.ts) */
++        bms_group_throttle: boolean;
++        /** BMS: не чаще одной групповой команды на группу за это окно, мс */
++        bms_group_throttle_window: number;
++        /** BMS: не больше стольких групповых команд на всю сеть за bms_broadcast_budget_window */
++        bms_broadcast_budget: number;
++        /** BMS: окно бюджета широковещаний, мс */
++        bms_broadcast_budget_window: number;
+     };
+     health: {
+         /** in minutes */
+diff --git a/lib/util/bmsGroupThrottle.ts b/lib/util/bmsGroupThrottle.ts
+new file mode 100644
+index 0000000..70809a9
+--- /dev/null
++++ b/lib/util/bmsGroupThrottle.ts
+@@ -0,0 +1,250 @@
++// BMS: ограничитель групповых команд Zigbee.
++//
++// Почему: групповая команда в Zigbee — это широковещание. Его пересылает каждый повторитель сети (до 3 раз),
++// и каждый узел держит запись о нём в таблице широковещаний (BTT) около 9 с. В EmberZNet таблица по умолчанию
++// на 15 записей, и часть её занимают чужие широковещания (запросы маршрутов, объявления устройств). Когда
++// владелец водил ползунком яркости/цвета группы, Home Assistant слал команду несколько раз в секунду: на живой
++// сети (28 повторителей) это дало до 49 сообщений/с, NCP отвечал BUSY, шли ROUTE_ERROR, а одноадресные команды
++// реле висели по 10 с. В тишине те же реле отвечают за 0,1–0,3 с. Значит, ограничивать надо частоту широковещаний.
++//
++// Правило: на одну группу — не чаще одной команды за окно группы; на всю сеть — не больше N групповых за
++// скользящее окно (бюджет). Пока ограничение действует, новые команды группе не копятся очередью: они
++// сливаются в одну отложенную, побеждает последнее значение каждого поля, и по истечении ограничения уходит
++// одна команда. Состояния Z2M обновляются только тогда, когда команда действительно отправлена.
++import Group from "../model/group";
++import type Zigbee from "../zigbee";
++import logger from "./logger";
++import * as settings from "./settings";
++import {stringify} from "./stringify";
++
++export interface ThrottleTopic {
++    ID: string | number;
++    endpoint: string | undefined;
++    attribute: string;
++    type: "get" | "set";
++}
++
++type Send = (parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage) => Promise<void>;
++type Parse = (parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage) => KeyValue | undefined;
++
++interface Pending {
++    group: Group;
++    message: KeyValue;
++    merged: number;
++}
++
++// Поля, которые можно сливать «последнее побеждает». Остальное (toggle, сцены, эффекты, *_move/*_step,
++// get) по смыслу нельзя ни объединить, ни отбросить — такие команды уходят сразу, как в штатном Z2M.
++const MERGEABLE = new Set(["state", "brightness", "brightness_percent", "color_temp", "color_temp_percent", "color", "transition"]);
++const BRIGHTNESS = ["brightness", "brightness_percent"];
++const COLOR = ["color_temp", "color_temp_percent", "color"];
++const LOG_INTERVAL_MS = 1000;
++
++const isState = (value: unknown, state: string): boolean => typeof value === "string" && value.toLowerCase() === state;
++
++/** Слить новую команду в отложенную: последнее значение каждого поля побеждает, смена state не теряется. */
++export function mergeGroupMessage(pending: KeyValue, next: KeyValue): KeyValue {
++    const merged = {...pending};
++
++    // Выключение новее отложенных яркости и цвета: выключенной лампе они уже не нужны (конвертер Z2M при OFF
++    // яркость всё равно отбрасывает), а цвет после OFF ушёл бы лишним кадром.
++    if (isState(next.state, "off")) {
++        for (const key of [...BRIGHTNESS, ...COLOR]) delete merged[key];
++    }
++
++    // Яркость без state новее отложенного OFF: в Z2M яркость > 0 без state включает лампу — значит, OFF отменён.
++    const nextBrightness = next.brightness ?? next.brightness_percent;
++    if (next.state === undefined && nextBrightness !== undefined && Number(nextBrightness) > 0 && isState(merged.state, "off")) {
++        delete merged.state;
++    }
++
++    // Взаимоисключающие поля: прежнее значение в другой форме не должно спорить с новым.
++    for (const family of [BRIGHTNESS, COLOR]) {
++        if (family.some((key) => next[key] !== undefined)) {
++            for (const key of family) delete merged[key];
++        }
++    }
++
++    return Object.assign(merged, next);
++}
++
++export class GroupThrottle {
++    private zigbee: Zigbee;
++    private send: Send;
++    private parse: Parse;
++    private lastSent = new Map<number, number>();
++    // Отправленные групповые за последнее окно бюджета (время), по возрастанию.
++    private sentTimes: number[] = [];
++    // Отложенные по группам; порядок Map = порядок, в котором группы были отложены (кто раньше ждёт — раньше уйдёт).
++    private pending = new Map<number, Pending>();
++    private lastLog = new Map<number, number>();
++    private timer: NodeJS.Timeout | undefined;
++    private running = new Set<Promise<void>>();
++
++    constructor(zigbee: Zigbee, send: Send, parse: Parse) {
++        this.zigbee = zigbee;
++        this.send = send;
++        this.parse = parse;
++    }
++
++    /**
++     * true — команда группе взята ограничителем (отправлена сразу или отложена); false — обрабатывать как обычно
++     * (не группа, get, ограничитель выключен). Синхронно, как и склейка: порядок команд определяется здесь.
++     */
++    offer(parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage): boolean {
++        if (!settings.get().advanced.bms_group_throttle || parsedTopic.type !== "set") {
++            return false;
++        }
++
++        const group = this.zigbee.resolveEntity(parsedTopic.ID);
++
++        if (!(group instanceof Group)) {
++            return false;
++        }
++
++        const message = this.parse(parsedTopic, data);
++
++        if (!message || typeof message !== "object" || Array.isArray(message)) {
++            // Не разбирается — пусть штатный код напишет свою ошибку.
++            return false;
++        }
++
++        const now = Date.now();
++        const mergeable =
++            parsedTopic.endpoint === undefined &&
++            Object.keys(message).every((k) => MERGEABLE.has(k)) &&
++            (message.state === undefined || isState(message.state, "on") || isState(message.state, "off"));
++
++        if (!mergeable) {
++            // Не сливается (toggle, сцена, эффект, *_move…). Отложенная команда этой группы уходит первой, чтобы
++            // порядок команд группе не перевернулся; обе — сразу (как в штатном Z2M), но в учёт бюджета.
++            this.sendPending(group.ID, now);
++            this.record(group.ID, now);
++            this.run(parsedTopic, data);
++            this.schedule();
++            return true;
++        }
++
++        const pending = this.pending.get(group.ID);
++
++        if (pending) {
++            pending.message = mergeGroupMessage(pending.message, message);
++            pending.merged += 1;
++            this.log(group, now, `объединена с отложенной (${pending.merged} шт.): ${stringify(pending.message)}`);
++            return true;
++        }
++
++        const wait = this.waitFor(group.ID, now);
++
++        if (wait <= 0) {
++            this.record(group.ID, now);
++            this.run(parsedTopic, data);
++            return true;
++        }
++
++        this.pending.set(group.ID, {group, message, merged: 1});
++        this.log(group, now, `отложена на ${wait} мс (${this.reason(group.ID, now)})`);
++        this.schedule();
++        return true;
++    }
++
++    /** При остановке отложенные команды уходят сразу, а не теряются. */
++    async stop(): Promise<void> {
++        clearTimeout(this.timer);
++        this.timer = undefined;
++
++        for (const ID of [...this.pending.keys()]) {
++            this.sendPending(ID, Date.now());
++        }
++
++        await Promise.allSettled([...this.running]);
++    }
++
++    private window(): {group: number; budget: number; budgetWindow: number} {
++        const a = settings.get().advanced;
++        return {group: a.bms_group_throttle_window, budget: a.bms_broadcast_budget, budgetWindow: a.bms_broadcast_budget_window};
++    }
++
++    private prune(now: number): void {
++        const {budgetWindow} = this.window();
++        while (this.sentTimes.length && this.sentTimes[0] <= now - budgetWindow) this.sentTimes.shift();
++    }
++
++    /** Через сколько мс группе можно отправить (0 — можно сейчас). */
++    private waitFor(Id: number, now: number): number {
++        const w = this.window();
++        this.prune(now);
++        const last = this.lastSent.get(Id);
++        const groupWait = last === undefined ? 0 : last + w.group - now;
++        // Бюджет занят: ждём, пока самая старая из учтённых выйдет из окна.
++        const budgetWait = this.sentTimes.length >= w.budget ? this.sentTimes[this.sentTimes.length - w.budget] + w.budgetWindow - now : 0;
++        return Math.max(0, groupWait, budgetWait);
++    }
++
++    private reason(Id: number, now: number): string {
++        const w = this.window();
++        const last = this.lastSent.get(Id);
++        return last !== undefined && last + w.group > now ? `окно группы ${w.group} мс` : `бюджет сети ${w.budget} групповых за ${w.budgetWindow} мс`;
++    }
++
++    private record(Id: number, now: number): void {
++        this.lastSent.set(Id, now);
++        this.sentTimes.push(now);
++    }
++
++    private sendPending(Id: number, now: number): void {
++        const pending = this.pending.get(Id);
++
++        if (!pending) {
++            return;
++        }
++
++        this.pending.delete(Id);
++        this.record(Id, now);
++
++        if (pending.merged > 1) {
++            logger.debug(`BMS: групповая к '${pending.group.name}': ${pending.merged} команд → одна ${stringify(pending.message)}`);
++        }
++
++        const topic: ThrottleTopic = {ID: Id, endpoint: undefined, attribute: "", type: "set"};
++        this.run(topic, {topic: `${settings.get().mqtt.base_topic}/${pending.group.name}/set`, message: stringify(pending.message)});
++    }
++
++    /** Один таймер на всё: отпускает отложенные по порядку, пока позволяют окно группы и бюджет сети. */
++    private schedule(): void {
++        clearTimeout(this.timer);
++        this.timer = undefined;
++        let next = Number.POSITIVE_INFINITY;
++        const now = Date.now();
++
++        for (const ID of [...this.pending.keys()]) {
++            const wait = this.waitFor(ID, now);
++
++            if (wait <= 0) {
++                this.sendPending(ID, now);
++            } else {
++                next = Math.min(next, wait);
++            }
++        }
++
++        if (next !== Number.POSITIVE_INFINITY) {
++            this.timer = setTimeout(() => this.schedule(), next);
++        }
++    }
++
++    private log(group: Group, now: number, text: string): void {
++        const last = this.lastLog.get(group.ID);
++
++        if (last === undefined || now - last >= LOG_INTERVAL_MS) {
++            this.lastLog.set(group.ID, now);
++            logger.info(`BMS: групповая к '${group.name}' ${text}`);
++        }
++    }
++
++    private run(parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage): void {
++        const promise = this.send(parsedTopic, data)
++            .catch((error) => logger.error(`BMS: отправка '${data.topic}' не удалась: ${error}`))
++            .finally(() => this.running.delete(promise));
++        this.running.add(promise);
++    }
++}
+diff --git a/lib/util/settings.schema.json b/lib/util/settings.schema.json
+index fae28cd..0e3f47e 100644
+--- a/lib/util/settings.schema.json
++++ b/lib/util/settings.schema.json
+@@ -838,6 +838,34 @@
+                     "minimum": 10,
+                     "maximum": 1000,
+                     "default": 50
++                },
++                "bms_group_throttle": {
++                    "type": "boolean",
++                    "title": "BMS: group command rate limit",
++                    "description": "Group commands are Zigbee broadcasts. Limit them per group and per network; while limited, new commands to a group are merged into one pending command (last value of each field wins)",
++                    "default": true
++                },
++                "bms_group_throttle_window": {
++                    "type": "number",
++                    "title": "BMS: min interval between group commands to one group (ms)",
++                    "minimum": 100,
++                    "maximum": 10000,
++                    "default": 1000
++                },
++                "bms_broadcast_budget": {
++                    "type": "number",
++                    "title": "BMS: max group commands per budget window (whole network)",
++                    "minimum": 1,
++                    "maximum": 15,
++                    "default": 8
++                },
++                "bms_broadcast_budget_window": {
++                    "type": "number",
++                    "title": "BMS: broadcast budget window (ms)",
++                    "description": "Zigbee keeps each broadcast in the broadcast transaction table for about 9 s",
++                    "minimum": 1000,
++                    "maximum": 60000,
++                    "default": 9000
+                 }
+             }
+         },
+diff --git a/lib/util/settings.ts b/lib/util/settings.ts
+index 40175e3..b23c29a 100644
+--- a/lib/util/settings.ts
++++ b/lib/util/settings.ts
+@@ -116,6 +116,10 @@ export const defaults = {
+         enable_external_js: true,
+         bms_group_coalescing: true,
+         bms_group_coalescing_window: 50,
++        bms_group_throttle: true,
++        bms_group_throttle_window: 1000,
++        bms_broadcast_budget: 8,
++        bms_broadcast_budget_window: 9000,
+     },
+     health: {
+         interval: 10,
+diff --git a/test/extensions/bmsGroupCoalescing.test.ts b/test/extensions/bmsGroupCoalescing.test.ts
+index 73e0612..ff98c63 100644
+--- a/test/extensions/bmsGroupCoalescing.test.ts
++++ b/test/extensions/bmsGroupCoalescing.test.ts
+@@ -50,6 +50,8 @@ describe("BMS: group command coalescing", () => {
+         data.writeDefaultConfiguration();
+         controller.state.clear();
+         settings.reRead();
++        // Ограничитель групповых проверяет bmsGroupThrottle.test.ts; здесь — только склейка.
++        settings.set(["advanced", "bms_group_throttle"], false);
+         loadTopicGetSetRegex();
+         // Группы — только те, что задаёт сам тест: группы из общих фикстур давали бы лишние совпадения.
+         for (const group of Object.values(groups)) {
+diff --git a/test/extensions/bmsGroupThrottle.test.ts b/test/extensions/bmsGroupThrottle.test.ts
+new file mode 100644
+index 0000000..d6397f0
+--- /dev/null
++++ b/test/extensions/bmsGroupThrottle.test.ts
+@@ -0,0 +1,221 @@
++// BMS: ограничитель групповых команд (lib/util/bmsGroupThrottle.ts).
++// biome-ignore assist/source/organizeImports: import mocks first
++import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
++import * as data from "../mocks/data";
++import {mockLogger} from "../mocks/logger";
++import {events as mockMQTTEvents, mockMQTTPublishAsync} from "../mocks/mqtt";
++import * as mockSleep from "../mocks/sleep";
++import {flushPromises} from "../mocks/utils";
++import {devices, groups, resetGroupMembers} from "../mocks/zigbeeHerdsman";
++
++import {clearGlobalStore} from "zigbee-herdsman-converters";
++import {Controller} from "../../lib/controller";
++import {loadTopicGetSetRegex} from "../../lib/extension/publish";
++import {mergeGroupMessage} from "../../lib/util/bmsGroupThrottle";
++import * as settings from "../../lib/util/settings";
++import {stringify} from "../../lib/util/stringify";
++
++describe("BMS: group command rate limit", () => {
++    let controller: Controller;
++    const bulbColor = devices.bulb_color.getEndpoint(1)!;
++    const bulbColor2 = devices.bulb_color_2.getEndpoint(1)!;
++    const bulb2 = devices.bulb_2.getEndpoint(1)!;
++    const bulb = devices.bulb.getEndpoint(1)!;
++    const allEndpoints = [bulbColor, bulbColor2, bulb2, bulb];
++
++    const set = async (name: string, payload: Record<string, unknown> | string): Promise<void> => {
++        await mockMQTTEvents.message(`zigbee2mqtt/${name}/set`, typeof payload === "string" ? payload : stringify(payload));
++        await flushPromises();
++    };
++    const wait = async (ms: number): Promise<void> => {
++        await vi.advanceTimersByTimeAsync(ms);
++        await flushPromises();
++    };
++    const commands = (group: keyof typeof groups): unknown[][] => groups[group].command.mock.calls.map((c) => [c[1], c[2]?.level]);
++    const published = (topic: string): Record<string, unknown>[] =>
++        mockMQTTPublishAsync.mock.calls.filter((c) => c[0] === `zigbee2mqtt/${topic}`).map((c) => JSON.parse(c[1]));
++    const throttleLog = (): string[] =>
++        mockLogger.info.mock.calls.map((c) => c[0]).filter((m): m is string => typeof m === "string" && m.startsWith("BMS: групповая к"));
++
++    beforeAll(async () => {
++        vi.useFakeTimers();
++        data.writeEmptyState();
++        controller = new Controller(vi.fn(), vi.fn());
++        mockSleep.mock();
++        await controller.start();
++        await flushPromises();
++    });
++
++    beforeEach(() => {
++        data.writeDefaultConfiguration();
++        controller.state.clear();
++        settings.reRead();
++        // Склейку проверяет bmsGroupCoalescing.test.ts; здесь она мешала бы (одиночные команды устройствам ждали бы окно).
++        settings.set(["advanced", "bms_group_coalescing"], false);
++        loadTopicGetSetRegex();
++        for (const group of Object.values(groups)) {
++            group.members = [];
++            group.command.mockClear();
++        }
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        for (const ep of allEndpoints) ep.command.mockClear();
++        mockMQTTPublishAsync.mockClear();
++        mockLogger.info.mockClear();
++        clearGlobalStore();
++    });
++
++    afterEach(async () => {
++        // Дальше окна бюджета (9 с): следующий тест начинает с чистого учёта.
++        await wait(20000);
++        resetGroupMembers();
++    });
++
++    afterAll(async () => {
++        await vi.runOnlyPendingTimersAsync();
++        mockSleep.restore();
++        await controller?.stop();
++        await flushPromises();
++        vi.useRealTimers();
++    });
++
++    it("is on by default", () => {
++        const a = settings.get().advanced;
++        expect([a.bms_group_throttle, a.bms_group_throttle_window, a.bms_broadcast_budget, a.bms_broadcast_budget_window]).toStrictEqual([
++            true,
++            1000,
++            8,
++            9000,
++        ]);
++    });
++
++    it("sends the first and the last command of a slider series", async () => {
++        await set("group_1", {state: "ON", brightness: 254});
++        expect(commands("group_1")).toStrictEqual([["moveToLevelWithOnOff", 254]]);
++
++        for (const brightness of [200, 120, 59]) {
++            await wait(100);
++            await set("group_1", {state: "ON", brightness});
++        }
++        await wait(600);
++        // Окно группы (1000 мс) ещё не прошло: ничего нового в эфир, и состояние Z2M — по отправленному.
++        expect(commands("group_1")).toHaveLength(1);
++        expect(published("group_1").at(-1)).toMatchObject({brightness: 254});
++
++        await wait(100);
++        expect(commands("group_1")).toStrictEqual([
++            ["moveToLevelWithOnOff", 254],
++            ["moveToLevelWithOnOff", 59],
++        ]);
++        expect(published("group_1").at(-1)).toMatchObject({state: "ON", brightness: 59});
++        expect(published("bulb_color").at(-1)).toMatchObject({state: "ON", brightness: 59});
++        expect(throttleLog()).toStrictEqual(["BMS: групповая к 'group_1' отложена на 900 мс (окно группы 1000 мс)"]);
++    });
++
++    it("does not lose a state change merged with later fields", async () => {
++        await set("group_1", {state: "ON", brightness: 100});
++        await set("group_1", {state: "OFF"});
++        await set("group_1", {color_temp: 300});
++        await wait(1000);
++        // Порядок полей внутри команды — штатный Z2M (при OFF state уходит последним); главное — OFF не потерян.
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["moveToLevelWithOnOff", "moveToColorTemp", "off"]);
++        expect(published("group_1").at(-1)).toMatchObject({state: "OFF", color_temp: 300});
++    });
++
++    it("lets the newest command win per field", () => {
++        expect(mergeGroupMessage({state: "ON", brightness: 100}, {brightness: 50})).toStrictEqual({state: "ON", brightness: 50});
++        expect(mergeGroupMessage({state: "ON", brightness: 100, color_temp: 300}, {state: "OFF"})).toStrictEqual({state: "OFF"});
++        expect(mergeGroupMessage({state: "OFF"}, {brightness: 120})).toStrictEqual({brightness: 120});
++        expect(mergeGroupMessage({state: "OFF"}, {brightness: 0})).toStrictEqual({state: "OFF", brightness: 0});
++        expect(mergeGroupMessage({state: "OFF"}, {color_temp: 300})).toStrictEqual({state: "OFF", color_temp: 300});
++        expect(mergeGroupMessage({color_temp: 300, brightness_percent: 10}, {color: {x: 0.1, y: 0.2}, brightness: 9})).toStrictEqual({
++            color: {x: 0.1, y: 0.2},
++            brightness: 9,
++        });
++    });
++
++    it("keeps the whole network within the broadcast budget", async () => {
++        settings.set(["advanced", "bms_broadcast_budget"], 3);
++        groups.group_2.members.push(bulb2);
++        groups.group_tradfri_remote.members.push(bulb);
++        groups.group_with_tradfri.members.push(bulbColor2);
++        await set("group_1", {state: "ON"});
++        await wait(10);
++        await set("group_2", {state: "ON"});
++        await set("group_tradfri_remote", {state: "ON"});
++        await set("group_with_tradfri", {state: "ON"});
++        await wait(2000);
++        await set("group_with_tradfri", {state: "OFF"});
++        expect(groups.group_with_tradfri.command).toHaveBeenCalledTimes(0);
++
++        // Самая старая (group_1) выходит из окна бюджета через 9000 мс после отправки.
++        await wait(9000 - 2010 - 1);
++        expect(groups.group_with_tradfri.command).toHaveBeenCalledTimes(0);
++        await wait(1);
++        expect(groups.group_with_tradfri.command.mock.calls.map((c) => c[1])).toStrictEqual(["off"]);
++        expect(throttleLog()).toStrictEqual([
++            "BMS: групповая к 'group_with_tradfri' отложена на 8990 мс (бюджет сети 3 групповых за 9000 мс)",
++            'BMS: групповая к \'group_with_tradfri\' объединена с отложенной (2 шт.): {"state":"OFF"}',
++        ]);
++    });
++
++    it("never delays commands to single devices", async () => {
++        settings.set(["advanced", "bms_broadcast_budget"], 1);
++        await set("group_1", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        await set("bulb", {state: "OFF"});
++        expect(bulb.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++    });
++
++    it("sends a pending command before a command it cannot merge (toggle)", async () => {
++        await set("group_1", {state: "ON"});
++        await set("group_1", {state: "ON", brightness: 100});
++        await set("group_1", {state: "TOGGLE"});
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["on", "moveToLevelWithOnOff", "toggle"]);
++    });
++
++    it("limits coalesced group commands too", async () => {
++        settings.set(["advanced", "bms_group_coalescing"], true);
++        await set("bulb_color", {state: "OFF"});
++        await set("bulb_color_2", {state: "OFF"});
++        await wait(50);
++        expect(commands("group_1")).toStrictEqual([["off", undefined]]);
++        await set("bulb_color", {state: "ON"});
++        await set("bulb_color_2", {state: "ON"});
++        await wait(50);
++        // Склеенная вторая ушла бы через 100 мс после первой — ограничитель держит её до конца окна группы.
++        expect(commands("group_1")).toHaveLength(1);
++        await wait(949);
++        expect(commands("group_1")).toHaveLength(1);
++        await wait(1);
++        expect(commands("group_1")).toStrictEqual([
++            ["off", undefined],
++            ["on", undefined],
++        ]);
++    });
++
++    it("logs a deferred group at most once per second", async () => {
++        await set("group_1", {brightness: 11});
++        for (let i = 2; i < 30; i++) {
++            await wait(50);
++            await set("group_1", {brightness: 10 + i});
++        }
++        // 1,4 с: команды раз в секунду (0, 1000), в журнале — строка на каждую секунду, а не на каждую из 29 команд.
++        expect(commands("group_1")).toStrictEqual([
++            ["moveToLevelWithOnOff", 11],
++            ["moveToLevelWithOnOff", 30],
++        ]);
++        expect(throttleLog()).toHaveLength(2);
++    });
++
++    it("behaves like upstream when turned off", async () => {
++        settings.set(["advanced", "bms_group_throttle"], false);
++        for (const brightness of [10, 20, 30]) await set("group_1", {brightness});
++        expect(commands("group_1")).toStrictEqual([
++            ["moveToLevelWithOnOff", 10],
++            ["moveToLevelWithOnOff", 20],
++            ["moveToLevelWithOnOff", 30],
++        ]);
++        expect(throttleLog()).toStrictEqual([]);
++    });
++});
+diff --git a/test/extensions/bridge.test.ts b/test/extensions/bridge.test.ts
+index c8b3022..ab03ee2 100644
+--- a/test/extensions/bridge.test.ts
++++ b/test/extensions/bridge.test.ts
+@@ -124,6 +124,10 @@ describe("Extension: Bridge", () => {
+                         adapter_delay: undefined,
+                         bms_group_coalescing: true,
+                         bms_group_coalescing_window: 50,
++                        bms_group_throttle: true,
++                        bms_group_throttle_window: 1000,
++                        bms_broadcast_budget: 8,
++                        bms_broadcast_budget_window: 9000,
+                         cache_state: true,
+                         cache_state_persistent: true,
+                         cache_state_send_on_startup: true,
+diff --git a/test/extensions/groups.test.ts b/test/extensions/groups.test.ts
+index 43841e9..bab5249 100644
+--- a/test/extensions/groups.test.ts
++++ b/test/extensions/groups.test.ts
+@@ -44,6 +44,7 @@ describe("Extension: Groups", () => {
+         settings.reRead();
+         // BMS: эти тесты — про штатное поведение (команда уходит сразу); склейку проверяет bmsGroupCoalescing.test.ts.
+         settings.set(["advanced", "bms_group_coalescing"], false);
++        settings.set(["advanced", "bms_group_throttle"], false);
+         mockMQTTPublishAsync.mockClear();
+         groups.gledopto_group.command.mockClear();
+         zhcGlobalStore.clear();
+diff --git a/test/extensions/publish.test.ts b/test/extensions/publish.test.ts
+index ed29dd0..79f8b33 100644
+--- a/test/extensions/publish.test.ts
++++ b/test/extensions/publish.test.ts
+@@ -46,6 +46,7 @@ describe("Extension: Publish", () => {
+         settings.reRead();
+         // BMS: эти тесты — про штатное поведение (команда уходит сразу); склейку проверяет bmsGroupCoalescing.test.ts.
+         settings.set(["advanced", "bms_group_coalescing"], false);
++        settings.set(["advanced", "bms_group_throttle"], false);
+         loadTopicGetSetRegex();
+         for (const mock of mocksClear) mock.mockClear();
+         for (const key in devices) {
