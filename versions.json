@@ -3,7 +3,7 @@
   "zigbee-herdsman": "10.10.0",
   "zigbee-herdsman-converters": "26.115.1",
   "ha-addon-upstream": "zigbee2mqtt/hassio-zigbee2mqtt v2.14.2-1",
-  "coordinator": "SMLIGHT SLZB-06M \u2014 EFR32MG21, \u043f\u0440\u043e\u0448\u0438\u0432\u043a\u0430 EmberZNet >= 7.4 (EZSP v13+), \u0430\u0434\u0430\u043f\u0442\u0435\u0440 Z2M: ember, \u043f\u043e\u0440\u0442 tcp://<ip>:6638",
-  "bms-addon-revision": 8,
+  "coordinator": "SMLIGHT SLZB-06M — EFR32MG21, прошивка EmberZNet >= 7.4 (EZSP v13+), адаптер Z2M: ember, порт tcp://<ip>:6638",
+  "bms-addon-revision": 9,
   "bms-core-sha256": "e990da61731f3d4d7c46cecaf74ab60bccfd6a14483f5e5f36be107e7b966e8e"
 }

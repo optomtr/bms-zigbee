@@ -1,0 +1,65 @@
+BMS phase 4: friendly UI on the existing frontend server; retain advanced UI and WebSocket auth.
+Applies after patches 0001-0007 to Zigbee2MQTT 2.14.2.
+
+diff --git a/lib/extension/frontend.ts b/lib/extension/frontend.ts
+index 99ed405..bbc2ef7 100644
+--- a/lib/extension/frontend.ts
++++ b/lib/extension/frontend.ts
+@@ -67,6 +67,8 @@ export class Frontend extends Extension {
+             const frontend = (await import(settings.get().frontend.package)) as typeof import("zigbee2mqtt-frontend");
+             const logError = logger.error.bind(logger);
+             const fileServer = createStaticFileServer(frontend.default.getPath(), logError);
++            // BMS: тот же HTTP/WebSocket и авторизация; служебный интерфейс доступен отдельно.
++            const bmsFiles = process.env.BMS_FRONTEND_PATH ? createStaticFileServer(process.env.BMS_FRONTEND_PATH, logError) : undefined;
+             const deviceIconsFileServer = createStaticFileServer(data.joinPath("device_icons"), logError);
+             const onRequest = (request: IncomingMessage, response: ServerResponse): void => {
+                 // biome-ignore lint/style/noNonNullAssertion: `Only valid for request obtained from Server`
+@@ -91,7 +93,14 @@ export class Frontend extends Extension {
+ 
+                 request.url = `/${newUrl}`;
+ 
+-                if (newUrl.startsWith("device_icons/")) {
++                const location = new URL(url, "http://localhost");
++                if (bmsFiles && newUrl.startsWith("bms-ui/")) {
++                    request.url = request.url.replace("/bms-ui", "");
++                    bmsFiles(request, response);
++                } else if (bmsFiles && ["", "index.html"].includes(newUrl.split("?")[0]) && !location.searchParams.has("advanced")) {
++                    request.url = "/index.html";
++                    bmsFiles(request, response);
++                } else if (newUrl.startsWith("device_icons/")) {
+                     request.url = request.url.replace("/device_icons", "");
+ 
+                     deviceIconsFileServer(request, response);
+diff --git a/test/extensions/frontend.test.ts b/test/extensions/frontend.test.ts
+index 5323b28..60cfccd 100644
+--- a/test/extensions/frontend.test.ts
++++ b/test/extensions/frontend.test.ts
+@@ -366,6 +366,28 @@ describe("Extension: Frontend", () => {
+         expect(mockHTTP.listen).toHaveBeenCalledWith(8081, "127.0.0.1");
+     });
+ 
++    it.each(["/", "/ingress/test/"])("serves BMS UI and keeps advanced UI/API at %s", async (baseUrl) => {
++        process.env.BMS_FRONTEND_PATH = "/opt/bms-ui";
++        try {
++            settings.set(["frontend", "base_url"], baseUrl);
++            controller = new Controller(vi.fn(), vi.fn());
++            await controller.start();
++            mockHTTPOnRequest({url: baseUrl}, 2);
++            expect(mockNodeStatic["/opt/bms-ui"]).toHaveBeenLastCalledWith({url: "/index.html"}, 2);
++            mockHTTPOnRequest({url: `${baseUrl}?demo=1`}, 2);
++            expect(mockNodeStatic["/opt/bms-ui"]).toHaveBeenLastCalledWith({url: "/index.html"}, 2);
++            mockHTTPOnRequest({url: `${baseUrl}bms-ui/app.mjs`}, 2);
++            expect(mockNodeStatic["/opt/bms-ui"]).toHaveBeenLastCalledWith({url: "/app.mjs"}, 2);
++            mockHTTPOnRequest({url: `${baseUrl}?advanced=1`}, 2);
++            expect(mockNodeStatic[frontendPath]).toHaveBeenLastCalledWith({url: "/?advanced=1"}, 2);
++            mockHTTPOnRequest({url: `${baseUrl}assets/stock.js`}, 2);
++            expect(mockNodeStatic[frontendPath]).toHaveBeenLastCalledWith({url: "/assets/stock.js"}, 2);
++            expect(ws.Server).toHaveBeenCalledWith({noServer: true, path: `${baseUrl}api`});
++        } finally {
++            delete process.env.BMS_FRONTEND_PATH;
++        }
++    });
++
+     it("Authentication", async () => {
+         const authToken = "sample-secure-token";
+         settings.set(["frontend", "auth_token"], authToken);
