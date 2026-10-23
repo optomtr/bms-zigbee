@@ -1,0 +1,11 @@
+{
+  "name": "bms-zigbee-tuya",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Библиотека точек данных Tuya по категориям (слой Tuya для BMS Zigbee)",
+  "type": "module",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}

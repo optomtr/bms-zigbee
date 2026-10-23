@@ -1,0 +1,59 @@
+# bms-models.yaml — свои описания устройств Tuya для BMS Zigbee.
+#
+# Где лежит: в папке данных Z2M рядом с configuration.yaml (у дополнения BMS Zigbee —
+# /config/bms_zigbee/bms-models.yaml). После правки — перезапустить дополнение.
+# Читает файл конвертер bms-models.mjs; ошибки пишет в журнал Z2M с пометкой bms:models.
+#
+# Как узнать номера точек: пока у устройства нет описания, расширение bms-tuya-service
+# показывает в его состоянии (вкладка «Состояние» в Z2M) всё, что оно шлёт:
+#   "dp_1": {"type": "enum", "value": 2}
+# Нажимаете на устройстве / в его приложении — смотрите, какая точка меняется.
+# Проверить команду до описания: в Z2M «Dev console» или MQTT
+#   zigbee2mqtt/<имя>/set  {"bms_dp": {"dp": 1, "type": "enum", "value": 0}}
+#
+# Модель:
+#   fingerprint  — список {modelID, manufacturerName} (видны в «О устройстве»); обязательно
+#   model (латиницей), vendor, description — подписи в интерфейсе; необязательно
+#   points       — точки; обязательно
+# Точка: dp (номер), kind (вид), type (bool | value | enum | bitmap | string | raw — тип у Tuya;
+#   по умолчанию: switch/binary — bool, numeric/cover_position — value, enum/cover_control — enum),
+#   read_only: true — только показывать, description — подсказка.
+# Виды:
+#   switch          — выключатель ON/OFF (свойство state); endpoint: l1, l2… для каналов; on/off — сырые значения
+#   binary          — да/нет: name, on/off (сырые значения, по умолчанию true/false), endpoint
+#   numeric         — число: name, unit, scale (делитель: 10 → 235 = 23.5), min, max, step, endpoint
+#   enum            — выбор: name, values {подпись: число}, endpoint
+#   cover_control   — штора: открыть/стоп/закрыть (свойство state); values по умолчанию {OPEN: 0, STOP: 1, CLOSE: 2}
+#   cover_position  — штора: положение 0 (закрыта)…100 (открыта); invert: true, если мотор считает наоборот,
+#                     или оба края: open_raw / closed_raw (что мотор шлёт открытым и закрытым)
+#
+# Образцы ниже — с выдуманным производителем _TZE200_xxxxxxxx: свой отпечаток и номера берите у устройства.
+
+# - fingerprint:
+#     - {modelID: TS0601, manufacturerName: _TZE200_xxxxxxxx}
+#   model: BMS-curtain-example
+#   description: Мотор шторы
+#   points:
+#     - {dp: 1, kind: cover_control}
+#     - {dp: 2, kind: cover_position, invert: true}                   # команда «встань на N %»
+#     - {dp: 3, kind: cover_position, invert: true, read_only: true}  # где штора сейчас
+#     # если мотор не доходит до края (закрытая — 100, открытая — 7), вместо invert:
+#     # - {dp: 3, kind: cover_position, closed_raw: 100, open_raw: 7, read_only: true}
+
+# - fingerprint:
+#     - {modelID: TS0601, manufacturerName: _TZE200_yyyyyyyy}
+#   model: BMS-relay2-example
+#   description: Реле на 2 канала
+#   points:
+#     - {dp: 1, kind: switch, endpoint: l1}
+#     - {dp: 2, kind: switch, endpoint: l2}
+#     - {dp: 14, kind: enum, name: power_on_behavior, values: {off: 0, on: 1, previous: 2}}
+
+# - fingerprint:
+#     - {modelID: TS0601, manufacturerName: _TZE200_zzzzzzzz}
+#   model: BMS-th-sensor-example
+#   description: Температура и влажность
+#   points:
+#     - {dp: 1, kind: numeric, name: temperature, unit: "°C", scale: 10, read_only: true}
+#     - {dp: 2, kind: numeric, name: humidity, unit: "%", read_only: true}
+#     - {dp: 4, kind: numeric, name: battery, unit: "%", read_only: true}

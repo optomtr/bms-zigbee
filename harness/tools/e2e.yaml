@@ -1,0 +1,8 @@
+db: ../.work/e2e.sqlite
+mqtt: {host: 127.0.0.1, port: 18830, base_topic: zigbee2mqtt}
+ha: {url: "ws://127.0.0.1:18123/api/websocket", token_env: HA_TOKEN, confirm: dp_event}
+timing: {command_interval_s: 2, command_timeout_s: 1}
+devices:
+  - {name: lamp, type: actuator, tuya: {entity_id: switch.lamp}, ours: {friendly_name: lamp}}
+  - {name: plug, type: actuator, tuya: {entity_id: switch.plug}, ours: {friendly_name: plug}}
+  - {name: temp, type: sensor, report_interval_s: 1, tuya: {entity_id: sensor.temp}, ours: {friendly_name: temp}}

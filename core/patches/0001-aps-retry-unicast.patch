@@ -1,0 +1,91 @@
+BMS 0001: APS-повтор (RETRY) для всех одноадресных ZCL-кадров ember
+
+Зачем: шлюз Tuya шлёт одноадресные команды с APS-повтором по умолчанию
+(опции 0x1040 = RETRY | ENABLE_ADDRESS_DISCOVERY). Upstream в
+sendZclFrameToEndpoint снимал RETRY, если ответа не ждут, а команды Tuya
+(кластер 0xEF00, dataRequest) zigbee-herdsman-converters шлёт именно так:
+disableDefaultResponse и без ответа. Итог: один потерянный по дороге через
+сеть кадр = потерянная команда («рядом работает, через сеть — нет»).
+
+Что меняет: убирает снятие RETRY; широковещательные и групповые кадры
+не тронуты. Тесты: два upstream-теста ожидали опции без RETRY — поправлены;
+новый тест — Tuya dataRequest с disableDefaultResponse уходит с RETRY.
+
+diff --git a/src/adapter/ember/adapter/emberAdapter.ts b/src/adapter/ember/adapter/emberAdapter.ts
+index f86c6eb..7c16d1d 100644
+--- a/src/adapter/ember/adapter/emberAdapter.ts
++++ b/src/adapter/ember/adapter/emberAdapter.ts
+@@ -1975,10 +1975,10 @@ export class EmberAdapter extends Adapter {
+             sequence: 0, // set by stack
+         };
+ 
+-        // don't RETRY if no response expected
+-        if (commandResponseId === undefined) {
+-            apsFrame.options &= ~EmberApsOption.RETRY;
+-        }
++        // BMS: upstream здесь снимал RETRY, если ответа не ждут. Мы оставляем APS-повтор всегда, как шлюз Tuya
++        // (одноадресные кадры у него идут с опциями 0x1040 = RETRY | ENABLE_ADDRESS_DISCOVERY). Команды Tuya
++        // (0xEF00 dataRequest) уходят с disableDefaultResponse и без ответа: без RETRY один потерянный по дороге
++        // через сеть кадр = потерянная команда («рядом работает, через сеть — нет»).
+ 
+         // Zigbee Direct cluster, enable APS layer encryption
+         if (zclFrame.cluster.ID === Zcl.Clusters.zigbeeDirectConfiguration.ID) {
+diff --git a/test/adapter/ember/emberAdapter.test.ts b/test/adapter/ember/emberAdapter.test.ts
+index f38a656..7de9542 100644
+--- a/test/adapter/ember/emberAdapter.test.ts
++++ b/test/adapter/ember/emberAdapter.test.ts
+@@ -3329,7 +3329,8 @@ describe("Ember Adapter Layer", () => {
+                 clusterId: zclFrame.cluster.ID,
+                 sourceEndpoint,
+                 destinationEndpoint: endpoint,
+-                options: DEFAULT_APS_OPTIONS & ~EmberApsOption.RETRY,
++                // BMS: APS-повтор остаётся и без ответа (как у шлюза Tuya)
++                options: DEFAULT_APS_OPTIONS,
+                 groupId: 0,
+                 sequence: 0, // set by stack
+             };
+@@ -3337,6 +3338,35 @@ describe("Ember Adapter Layer", () => {
+             expect(mockEzspSend).toHaveBeenCalledWith(EmberOutgoingMessageType.DIRECT, networkAddress, apsFrame, zclFrame.toBuffer(), 0, 0);
+         });
+ 
++        it("BMS: sendZclFrameToEndpoint sends Tuya dataRequest without response with APS RETRY", async () => {
++            const networkAddress: NodeId = 1234;
++            const endpoint: number = 1;
++            const zclFrame = Zcl.Frame.create(
++                Zcl.FrameType.SPECIFIC,
++                Zcl.Direction.CLIENT_TO_SERVER,
++                true, // disableDefaultResponse, как шлёт zigbee-herdsman-converters
++                undefined,
++                7,
++                "dataRequest",
++                "manuSpecificTuya",
++                {seq: 1, dpValues: [{dp: 1, datatype: 1, data: Buffer.from([1])}]},
++                {},
++            );
++
++            const p = adapter.sendZclFrameToEndpoint("0x1122334455667788", networkAddress, endpoint, zclFrame, 10000, true, false);
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await expect(p).resolves.toStrictEqual(undefined);
++
++            expect(mockEzspSend).toHaveBeenCalledTimes(1);
++            const [type, destination, apsFrame] = mockEzspSend.mock.calls[0];
++            expect(type).toStrictEqual(EmberOutgoingMessageType.DIRECT);
++            expect(destination).toStrictEqual(networkAddress);
++            expect(apsFrame.clusterId).toStrictEqual(Zcl.Clusters.manuSpecificTuya.ID);
++            expect(apsFrame.options & EmberApsOption.RETRY).toStrictEqual(EmberApsOption.RETRY);
++            expect(apsFrame.options).toStrictEqual(DEFAULT_APS_OPTIONS);
++        });
++
+         it("Adapter impl: sendZclFrameToEndpoint with encryption", async () => {
+             const networkAddress: NodeId = 1234;
+             const endpoint: number = 232;
+@@ -3363,7 +3393,7 @@ describe("Ember Adapter Layer", () => {
+                 clusterId: zclFrame.cluster.ID,
+                 sourceEndpoint,
+                 destinationEndpoint: endpoint,
+-                options: (DEFAULT_APS_OPTIONS & ~EmberApsOption.RETRY) | EmberApsOption.ENCRYPTION,
++                options: DEFAULT_APS_OPTIONS | EmberApsOption.ENCRYPTION,
+                 groupId: 0,
+                 sequence: 0, // set by stack
+             };

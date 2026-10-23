@@ -1,0 +1,613 @@
+BMS 0003: энергоскан для выбора канала (модуль + CLI для дополнения)
+
+Зачем: шлюз Tuya создаёт сеть плагином Network Creator — энергоскан и выбор
+самого тихого канала. Z2M канал не выбирает (берёт из настроек), поэтому
+дополнение «BMS Zigbee» при самом первом запуске, до Z2M, зовёт наш CLI.
+
+Что добавляет (новые файлы, upstream-код не меняется):
+- src/adapter/ember/bms/energyScan.ts — запуск Ezsp (сброс NCP), версия EZSP,
+  ezspStartScan(ENERGY_SCAN) по каналам 11/15/20/25, результаты через
+  ezspEnergyScanResultHandler/ezspScanCompleteHandler этого экземпляра Ezsp;
+  лучший канал — наименьший максимум RSSI, при равенстве меньший номер,
+  11 — последним (Wi-Fi канал 1). ezspNetworkInit не вызывается: сеть на
+  координаторе не создаётся и не трогается.
+- src/adapter/ember/bms/energyScanCli.ts — КОНТРАКТ с дополнением:
+  node <пакет>/dist/adapter/ember/bms/energyScanCli.js <порт>
+  stdout: одна строка {"results":[{"channel":11,"rssi":-85},...],"best":15},
+  код 0; ошибка — код 2 и текст в stderr. Журнал ядра — в stderr.
+- test/adapter/ember/energyScan.test.ts — на поддельном Ezsp (любое обращение
+  к чему-то кроме скана — ошибка теста) и через настоящий callbackDispatch.
+
+diff --git a/src/adapter/ember/bms/energyScan.ts b/src/adapter/ember/bms/energyScan.ts
+new file mode 100644
+index 0000000..020baf8
+--- /dev/null
++++ b/src/adapter/ember/bms/energyScan.ts
+@@ -0,0 +1,144 @@
++/**
++ * BMS: энергоскан для выбора канала сети при самом первом запуске (дополнение «BMS Zigbee» зовёт его до Z2M).
++ *
++ * Шлюз Tuya создаёт сеть плагином Network Creator: меряет шум на каналах и берёт самый тихий. Z2M сам канал
++ * не выбирает (берёт из настроек), поэтому скан делаем отдельно, классами самого ember-адаптера.
++ *
++ * Сеть не создаётся и не трогается: после сброса NCP мы шлём только версию EZSP и сам скан. ezspNetworkInit
++ * не вызываем, поэтому уже существующая на координаторе сеть остаётся как была (её поднимет Z2M при старте).
++ */
++import {logger} from "../../../utils/logger";
++import {channelsToUInt32Mask} from "../../../zspec/utils";
++import {EzspNetworkScanType, EzspStatus, SLStatus} from "../enums";
++import {EZSP_MIN_PROTOCOL_VERSION, EZSP_PROTOCOL_VERSION, EZSP_STACK_TYPE_MESH} from "../ezsp/consts";
++import type {Ezsp} from "../ezsp/ezsp";
++
++const NS = "zh:ember:bms";
++
++/**
++ * Каналы-кандидаты: 15, 20 и 25 лежат между Wi-Fi каналами 1/6/11 (2,4 ГГц), 11 — на Wi-Fi канале 1,
++ * поэтому при равенстве шума он выбирается последним (см. pickBestChannel).
++ */
++export const ENERGY_SCAN_CHANNELS: readonly number[] = [11, 15, 20, 25];
++/**
++ * Показатель длительности: (2^6 + 1) периодов по 960 символов ≈ 1 с на канал. Wi-Fi шумит всплесками,
++ * короткий скан их пропускает и «тихим» может оказаться занятый канал.
++ */
++export const ENERGY_SCAN_DURATION = 6;
++/** Сколько ждём конца скана: 4 канала по ~1 с, с большим запасом на медленный TCP-мост. */
++export const ENERGY_SCAN_TIMEOUT_MSEC = 30000;
++
++export type EnergyScanChannelResult = {channel: number; rssi: number};
++export type EnergyScanResult = {results: EnergyScanChannelResult[]; best: number};
++
++/** Только то, что скан берёт у Ezsp: тест подставляет сюда поддельный. */
++export type EnergyScanEzsp = Pick<
++    Ezsp,
++    "start" | "stop" | "ezspVersion" | "setProtocolVersion" | "ezspStartScan" | "ezspEnergyScanResultHandler" | "ezspScanCompleteHandler"
++>;
++
++/**
++ * Самый тихий канал: наименьший максимум RSSI. При равенстве — меньший номер, но 11 последним
++ * (он ложится на Wi-Fi канал 1: скан мог попасть в паузу Wi-Fi, а соседство с ним постоянное).
++ */
++export function pickBestChannel(results: readonly EnergyScanChannelResult[]): number {
++    if (results.length === 0) {
++        throw new Error("No channel was measured.");
++    }
++
++    const sorted = [...results].sort((a, b) => a.rssi - b.rssi || Number(a.channel === 11) - Number(b.channel === 11) || a.channel - b.channel);
++
++    return sorted[0].channel;
++}
++
++/**
++ * Согласовать версию EZSP, как EmberAdapter.emberVersion: без неё NCP не примет ни одной другой команды.
++ */
++async function negotiateVersion(ezsp: EnergyScanEzsp): Promise<void> {
++    let [protocolVersion, stackType] = await ezsp.ezspVersion(EZSP_PROTOCOL_VERSION);
++
++    if (stackType !== EZSP_STACK_TYPE_MESH) {
++        throw new Error(`Stack type ${stackType} is not expected.`);
++    }
++
++    if (protocolVersion < EZSP_PROTOCOL_VERSION && protocolVersion >= EZSP_MIN_PROTOCOL_VERSION) {
++        [protocolVersion] = await ezsp.ezspVersion(protocolVersion);
++    } else if (protocolVersion !== EZSP_PROTOCOL_VERSION) {
++        throw new Error(
++            `Adapter EZSP protocol version (${protocolVersion}) is not supported [${EZSP_MIN_PROTOCOL_VERSION}-${EZSP_PROTOCOL_VERSION}].`,
++        );
++    }
++
++    ezsp.setProtocolVersion(protocolVersion);
++}
++
++/**
++ * Запустить EZSP, сделать ENERGY_SCAN по каналам и вернуть результат с лучшим каналом. EZSP останавливается всегда.
++ */
++export async function energyScan(
++    ezsp: EnergyScanEzsp,
++    channels: readonly number[] = ENERGY_SCAN_CHANNELS,
++    duration = ENERGY_SCAN_DURATION,
++    timeout = ENERGY_SCAN_TIMEOUT_MSEC,
++): Promise<EnergyScanResult> {
++    try {
++        const startStatus = await ezsp.start();
++
++        if (startStatus !== EzspStatus.SUCCESS) {
++            throw new Error(`Failed to start EZSP layer with status=${EzspStatus[startStatus]}.`);
++        }
++
++        await negotiateVersion(ezsp);
++
++        const maxRssi = new Map<number, number>();
++        let complete!: (error?: Error) => void;
++        const scanDone = new Promise<void>((resolve, reject) => {
++            complete = (error) => (error ? reject(error) : resolve());
++        });
++        // если старт скана упал, а NCP потом всё же пришлёт «скан окончен», отказ некому ловить — гасим здесь
++        scanDone.catch(() => {});
++
++        // Результаты EZSP отдаёт обработчиками на самом Ezsp (не событиями): подменяем их на этом экземпляре.
++        ezsp.ezspEnergyScanResultHandler = (channel: number, maxRssiValue: number): void => {
++            logger.debug(`Energy scan channel=${channel} maxRssi=${maxRssiValue} dBm.`, NS);
++
++            if (channels.includes(channel)) {
++                // по каналу может прийти несколько отчётов — берём худший (самый громкий)
++                maxRssi.set(channel, Math.max(maxRssi.get(channel) ?? maxRssiValue, maxRssiValue));
++            }
++        };
++        ezsp.ezspScanCompleteHandler = (channel: number, status: SLStatus): void => {
++            complete(status === SLStatus.OK ? undefined : new Error(`Energy scan failed on channel ${channel} with status=${SLStatus[status]}.`));
++        };
++
++        const timer = setTimeout(() => complete(new Error(`Energy scan did not complete within ${timeout}ms.`)), timeout);
++
++        try {
++            const scanStatus = await ezsp.ezspStartScan(EzspNetworkScanType.ENERGY_SCAN, channelsToUInt32Mask([...channels]), duration);
++
++            if (scanStatus !== SLStatus.OK) {
++                throw new Error(`Failed to start energy scan with status=${SLStatus[scanStatus]}.`);
++            }
++
++            await scanDone;
++        } finally {
++            clearTimeout(timer);
++        }
++
++        const results: EnergyScanChannelResult[] = [];
++
++        for (const channel of channels) {
++            const rssi = maxRssi.get(channel);
++
++            if (rssi === undefined) {
++                logger.warning(`Energy scan reported nothing for channel ${channel}, skipping it.`, NS);
++            } else {
++                results.push({channel, rssi});
++            }
++        }
++
++        return {results, best: pickBestChannel(results)};
++    } finally {
++        await ezsp.stop();
++    }
++}
+diff --git a/src/adapter/ember/bms/energyScanCli.ts b/src/adapter/ember/bms/energyScanCli.ts
+new file mode 100644
+index 0000000..29e32d2
+--- /dev/null
++++ b/src/adapter/ember/bms/energyScanCli.ts
+@@ -0,0 +1,68 @@
++/**
++ * BMS: энергоскан из командной строки — для дополнения «BMS Zigbee» при самом первом запуске, до Z2M.
++ *
++ * КОНТРАКТ с дополнением (не менять без дополнения):
++ *   node <пакет>/dist/adapter/ember/bms/energyScanCli.js <порт, напр. tcp://192.168.1.50:6638>
++ *   успех: в stdout ОДНА строка JSON {"results":[{"channel":11,"rssi":-85},...],"best":15}, код выхода 0;
++ *   любая ошибка: код выхода 2 и понятный текст в stderr.
++ * Журнал ядра уходит в stderr (info/debug — только при BMS_DEBUG=1), чтобы stdout оставался одной строкой JSON.
++ */
++import {setLogger} from "../../../utils/logger";
++import {Ezsp} from "../ezsp/ezsp";
++import {type EnergyScanEzsp, energyScan} from "./energyScan";
++
++export const EXIT_OK = 0;
++export const EXIT_ERROR = 2;
++
++export type EnergyScanCliIo = {
++    stdout: (line: string) => void;
++    stderr: (line: string) => void;
++    createEzsp: (portPath: string) => EnergyScanEzsp;
++};
++
++export async function runEnergyScanCli(args: readonly string[], io: EnergyScanCliIo): Promise<number> {
++    if (args.length !== 1 || !args[0]) {
++        io.stderr("Usage: node energyScanCli.js <port path, e.g. tcp://192.168.1.50:6638>");
++        return EXIT_ERROR;
++    }
++
++    try {
++        const result = await energyScan(io.createEzsp(args[0]));
++
++        io.stdout(JSON.stringify(result));
++
++        return EXIT_OK;
++    } catch (error) {
++        io.stderr(`BMS energy scan failed: ${(error as Error).message}`);
++
++        return EXIT_ERROR;
++    }
++}
++
++/* v8 ignore start */
++if (require.main === module) {
++    const toStderr = (message: string | (() => string), namespace: string): void => {
++        process.stderr.write(`[${new Date().toISOString()}] ${namespace}: ${typeof message === "function" ? message() : message}\n`);
++    };
++    const quiet = (): void => {};
++    const verbose = process.env.BMS_DEBUG === "1";
++
++    setLogger({debug: verbose ? toStderr : quiet, info: verbose ? toStderr : quiet, warning: toStderr, error: toStderr});
++
++    void runEnergyScanCli(process.argv.slice(2), {
++        stdout: (line) => process.stdout.write(`${line}\n`),
++        stderr: (line) => process.stderr.write(`${line}\n`),
++        // скорость важна только для последовательного порта (как в Z2M по умолчанию); для tcp:// не используется
++        createEzsp: (portPath) => new Ezsp({path: portPath, baudRate: 115200, rtscts: false, adapter: "ember"}),
++    })
++        .catch((error) => {
++            process.stderr.write(`BMS energy scan failed: ${error}\n`);
++            return EXIT_ERROR;
++        })
++        .then((code) => {
++            // stdout в канал (pipe) на части систем пишется асинхронно: выходим, только когда строка ушла.
++            // Выход явный: после стопа EZSP могут остаться таймеры ASH, ждать их незачем.
++            process.stdout.write("", () => process.exit(code));
++        });
++}
++/* v8 ignore stop */
+diff --git a/test/adapter/ember/energyScan.test.ts b/test/adapter/ember/energyScan.test.ts
+new file mode 100644
+index 0000000..256b747
+--- /dev/null
++++ b/test/adapter/ember/energyScan.test.ts
+@@ -0,0 +1,363 @@
++import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
++import {
++    ENERGY_SCAN_CHANNELS,
++    ENERGY_SCAN_DURATION,
++    ENERGY_SCAN_TIMEOUT_MSEC,
++    type EnergyScanEzsp,
++    energyScan,
++    pickBestChannel,
++} from "../../../src/adapter/ember/bms/energyScan";
++import {EXIT_ERROR, EXIT_OK, runEnergyScanCli} from "../../../src/adapter/ember/bms/energyScanCli";
++import {EzspNetworkScanType, EzspStatus, SLStatus} from "../../../src/adapter/ember/enums";
++import {
++    EZSP_EXTENDED_PARAMETERS_INDEX,
++    EZSP_MIN_PROTOCOL_VERSION,
++    EZSP_PROTOCOL_VERSION,
++    EZSP_STACK_TYPE_MESH,
++} from "../../../src/adapter/ember/ezsp/consts";
++import {EzspFrameID} from "../../../src/adapter/ember/ezsp/enums";
++import {Ezsp} from "../../../src/adapter/ember/ezsp/ezsp";
++import {EzspError} from "../../../src/adapter/ember/ezspError";
++
++vi.mock("../../../src/adapter/ember/uart/ash");
++
++type Report = [channel: number, maxRssi: number];
++
++/**
++ * Поддельный Ezsp: скан «идёт» после ezspStartScan — отчёты по каналам и «скан окончен» приходят через обработчики,
++ * которые energyScan подменил на этом объекте (как их вызывает настоящий Ezsp из callbackDispatch).
++ * Любое обращение к чему-то ещё (networkInit, formNetwork, смена канала...) — ошибка теста: сеть трогать нельзя.
++ */
++function makeFakeEzsp(reports: Report[], completeStatus: SLStatus = SLStatus.OK, completeChannel = 0) {
++    const fake = {
++        start: vi.fn().mockResolvedValue(EzspStatus.SUCCESS),
++        stop: vi.fn().mockResolvedValue(undefined),
++        ezspVersion: vi.fn().mockImplementation((version: number) => [version, EZSP_STACK_TYPE_MESH, 0]),
++        setProtocolVersion: vi.fn(),
++        ezspStartScan: vi.fn().mockImplementation(() => {
++            setTimeout(() => {
++                for (const [channel, rssi] of reports) {
++                    fake.ezspEnergyScanResultHandler(channel, rssi);
++                }
++
++                fake.ezspScanCompleteHandler(completeChannel, completeStatus);
++            }, 4000);
++
++            return SLStatus.OK;
++        }),
++        ezspEnergyScanResultHandler: vi.fn(),
++        ezspScanCompleteHandler: vi.fn(),
++    };
++    const allowedSet = ["ezspEnergyScanResultHandler", "ezspScanCompleteHandler"];
++    const guarded = new Proxy(fake, {
++        get(target, prop) {
++            if (!(prop in target)) {
++                throw new Error(`Unexpected Ezsp access: ${String(prop)}`);
++            }
++
++            return target[prop as keyof typeof target];
++        },
++        set(target, prop, value) {
++            if (!allowedSet.includes(String(prop))) {
++                throw new Error(`Unexpected Ezsp write: ${String(prop)}`);
++            }
++
++            target[prop as keyof typeof target] = value;
++            return true;
++        },
++    });
++
++    return {fake, ezsp: guarded as unknown as EnergyScanEzsp};
++}
++
++const QUIET_REPORTS: Report[] = [
++    [11, -70],
++    [15, -91],
++    [20, -80],
++    [25, -88],
++];
++
++describe("BMS energy scan", () => {
++    beforeEach(() => {
++        vi.useFakeTimers();
++    });
++
++    afterEach(() => {
++        vi.useRealTimers();
++    });
++
++    describe("pickBestChannel", () => {
++        it("picks the lowest energy", () => {
++            expect(
++                pickBestChannel([
++                    {channel: 11, rssi: -70},
++                    {channel: 15, rssi: -91},
++                    {channel: 20, rssi: -80},
++                    {channel: 25, rssi: -88},
++                ]),
++            ).toStrictEqual(15);
++            // 11 выбирается, если он строго тише остальных
++            expect(
++                pickBestChannel([
++                    {channel: 11, rssi: -95},
++                    {channel: 15, rssi: -91},
++                ]),
++            ).toStrictEqual(11);
++        });
++
++        it("on a tie picks the lower channel, but 11 last", () => {
++            expect(
++                pickBestChannel([
++                    {channel: 25, rssi: -90},
++                    {channel: 20, rssi: -90},
++                ]),
++            ).toStrictEqual(20);
++            expect(
++                pickBestChannel([
++                    {channel: 11, rssi: -90},
++                    {channel: 25, rssi: -90},
++                    {channel: 15, rssi: -85},
++                ]),
++            ).toStrictEqual(25);
++            expect(
++                pickBestChannel([
++                    {channel: 11, rssi: -90},
++                    {channel: 15, rssi: -90},
++                    {channel: 20, rssi: -90},
++                    {channel: 25, rssi: -90},
++                ]),
++            ).toStrictEqual(15);
++        });
++
++        it("throws when nothing measured", () => {
++            expect(() => pickBestChannel([])).toThrow("No channel was measured.");
++        });
++    });
++
++    describe("energyScan", () => {
++        it("scans candidate channels with ENERGY_SCAN and returns results and best channel", async () => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            const p = energyScan(ezsp);
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await expect(p).resolves.toStrictEqual({
++                results: [
++                    {channel: 11, rssi: -70},
++                    {channel: 15, rssi: -91},
++                    {channel: 20, rssi: -80},
++                    {channel: 25, rssi: -88},
++                ],
++                best: 15,
++            });
++
++            expect(ENERGY_SCAN_CHANNELS).toStrictEqual([11, 15, 20, 25]);
++            expect(fake.start).toHaveBeenCalledTimes(1);
++            expect(fake.ezspVersion).toHaveBeenCalledWith(EZSP_PROTOCOL_VERSION);
++            expect(fake.setProtocolVersion).toHaveBeenCalledWith(EZSP_PROTOCOL_VERSION);
++            expect(fake.ezspStartScan).toHaveBeenCalledTimes(1);
++            expect(fake.ezspStartScan).toHaveBeenCalledWith(
++                EzspNetworkScanType.ENERGY_SCAN,
++                (1 << 11) | (1 << 15) | (1 << 20) | (1 << 25),
++                ENERGY_SCAN_DURATION,
++            );
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++            expect(fake.stop.mock.invocationCallOrder[0]).toBeGreaterThan(fake.ezspStartScan.mock.invocationCallOrder[0]);
++            expect(vi.getTimerCount()).toStrictEqual(0);
++        });
++
++        it("keeps the loudest of repeated reports, ignores other channels, skips unreported ones", async () => {
++            const {ezsp} = makeFakeEzsp([
++                [11, -95],
++                [15, -90],
++                [15, -60],
++                [15, -75],
++                [26, -99],
++                [25, -85],
++            ]);
++            const p = energyScan(ezsp);
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await expect(p).resolves.toStrictEqual({
++                results: [
++                    {channel: 11, rssi: -95},
++                    {channel: 15, rssi: -60},
++                    {channel: 25, rssi: -85},
++                ],
++                best: 11,
++            });
++        });
++
++        it("negotiates a lower supported EZSP protocol version like the adapter", async () => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            fake.ezspVersion.mockResolvedValueOnce([EZSP_MIN_PROTOCOL_VERSION, EZSP_STACK_TYPE_MESH, 0]);
++            const p = energyScan(ezsp);
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await expect(p).resolves.toMatchObject({best: 15});
++            expect(fake.ezspVersion.mock.calls).toStrictEqual([[EZSP_PROTOCOL_VERSION], [EZSP_MIN_PROTOCOL_VERSION]]);
++            expect(fake.setProtocolVersion).toHaveBeenCalledWith(EZSP_MIN_PROTOCOL_VERSION);
++        });
++
++        it.each([
++            ["too old", EZSP_MIN_PROTOCOL_VERSION - 1, EZSP_STACK_TYPE_MESH, "is not supported"],
++            ["too new", EZSP_PROTOCOL_VERSION + 1, EZSP_STACK_TYPE_MESH, "is not supported"],
++            ["wrong stack", EZSP_PROTOCOL_VERSION, 0x01, "Stack type 1 is not expected."],
++        ])("fails on %s NCP and stops EZSP without scanning", async (_name, version, stackType, message) => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            fake.ezspVersion.mockResolvedValueOnce([version, stackType, 0]);
++
++            await expect(energyScan(ezsp)).rejects.toThrow(message);
++            expect(fake.ezspStartScan).toHaveBeenCalledTimes(0);
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("fails when EZSP does not start", async () => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            fake.start.mockResolvedValueOnce(EzspStatus.HOST_FATAL_ERROR);
++
++            await expect(energyScan(ezsp)).rejects.toThrow("Failed to start EZSP layer with status=HOST_FATAL_ERROR.");
++            expect(fake.ezspVersion).toHaveBeenCalledTimes(0);
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("fails when the scan does not start, without leaving a timer", async () => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            fake.ezspStartScan.mockResolvedValueOnce(SLStatus.MAC_SCANNING);
++
++            await expect(energyScan(ezsp)).rejects.toThrow("Failed to start energy scan with status=MAC_SCANNING.");
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++            expect(vi.getTimerCount()).toStrictEqual(0);
++        });
++
++        it("fails when the scan command throws, and a late completion does not leak a rejection", async () => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            fake.ezspStartScan.mockRejectedValueOnce(new EzspError(EzspStatus.ASH_ERROR_TIMEOUTS));
++
++            await expect(energyScan(ezsp)).rejects.toThrow("ASH_ERROR_TIMEOUTS");
++            // NCP всё же сообщил «скан окончен» с ошибкой уже после отказа — не должно быть необработанного отказа
++            fake.ezspScanCompleteHandler(11, SLStatus.FAIL);
++            await vi.advanceTimersByTimeAsync(ENERGY_SCAN_TIMEOUT_MSEC);
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("fails when the NCP reports a scan error", async () => {
++            const {fake, ezsp} = makeFakeEzsp([[11, -70]], SLStatus.FAIL, 15);
++            const p = energyScan(ezsp);
++            const assertion = expect(p).rejects.toThrow("Energy scan failed on channel 15 with status=FAIL.");
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await assertion;
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("fails when the scan never completes", async () => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            fake.ezspStartScan.mockResolvedValueOnce(SLStatus.OK);
++            const p = energyScan(ezsp);
++            const assertion = expect(p).rejects.toThrow(`Energy scan did not complete within ${ENERGY_SCAN_TIMEOUT_MSEC}ms.`);
++
++            await vi.advanceTimersByTimeAsync(ENERGY_SCAN_TIMEOUT_MSEC);
++            await assertion;
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("fails when no candidate channel was reported", async () => {
++            const {fake, ezsp} = makeFakeEzsp([[26, -99]]);
++            const p = energyScan(ezsp);
++            const assertion = expect(p).rejects.toThrow("No channel was measured.");
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await assertion;
++            expect(fake.stop).toHaveBeenCalledTimes(1);
++        });
++
++        it("receives results through the real Ezsp callback dispatch", async () => {
++            const ezsp = new Ezsp({path: "MOCK", baudRate: 115200, rtscts: false, adapter: "ember"});
++            const dispatch = (frameId: EzspFrameID, params: number[]): void => {
++                // @ts-expect-error private
++                const contents: Buffer = ezsp.callbackFrameContents;
++                contents.fill(0);
++                // расширенный формат кадра: [seq, fc LB, fc HB, frameId LB, frameId HB, параметры...]
++                contents.set([0, 0x90, 0x01, frameId & 0xff, frameId >> 8, ...params]);
++                // @ts-expect-error private
++                ezsp.callbackBuffalo.setPosition(EZSP_EXTENDED_PARAMETERS_INDEX);
++                ezsp.callbackDispatch();
++            };
++
++            vi.spyOn(ezsp, "start").mockResolvedValue(EzspStatus.SUCCESS);
++            const stopSpy = vi.spyOn(ezsp, "stop").mockResolvedValue(undefined);
++            vi.spyOn(ezsp, "ezspVersion").mockResolvedValue([EZSP_MIN_PROTOCOL_VERSION, EZSP_STACK_TYPE_MESH, 0]);
++            vi.spyOn(ezsp, "ezspStartScan").mockImplementation(async () => {
++                await Promise.resolve();
++                setTimeout(() => {
++                    // int8 RSSI: 0xb3 = -77, 0xa5 = -91, 0xb0 = -80, 0xa8 = -88
++                    dispatch(EzspFrameID.ENERGY_SCAN_RESULT_HANDLER, [11, 0xb3]);
++                    dispatch(EzspFrameID.ENERGY_SCAN_RESULT_HANDLER, [15, 0xa5]);
++                    dispatch(EzspFrameID.ENERGY_SCAN_RESULT_HANDLER, [20, 0xb0]);
++                    dispatch(EzspFrameID.ENERGY_SCAN_RESULT_HANDLER, [25, 0xa8]);
++                    dispatch(EzspFrameID.SCAN_COMPLETE_HANDLER, [25, 0x00]);
++                }, 4000);
++
++                return SLStatus.OK;
++            });
++
++            const p = energyScan(ezsp);
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await expect(p).resolves.toStrictEqual({
++                results: [
++                    {channel: 11, rssi: -77},
++                    {channel: 15, rssi: -91},
++                    {channel: 20, rssi: -80},
++                    {channel: 25, rssi: -88},
++                ],
++                best: 15,
++            });
++            expect(stopSpy).toHaveBeenCalledTimes(1);
++        });
++    });
++
++    describe("CLI", () => {
++        const makeIo = (ezsp?: EnergyScanEzsp) => ({
++            stdout: vi.fn(),
++            stderr: vi.fn(),
++            createEzsp: vi.fn().mockReturnValue(ezsp),
++        });
++
++        it.each([[[]], [["tcp://192.168.1.50:6638", "extra"]], [[""]]])("exits 2 with usage on bad arguments %j", async (args) => {
++            const io = makeIo();
++
++            await expect(runEnergyScanCli(args, io)).resolves.toStrictEqual(EXIT_ERROR);
++            expect(EXIT_ERROR).toStrictEqual(2);
++            expect(io.stderr).toHaveBeenCalledWith("Usage: node energyScanCli.js <port path, e.g. tcp://192.168.1.50:6638>");
++            expect(io.stdout).toHaveBeenCalledTimes(0);
++            expect(io.createEzsp).toHaveBeenCalledTimes(0);
++        });
++
++        it("prints ONE line of JSON by contract and exits 0", async () => {
++            const {ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            const io = makeIo(ezsp);
++            const p = runEnergyScanCli(["tcp://192.168.1.50:6638"], io);
++
++            await vi.advanceTimersByTimeAsync(5000);
++            await expect(p).resolves.toStrictEqual(EXIT_OK);
++            expect(EXIT_OK).toStrictEqual(0);
++            expect(io.createEzsp).toHaveBeenCalledWith("tcp://192.168.1.50:6638");
++            expect(io.stderr).toHaveBeenCalledTimes(0);
++            expect(io.stdout).toHaveBeenCalledTimes(1);
++            expect(io.stdout).toHaveBeenCalledWith(
++                '{"results":[{"channel":11,"rssi":-70},{"channel":15,"rssi":-91},{"channel":20,"rssi":-80},{"channel":25,"rssi":-88}],"best":15}',
++            );
++        });
++
++        it("exits 2 with a readable error on failure", async () => {
++            const {fake, ezsp} = makeFakeEzsp(QUIET_REPORTS);
++            fake.start.mockResolvedValueOnce(EzspStatus.HOST_FATAL_ERROR);
++            const io = makeIo(ezsp);
++
++            await expect(runEnergyScanCli(["tcp://192.168.1.50:6638"], io)).resolves.toStrictEqual(EXIT_ERROR);
++            expect(io.stdout).toHaveBeenCalledTimes(0);
++            expect(io.stderr).toHaveBeenCalledWith("BMS energy scan failed: Failed to start EZSP layer with status=HOST_FATAL_ERROR.");
++        });
++    });
++});

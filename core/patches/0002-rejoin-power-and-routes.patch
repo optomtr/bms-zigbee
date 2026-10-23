@@ -1,0 +1,647 @@
+BMS 0002: при переподключении устройства — мощность вверх и перестройка маршрутов, как шлюз Tuya
+
+Зачем: шлюз Tuya при
+переподключении (rejoin) устройства:
+- поднимает мощность с базы (обычно 13 dBm) до 19 dBm на 60 с и возвращает
+  базу; не поднимает, если база уже 18/19;
+- когда переподключившееся устройство снова что-то прислало, рассылает
+  many-to-one route request (перестройка маршрутов к шлюзу), не чаще раза в 30 с.
+Переподключается тот, кто потерял связь (дальний, за стеной, после сбоя
+питания), и без этого он долго «висит» на старых маршрутах.
+
+Что меняет (только драйвер ember):
+- база = transmitPower из настроек, если задана и применилась, иначе текущая
+  мощность радио (radioTxPower из ezspGetNetworkParameters при старте);
+- trustCenterJoin со статусом STANDARD_SECURITY_SECURED_REJOIN (0) или
+  STANDARD_SECURITY_UNSECURED_REJOIN (3) и не DENY_JOIN: при базе < 18 —
+  ezspSetRadioPower(19), возврат базы через 60 с после ПОСЛЕДНЕГО
+  переподключения; узел запоминается;
+- первое входящее сообщение (ZCL или ZDO) от такого узла:
+  ezspSendManyToOneRouteRequest с параметрами концентратора из стек-конфига
+  (как initNCPConcentrator), не чаще раза в 30 с; узел убирается из списка;
+- stop(): таймеры снимаются, повышенная мощность возвращается к базе.
+Все вызовы EZSP идут через this.queue; журнал с приставкой «BMS:».
+
+diff --git a/src/adapter/ember/adapter/emberAdapter.ts b/src/adapter/ember/adapter/emberAdapter.ts
+index 7c16d1d..2b3deaa 100644
+--- a/src/adapter/ember/adapter/emberAdapter.ts
++++ b/src/adapter/ember/adapter/emberAdapter.ts
+@@ -218,6 +218,17 @@ const DEFAULT_REQUEST_TIMEOUT = 15000; // msec
+ const DEFAULT_NETWORK_REQUEST_TIMEOUT = 10000; // nothing on the network to bother requests, should be much faster than this
+ /** Time between watchdog counters reading/clearing */
+ const WATCHDOG_COUNTERS_FEED_INTERVAL = 3600000; // every hour...
++/**
++ * BMS: при переподключении устройства (rejoin) шлюз Tuya поднимает мощность до 19 dBm на 60 с, потом возвращает базу
++ * (обычно 13). Переподключается тот, кто потерял связь, — обычно дальний или за препятствием: на повышенной мощности
++ * координатора он быстрее возвращается в сеть. Если база уже 18/19, шлюз мощность не трогает.
++ */
++const BMS_REJOIN_TX_POWER = 19;
++const BMS_REJOIN_TX_POWER_MIN_BASE = 18;
++/** BMS: окно отсчитывается от ПОСЛЕДНЕГО переподключения (каждое новое продлевает его), как у шлюза Tuya. */
++const BMS_REJOIN_TX_POWER_HOLD_MSEC = 60000;
++/** BMS: перестройку маршрутов к координатору (many-to-one route request) шлюз Tuya рассылает не чаще раза в 30 с. */
++const BMS_REJOIN_MTORR_MIN_INTERVAL_MSEC = 30000;
+ 
+ /**
+  * Relay calls between Z2M and EZSP-layer and handle any error that might occur via queue & waitress.
+@@ -249,6 +260,17 @@ export class EmberAdapter extends Adapter {
+     private networkCache: NetworkCache;
+     private multicastTable: EmberMulticastId[];
+ 
++    /** BMS: мощность, к которой возвращаемся после подъёма при переподключении (известна после старта). */
++    private bmsBaseTxPower?: number;
++    /** BMS: сейчас стоит повышенная мощность переподключения. */
++    private bmsTxPowerBoosted: boolean;
++    /** BMS: возврат базовой мощности через 60 с после последнего переподключения. */
++    private bmsTxPowerRestoreHandle?: NodeJS.Timeout;
++    /** BMS: узлы, которые переподключились и ещё ничего не прислали. */
++    private readonly bmsRejoinedNodes: Set<NodeId>;
++    /** BMS: пока таймер жив, many-to-one route request повторно не рассылаем. */
++    private bmsMtorrHoldoffHandle?: NodeJS.Timeout;
++
+     constructor(
+         networkOptions: TsType.NetworkOptions,
+         serialPortOptions: TsType.SerialPortOptions,
+@@ -274,6 +296,8 @@ export class EmberAdapter extends Adapter {
+         this.networkCache = initNetworkCache();
+         this.manufacturerCode = DEFAULT_STACK_CONFIG.DEFAULT_MANUFACTURER_CODE; // will be overridden in initEzsp
+         this.multicastTable = [];
++        this.bmsTxPowerBoosted = false;
++        this.bmsRejoinedNodes = new Set();
+ 
+         this.stackConfig = this.loadStackConfig();
+         this.queue = new Queue(this.adapterOptions.concurrent || 16); // ORed to avoid 0 (not checked in settings/queue constructor)
+@@ -519,6 +543,8 @@ export class EmberAdapter extends Adapter {
+      * @param messageContents The content of the response.
+      */
+     private onZDOResponse(apsFrame: EmberApsFrame, sender: NodeId, messageContents: Buffer): void {
++        this.bmsRouteRequestAfterRejoin(sender);
++
+         try {
+             const result = Zdo.Buffalo.readResponse(this.hasZdoMessageOverhead, apsFrame.clusterId, messageContents);
+ 
+@@ -554,6 +580,8 @@ export class EmberAdapter extends Adapter {
+         sender: NodeId,
+         messageContents: Buffer,
+     ): void {
++        this.bmsRouteRequestAfterRejoin(sender);
++
+         const payload: ZclPayload = {
+             clusterID: apsFrame.clusterId,
+             header: Zcl.Header.fromBuffer(messageContents),
+@@ -623,6 +651,17 @@ export class EmberAdapter extends Adapter {
+             this.emit("deviceLeave", payload);
+         } else {
+             if (policyDecision !== EmberJoinDecision.DENY_JOIN) {
++                // BMS: переподключение (rejoin) — в EmberDeviceUpdate это SECURED_REJOIN (0) и UNSECURED_REJOIN (3);
++                // UNSECURED_JOIN (1) — новое подключение, DEVICE_LEFT (2) — уход. Реагируем как шлюз Tuya.
++                if (
++                    status === EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN ||
++                    status === EmberDeviceUpdate.STANDARD_SECURITY_UNSECURED_REJOIN
++                ) {
++                    this.bmsRejoinedNodes.add(newNodeId);
++                    // не ждём: deviceJoined не должен стоять в очереди за командой радио
++                    void this.bmsBoostTxPowerOnRejoin(newNodeId);
++                }
++
+                 const payload: DeviceJoinedPayload = {
+                     networkAddress: newNodeId,
+                     ieeeAddr: newNodeEui64,
+@@ -650,6 +689,94 @@ export class EmberAdapter extends Adapter {
+         }
+     }
+ 
++    /**
++     * BMS: подъём мощности при переподключении, как шлюз Tuya: 19 dBm, база возвращается через 60 с после ПОСЛЕДНЕГО
++     * переподключения. При базе 18/19 ничего не делаем.
++     */
++    private async bmsBoostTxPowerOnRejoin(nodeId: NodeId): Promise<void> {
++        if (this.bmsBaseTxPower === undefined || this.bmsBaseTxPower >= BMS_REJOIN_TX_POWER_MIN_BASE) {
++            return;
++        }
++
++        clearTimeout(this.bmsTxPowerRestoreHandle);
++        this.bmsTxPowerRestoreHandle = setTimeout(this.bmsRestoreTxPower.bind(this), BMS_REJOIN_TX_POWER_HOLD_MSEC);
++
++        if (!this.bmsTxPowerBoosted) {
++            this.bmsTxPowerBoosted = true;
++
++            await this.bmsSetTxPower(BMS_REJOIN_TX_POWER, `rejoin of ${nodeId}`);
++        }
++    }
++
++    /** BMS: вернуть базовую мощность (по таймеру или при остановке адаптера). */
++    private async bmsRestoreTxPower(): Promise<void> {
++        clearTimeout(this.bmsTxPowerRestoreHandle);
++        this.bmsTxPowerRestoreHandle = undefined;
++
++        if (this.bmsTxPowerBoosted && this.bmsBaseTxPower !== undefined) {
++            this.bmsTxPowerBoosted = false;
++
++            await this.bmsSetTxPower(this.bmsBaseTxPower, "rejoin window over");
++        }
++    }
++
++    private async bmsSetTxPower(power: number, reason: string): Promise<void> {
++        try {
++            const status = await this.queue.execute<SLStatus>(async () => await this.ezsp.ezspSetRadioPower(power));
++
++            if (status === SLStatus.OK) {
++                logger.info(`BMS: transmit power set to ${power} dBm (${reason}).`, NS);
++            } else {
++                logger.error(`BMS: failed to set transmit power to ${power} dBm (${reason}) status=${SLStatus[status]}.`, NS);
++            }
++        } catch (error) {
++            logger.error(`BMS: failed to set transmit power to ${power} dBm (${reason}): ${(error as Error).message}`, NS);
++        }
++    }
++
++    /**
++     * BMS: первое сообщение от переподключившегося узла — перестраиваем маршруты к координатору (many-to-one route
++     * request), как шлюз Tuya: не чаще раза в 30 с. Запрос широковещательный и обновляет маршруты всей сети, поэтому
++     * узел из списка убираем и тогда, когда запрос пропущен по 30-секундному ограничению.
++     */
++    private bmsRouteRequestAfterRejoin(sender: NodeId): void {
++        if (!this.bmsRejoinedNodes.delete(sender)) {
++            return;
++        }
++
++        if (this.bmsMtorrHoldoffHandle !== undefined) {
++            logger.debug(`BMS: many-to-one route request after rejoin of ${sender} skipped (sent less than 30s ago).`, NS);
++            return;
++        }
++
++        this.bmsMtorrHoldoffHandle = setTimeout(() => {
++            this.bmsMtorrHoldoffHandle = undefined;
++        }, BMS_REJOIN_MTORR_MIN_INTERVAL_MSEC);
++
++        void this.bmsSendManyToOneRouteRequest(sender);
++    }
++
++    private async bmsSendManyToOneRouteRequest(sender: NodeId): Promise<void> {
++        try {
++            // те же параметры, что адаптер даёт концентратору в initNCPConcentrator
++            const status = await this.queue.execute<SLStatus>(
++                async () =>
++                    await this.ezsp.ezspSendManyToOneRouteRequest(
++                        this.stackConfig.CONCENTRATOR_RAM_TYPE === "low" ? EMBER_LOW_RAM_CONCENTRATOR : EMBER_HIGH_RAM_CONCENTRATOR,
++                        this.stackConfig.CONCENTRATOR_MAX_HOPS,
++                    ),
++            );
++
++            if (status === SLStatus.OK) {
++                logger.info(`BMS: many-to-one route request sent after rejoin of ${sender}.`, NS);
++            } else {
++                logger.error(`BMS: failed to send many-to-one route request after rejoin of ${sender} status=${SLStatus[status]}.`, NS);
++            }
++        } catch (error) {
++            logger.error(`BMS: failed to send many-to-one route request after rejoin of ${sender}: ${(error as Error).message}`, NS);
++        }
++    }
++
+     private async watchdogCounters(): Promise<void> {
+         await this.queue.execute<void>(async () => {
+             // listed as per EmberCounterType
+@@ -731,12 +858,18 @@ export class EmberAdapter extends Adapter {
+             throw new Error(`Failed to get network parameters with status=${SLStatus[status]}.`);
+         }
+ 
++        // BMS: база для подъёма мощности при переподключении — то, что реально стоит на радио:
++        // мощность из настроек, если она задана и применилась, иначе текущая мощность радио
++        this.bmsBaseTxPower = parameters.radioTxPower;
++
+         if (this.adapterOptions.transmitPower != null && parameters.radioTxPower !== this.adapterOptions.transmitPower) {
+             const status = await this.ezsp.ezspSetRadioPower(this.adapterOptions.transmitPower);
+ 
+             if (status !== SLStatus.OK) {
+                 // soft-fail, don't prevent start
+                 logger.error(`Failed to set transmit power to ${this.adapterOptions.transmitPower} status=${SLStatus[status]}.`, NS);
++            } else {
++                this.bmsBaseTxPower = this.adapterOptions.transmitPower;
+             }
+         }
+ 
+@@ -1562,6 +1695,11 @@ export class EmberAdapter extends Adapter {
+ 
+     public async stop(): Promise<void> {
+         clearInterval(this.watchdogCountersHandle);
++        // BMS: таймеры снимаем, повышенную мощность не оставляем на радио после остановки
++        clearTimeout(this.bmsMtorrHoldoffHandle);
++        this.bmsMtorrHoldoffHandle = undefined;
++        this.bmsRejoinedNodes.clear();
++        await this.bmsRestoreTxPower();
+         await this.ezsp.stop();
+         this.ezsp.removeAllListeners();
+ 
+diff --git a/test/adapter/ember/emberAdapter.test.ts b/test/adapter/ember/emberAdapter.test.ts
+index 7de9542..03b19bb 100644
+--- a/test/adapter/ember/emberAdapter.test.ts
++++ b/test/adapter/ember/emberAdapter.test.ts
+@@ -12,7 +12,7 @@ import {
+ } from "../../../src/adapter/ember/adapter/emberAdapter";
+ import {FIXED_ENDPOINTS} from "../../../src/adapter/ember/adapter/endpoints";
+ import {OneWaitressEvents} from "../../../src/adapter/ember/adapter/oneWaitress";
+-import {EMBER_LOW_RAM_CONCENTRATOR, SECURITY_LEVEL_Z3} from "../../../src/adapter/ember/consts";
++import {EMBER_HIGH_RAM_CONCENTRATOR, EMBER_LOW_RAM_CONCENTRATOR, SECURITY_LEVEL_Z3} from "../../../src/adapter/ember/consts";
+ import {
+     EmberApsOption,
+     EmberDeviceUpdate,
+@@ -274,6 +274,7 @@ const mockEzspSetLogicalAndRadioChannel = vi.fn().mockResolvedValue(SLStatus.OK)
+ const mockEzspSendRawMessage = vi.fn().mockResolvedValue(SLStatus.OK);
+ const mockEzspSetNWKFrameCounter = vi.fn().mockResolvedValue(SLStatus.OK);
+ const mockEzspSetAPSFrameCounter = vi.fn().mockResolvedValue(SLStatus.OK);
++const mockEzspSendManyToOneRouteRequest = vi.fn().mockResolvedValue(SLStatus.OK);
+ 
+ vi.mock("../../../src/adapter/ember/uart/ash");
+ 
+@@ -334,6 +335,7 @@ vi.mock("../../../src/adapter/ember/ezsp/ezsp", async (importOriginal) => ({
+         ezspSendRawMessage: mockEzspSendRawMessage,
+         ezspSetNWKFrameCounter: mockEzspSetNWKFrameCounter,
+         ezspSetAPSFrameCounter: mockEzspSetAPSFrameCounter,
++        ezspSendManyToOneRouteRequest: mockEzspSendManyToOneRouteRequest,
+     })),
+ }));
+ 
+@@ -388,6 +390,7 @@ const ezspMocks = [
+     mockEzspSendRawMessage,
+     mockEzspSetNWKFrameCounter,
+     mockEzspSetAPSFrameCounter,
++    mockEzspSendManyToOneRouteRequest,
+ ];
+ 
+ describe("Ember Adapter Layer", () => {
+@@ -890,6 +893,142 @@ describe("Ember Adapter Layer", () => {
+         expect(loggerSpies.error).toHaveBeenCalledWith("Failed to set transmit power to 12 status=FAIL.", "zh:ember");
+     });
+ 
++    it("BMS: restores configured transmit power after rejoin boost", async () => {
++        adapter = new EmberAdapter(
++            DEFAULT_NETWORK_OPTIONS,
++            DEFAULT_SERIAL_PORT_OPTIONS,
++            backupPath,
++            Object.assign({}, DEFAULT_ADAPTER_OPTIONS, {transmitPower: 10}),
++        );
++
++        const result = adapter.start();
++
++        await vi.advanceTimersByTimeAsync(5000);
++        await result;
++        clearMocks();
++
++        mockEzspEmitter.emit(
++            "trustCenterJoin",
++            1234,
++            "0x11223344eebbccaa",
++            EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN,
++            EmberJoinDecision.NO_ACTION,
++            4321,
++        );
++        await flushPromises();
++
++        expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(1);
++        expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(19);
++
++        await vi.advanceTimersByTimeAsync(60000);
++
++        // база — мощность из настроек (10), а не то, что радио сообщило до её установки (5)
++        expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(2);
++        expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(10);
++    });
++
++    it("BMS: uses actual radio power as base when configured transmit power failed to apply", async () => {
++        adapter = new EmberAdapter(
++            DEFAULT_NETWORK_OPTIONS,
++            DEFAULT_SERIAL_PORT_OPTIONS,
++            backupPath,
++            Object.assign({}, DEFAULT_ADAPTER_OPTIONS, {transmitPower: 12}),
++        );
++        mockEzspSetRadioPower.mockResolvedValueOnce(SLStatus.FAIL);
++
++        const result = adapter.start();
++
++        await vi.advanceTimersByTimeAsync(5000);
++        await result;
++        clearMocks();
++
++        mockEzspEmitter.emit(
++            "trustCenterJoin",
++            1234,
++            "0x11223344eebbccaa",
++            EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN,
++            EmberJoinDecision.NO_ACTION,
++            4321,
++        );
++        await flushPromises();
++        await vi.advanceTimersByTimeAsync(60000);
++
++        expect(mockEzspSetRadioPower.mock.calls).toStrictEqual([[19], [DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower]]);
++    });
++
++    it("BMS: many-to-one route request after rejoin uses concentrator params from custom stack config", async () => {
++        writeFileSync(STACK_CONFIG_PATH, JSON.stringify({CONCENTRATOR_RAM_TYPE: "low", CONCENTRATOR_MAX_HOPS: 5}, undefined, 2));
++
++        adapter = new EmberAdapter(DEFAULT_NETWORK_OPTIONS, DEFAULT_SERIAL_PORT_OPTIONS, backupPath, DEFAULT_ADAPTER_OPTIONS);
++
++        const result = adapter.start();
++
++        await vi.advanceTimersByTimeAsync(5000);
++        await result;
++        clearMocks();
++
++        mockEzspEmitter.emit(
++            "trustCenterJoin",
++            1234,
++            "0x11223344eebbccaa",
++            EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN,
++            EmberJoinDecision.NO_ACTION,
++            4321,
++        );
++        await flushPromises();
++        mockEzspEmitter.emit(
++            "incomingMessage",
++            EmberIncomingMessageType.UNICAST,
++            {
++                profileId: ZSpec.HA_PROFILE_ID,
++                clusterId: Zcl.Clusters.genBasic.ID,
++                sourceEndpoint: 1,
++                destinationEndpoint: 1,
++                options: 0,
++                groupId: 0,
++                sequence: 0,
++            },
++            252,
++            1234,
++            Buffer.from("1803010000002003", "hex"),
++        );
++        await flushPromises();
++
++        expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(1);
++        expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledWith(EMBER_LOW_RAM_CONCENTRATOR, 5);
++
++        // cleanup
++        unlinkSync(STACK_CONFIG_PATH);
++    });
++
++    it.each([18, 19])("BMS: does not boost transmit power on rejoin when base is already %s dBm", async (transmitPower) => {
++        adapter = new EmberAdapter(
++            DEFAULT_NETWORK_OPTIONS,
++            DEFAULT_SERIAL_PORT_OPTIONS,
++            backupPath,
++            Object.assign({}, DEFAULT_ADAPTER_OPTIONS, {transmitPower}),
++        );
++
++        const result = adapter.start();
++
++        await vi.advanceTimersByTimeAsync(5000);
++        await result;
++        clearMocks();
++
++        mockEzspEmitter.emit(
++            "trustCenterJoin",
++            1234,
++            "0x11223344eebbccaa",
++            EmberDeviceUpdate.STANDARD_SECURITY_UNSECURED_REJOIN,
++            EmberJoinDecision.USE_PRECONFIGURED_KEY,
++            4321,
++        );
++        await flushPromises();
++        await vi.advanceTimersByTimeAsync(120000);
++
++        expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(0);
++    });
++
+     it("Fails to start when EZSP layer fails to start", async () => {
+         adapter = new EmberAdapter(DEFAULT_NETWORK_OPTIONS, DEFAULT_SERIAL_PORT_OPTIONS, backupPath, DEFAULT_ADAPTER_OPTIONS);
+ 
+@@ -1750,6 +1889,231 @@ describe("Ember Adapter Layer", () => {
+             expect(mockManufCode).toStrictEqual(Zcl.ManufacturerCode.LUMI_UNITED_TECHOLOGY_LTD_SHENZHEN);
+         });
+ 
++        describe("BMS: rejoin like Tuya gateway", () => {
++            const emitTrustCenterJoin = async (nodeId: NodeId, status: EmberDeviceUpdate) => {
++                mockEzspEmitter.emit("trustCenterJoin", nodeId, "0x11223344eebbccaa", status, EmberJoinDecision.NO_ACTION, 4321);
++                await flushPromises();
++            };
++            const emitIncomingMessage = async (sender: NodeId) => {
++                const apsFrame: EmberApsFrame = {
++                    profileId: ZSpec.HA_PROFILE_ID,
++                    clusterId: Zcl.Clusters.genBasic.ID,
++                    sourceEndpoint: 1,
++                    destinationEndpoint: 1,
++                    options: 0,
++                    groupId: 0,
++                    sequence: 0,
++                };
++
++                mockEzspEmitter.emit(
++                    "incomingMessage",
++                    EmberIncomingMessageType.UNICAST,
++                    apsFrame,
++                    252,
++                    sender,
++                    Buffer.from("1803010000002003", "hex"),
++                );
++                await flushPromises();
++            };
++
++            it("boosts transmit power to 19 dBm and restores base 60s after the LAST rejoin", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(1);
++                expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(19);
++                expect(loggerSpies.info).toHaveBeenCalledWith("BMS: transmit power set to 19 dBm (rejoin of 1234).", "zh:ember");
++
++                await vi.advanceTimersByTimeAsync(30000);
++                // второе переподключение: мощность уже поднята, окно продлевается
++                await emitTrustCenterJoin(5678, EmberDeviceUpdate.STANDARD_SECURITY_UNSECURED_REJOIN);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(1);
++
++                await vi.advanceTimersByTimeAsync(59000);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(1);
++
++                await vi.advanceTimersByTimeAsync(1000);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(2);
++                expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower);
++                expect(loggerSpies.info).toHaveBeenCalledWith(
++                    `BMS: transmit power set to ${DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower} dBm (rejoin window over).`,
++                    "zh:ember",
++                );
++
++                // следующее переподключение снова поднимает
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(3);
++                expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(19);
++            });
++
++            it.each([
++                ["STANDARD_SECURITY_SECURED_REJOIN", EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN],
++                ["STANDARD_SECURITY_UNSECURED_REJOIN", EmberDeviceUpdate.STANDARD_SECURITY_UNSECURED_REJOIN],
++            ])("treats %s as rejoin", async (_name, status) => {
++                await emitTrustCenterJoin(1234, status);
++                await emitIncomingMessage(1234);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(1);
++                expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(19);
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(1);
++            });
++
++            it("does nothing on a new join, leave or denied rejoin", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_UNSECURED_JOIN);
++                await emitTrustCenterJoin(1235, EmberDeviceUpdate.DEVICE_LEFT);
++                mockEzspEmitter.emit(
++                    "trustCenterJoin",
++                    1236,
++                    "0x11223344eebbccab",
++                    EmberDeviceUpdate.STANDARD_SECURITY_UNSECURED_REJOIN,
++                    EmberJoinDecision.DENY_JOIN,
++                    4321,
++                );
++                await flushPromises();
++                await emitIncomingMessage(1234);
++                await emitIncomingMessage(1235);
++                await emitIncomingMessage(1236);
++                await vi.advanceTimersByTimeAsync(120000);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(0);
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(0);
++            });
++
++            it("logs and keeps going when setting transmit power fails", async () => {
++                mockEzspSetRadioPower.mockResolvedValueOnce(SLStatus.FAIL).mockRejectedValueOnce(new EzspError(EzspStatus.NOT_CONNECTED));
++
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++
++                expect(loggerSpies.error).toHaveBeenCalledWith(
++                    "BMS: failed to set transmit power to 19 dBm (rejoin of 1234) status=FAIL.",
++                    "zh:ember",
++                );
++
++                await vi.advanceTimersByTimeAsync(60000);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(2);
++                expect(loggerSpies.error).toHaveBeenCalledWith(
++                    `BMS: failed to set transmit power to ${DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower} dBm (rejoin window over): ${new EzspError(EzspStatus.NOT_CONNECTED).message}`,
++                    "zh:ember",
++                );
++            });
++
++            it("restores base transmit power and clears timers on stop", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                await emitIncomingMessage(1234);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(1);
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(1);
++
++                await emitTrustCenterJoin(5678, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                await adapter.stop();
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(2);
++                expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower);
++                expect(mockEzspSetRadioPower.mock.invocationCallOrder[1]).toBeLessThan(mockEzspStop.mock.invocationCallOrder[0]);
++
++                await vi.advanceTimersByTimeAsync(120000);
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(2);
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerRestoreHandle).toStrictEqual(undefined);
++                // @ts-expect-error private
++                expect(adapter.bmsMtorrHoldoffHandle).toStrictEqual(undefined);
++                // @ts-expect-error private
++                expect(adapter.bmsRejoinedNodes.size).toStrictEqual(0);
++            });
++
++            it("does not touch transmit power on stop when not boosted", async () => {
++                await adapter.stop();
++
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(0);
++            });
++
++            it("sends many-to-one route request on first message after rejoin, at most once per 30s", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                await emitTrustCenterJoin(5678, EmberDeviceUpdate.STANDARD_SECURITY_UNSECURED_REJOIN);
++
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(0);
++
++                // чужой узел (не переподключался) — ничего
++                await emitIncomingMessage(4444);
++
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(0);
++
++                await emitIncomingMessage(1234);
++
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(1);
++                // те же параметры, что у концентратора в initNCPConcentrator (стек-конфиг по умолчанию)
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledWith(
++                    EMBER_HIGH_RAM_CONCENTRATOR,
++                    DEFAULT_STACK_CONFIG.CONCENTRATOR_MAX_HOPS,
++                );
++                expect(loggerSpies.info).toHaveBeenCalledWith("BMS: many-to-one route request sent after rejoin of 1234.", "zh:ember");
++
++                // узел убран из списка: его следующее сообщение — ничего
++                await emitIncomingMessage(1234);
++                // второй узел в пределах 30 с — пропуск, и он тоже убран из списка
++                await vi.advanceTimersByTimeAsync(29000);
++                await emitIncomingMessage(5678);
++
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(1);
++
++                await vi.advanceTimersByTimeAsync(1000);
++                await emitIncomingMessage(5678);
++
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(1);
++
++                // после 30 с новое переподключение снова даёт запрос
++                await emitTrustCenterJoin(5678, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                await emitIncomingMessage(5678);
++
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(2);
++            });
++
++            it("sends many-to-one route request on first ZDO message after rejoin", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++
++                const apsFrame: EmberApsFrame = {
++                    profileId: Zdo.ZDO_PROFILE_ID,
++                    clusterId: Zdo.ClusterId.END_DEVICE_ANNOUNCE,
++                    sourceEndpoint: Zdo.ZDO_ENDPOINT,
++                    destinationEndpoint: Zdo.ZDO_ENDPOINT,
++                    options: 0,
++                    groupId: 0,
++                    sequence: 0,
++                };
++
++                mockEzspEmitter.emit("zdoResponse", apsFrame, 1234, Buffer.from([0]));
++                await flushPromises();
++
++                expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(1);
++            });
++
++            it("logs failure of many-to-one route request", async () => {
++                mockEzspSendManyToOneRouteRequest.mockResolvedValueOnce(SLStatus.FAIL).mockRejectedValueOnce(new EzspError(EzspStatus.NOT_CONNECTED));
++
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                await emitIncomingMessage(1234);
++
++                expect(loggerSpies.error).toHaveBeenCalledWith(
++                    "BMS: failed to send many-to-one route request after rejoin of 1234 status=FAIL.",
++                    "zh:ember",
++                );
++
++                await vi.advanceTimersByTimeAsync(30000);
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                await emitIncomingMessage(1234);
++
++                expect(loggerSpies.error).toHaveBeenCalledWith(
++                    `BMS: failed to send many-to-one route request after rejoin of 1234: ${new EzspError(EzspStatus.NOT_CONNECTED).message}`,
++                    "zh:ember",
++                );
++            });
++        });
++
+         it("Triggers watchdog counters", async () => {
+             await vi.advanceTimersByTimeAsync(3610000);
+             expect(mockEzspReadAndClearCounters).toHaveBeenCalledTimes(1);

@@ -1,0 +1,6 @@
+# Репозиторий дополнений Home Assistant: этот файл должен лежать в корне репозитория —
+# по нему Home Assistant узнаёт имя, когда адрес добавляют в «Магазин дополнений -> Репозитории».
+# Само дополнение — папка addon/bms_zigbee (HA находит его по config.yaml).
+name: BMS Zigbee
+url: https://github.com/optomtr/bms-zigbee
+maintainer: BMS Smart Home

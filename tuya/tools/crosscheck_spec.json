@@ -1,0 +1,986 @@
+{
+  "about": "Какие модели converters сверяем с библиотекой и как свойства Z2M соответствуют кодам библиотеки. Соответствие (поле lib) — суждение человека, остальное crosscheck.mjs проверяет по исходникам: строки, цитаты, номера точек. Если номер/имя в строке не найдены в converters или код не найден в библиотеке — скрипт падает, а не молчит.",
+  "files": {
+    "tuya": "src/devices/tuya.ts",
+    "tuyalib": "src/lib/tuya.ts",
+    "legacy": "src/lib/legacy.ts"
+  },
+  "models": [
+    {
+      "model": "TS0601_cover_12",
+      "category": "cl",
+      "group": "Шторы",
+      "why": "Единственная модель шторного мотора, у которой имена свойств Z2M почти дословно повторяют облачные коды Tuya (situation_set, fault, total_time)",
+      "rows": [
+        {
+          "z2m": "state",
+          "dp": 1,
+          "lib": [
+            "control"
+          ],
+          "enum": {
+            "values": {
+              "OPEN": 0,
+              "STOP": 1,
+              "CLOSE": 2,
+              "CONTINUE": 3
+            },
+            "file": "tuyalib",
+            "line": 1671,
+            "quote": "coverAction: valueConverterBasic.lookup"
+          },
+          "note": "Библиотека для cl хранит не индексы, а набор команд «open_close_stop» (covers.py:42); сверять имена значений не с чем.",
+          "checks": [
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/core/ha_entities/covers.py",
+              "line": 42,
+              "quote": "localtuya_cover(\"open_close_stop\", \"position\")"
+            }
+          ]
+        },
+        {
+          "z2m": "position",
+          "dp": 2,
+          "lib": [
+            "percent_control"
+          ],
+          "note": "Задание положения (set_position_dp)."
+        },
+        {
+          "z2m": "position",
+          "dp": 3,
+          "lib": [
+            "percent_state"
+          ],
+          "claim": {
+            "dp": 3,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 3 — позиция шторы",
+            "what": "DP 3 — позиция шторы"
+          },
+          "note": "Текущее положение (current_position_dp)."
+        },
+        {
+          "z2m": "motor_direction",
+          "dp": 5,
+          "lib": [
+            "control_back"
+          ],
+          "enum": {
+            "values": {
+              "normal": 0,
+              "reversed": 1
+            },
+            "file": "tuyalib",
+            "line": 1673,
+            "quote": "tubularMotorDirection"
+          },
+          "note": "В converters строка 1686 прямо переводит приходящее от устройства \"back\" в reversed: значит устройство называет значения forward/back, как cloud-код control_back в библиотеке. Индексы совпадают по смыслу (0 = вперёд, 1 = назад); имена в Z2M другие.",
+          "checks": [
+            {
+              "root": "src",
+              "file": "src/lib/tuya.ts",
+              "line": 1686,
+              "quote": "return v === \"back\" ? \"reversed\" : \"normal\";"
+            }
+          ],
+          "libValues": "enum",
+          "valuesJudgement": "тот же смысл",
+          "valuesWhy": "индекс 0 = вперёд/normal, 1 = назад/reversed; имена разные"
+        },
+        {
+          "z2m": "auto_power",
+          "dp": 6,
+          "lib": []
+        },
+        {
+          "z2m": "motor_state",
+          "dp": 7,
+          "lib": [],
+          "note": "В cl-пресете нет точки состояния мотора (opening/closing/stopped)."
+        },
+        {
+          "z2m": "total_time",
+          "dp": 10,
+          "lib": [
+            "time_total"
+          ],
+          "note": "Имя в Z2M и код в библиотеке — одно слово наоборот."
+        },
+        {
+          "z2m": "situation_set",
+          "dp": 11,
+          "lib": [
+            "situation_set"
+          ],
+          "enumRaw": true
+        },
+        {
+          "z2m": "fault",
+          "dp": 12,
+          "lib": [
+            "fault"
+          ]
+        },
+        {
+          "z2m": "favorite_position",
+          "dp": 19,
+          "lib": []
+        },
+        {
+          "z2m": "battery",
+          "dp": 103,
+          "lib": [],
+          "claim": {
+            "dp": 4,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 4 — заряд батареи",
+            "what": "DP 4 — заряд батареи"
+          },
+          "note": "В пресете cl нет батареи вообще (у cl нет battery_* ни в одной платформе)."
+        }
+      ]
+    },
+    {
+      "model": "TS0601_cover_6",
+      "category": "cl",
+      "group": "Шторы",
+      "why": "Мотор с инвертированным положением (coverPositionInverted) и батареей",
+      "rows": [
+        {
+          "z2m": "state",
+          "dp": 1,
+          "lib": [
+            "control"
+          ]
+        },
+        {
+          "z2m": "position",
+          "dp": 2,
+          "lib": [
+            "percent_control"
+          ],
+          "note": "Конвертер coverPositionInverted (tuya.ts:1661): 100 - v. То есть у этой модели 100 = закрыто — та самая особенность, о которой знает и BMS Integration (cover.py:166).",
+          "checks": [
+            {
+              "root": "src",
+              "file": "src/lib/tuya.ts",
+              "line": 1661,
+              "quote": "coverPositionInverted: {"
+            },
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/cover.py",
+              "line": 166,
+              "quote": "round(100 - raw if config.get(CONF_POSITION_INVERTED) else raw)"
+            }
+          ]
+        },
+        {
+          "z2m": "position",
+          "dp": 3,
+          "lib": [
+            "percent_state"
+          ],
+          "claim": {
+            "dp": 3,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 3 — позиция шторы",
+            "what": "DP 3 — позиция шторы"
+          }
+        },
+        {
+          "z2m": "opening_mode",
+          "dp": 4,
+          "lib": []
+        },
+        {
+          "z2m": "work_state",
+          "dp": 7,
+          "lib": []
+        },
+        {
+          "z2m": "battery",
+          "dp": 13,
+          "lib": [],
+          "claim": {
+            "dp": 4,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 4 — заряд батареи",
+            "what": "DP 4 — заряд батареи"
+          }
+        },
+        {
+          "z2m": "motor_direction",
+          "dp": 101,
+          "lib": [
+            "control_back"
+          ],
+          "enum": {
+            "values": {
+              "left": 0,
+              "right": 1
+            },
+            "file": "tuyalib",
+            "line": 1691,
+            "quote": "motorDirectionSide: valueConverterBasic.lookup"
+          },
+          "note": "Тут направление названо left/right («сторона мотора»), а не forward/back.",
+          "libValues": "enum",
+          "valuesJudgement": "расходится",
+          "valuesWhy": "left/right — сторона мотора, а не направление вращения forward/back"
+        },
+        {
+          "z2m": "set_upper_limit",
+          "dp": 102,
+          "lib": [
+            "up_confirm"
+          ],
+          "note": "В библиотеке это переключатель-кнопка «Set Upper Limit» (boolean), в Z2M — enum start/stop."
+        },
+        {
+          "z2m": "illuminance",
+          "dp": 104,
+          "lib": []
+        },
+        {
+          "z2m": "factory_reset",
+          "dp": 107,
+          "lib": []
+        }
+      ]
+    },
+    {
+      "model": "TS0601_cover_1",
+      "category": "cl",
+      "group": "Шторы",
+      "why": "Самая массовая модель (72 производителя в отпечатках); у неё нет tuyaDatapoints, номера зашиты в legacy-конвертерах",
+      "legacy": true,
+      "rows": [
+        {
+          "z2m": "state",
+          "dp": 1,
+          "lib": [
+            "control"
+          ],
+          "legacy": {
+            "file": "legacy",
+            "line": 592,
+            "quote": "state: 1,",
+            "conv": "legacy.dataPoints.state"
+          },
+          "enum": {
+            "values": {
+              "open": 0,
+              "stop": 1,
+              "close": 2
+            },
+            "file": "legacy",
+            "line": 112,
+            "quote": "return {close: 2, open: 0, stop: 1}; // defaults"
+          },
+          "note": "Значения по умолчанию (legacy.ts:112). Для _TZE200_rddyvrci, _TZE200_wmcdj3aq, _TZE200_cowvfni3, _TYST11_cowvfni3 индексы другие (legacy.ts:93-105): у одного и того же «open/stop/close» разные числа. При чтении состояния DP 1 игнорируется (legacy.ts:3579)."
+        },
+        {
+          "z2m": "position",
+          "dp": 2,
+          "lib": [
+            "percent_control"
+          ],
+          "legacy": {
+            "file": "legacy",
+            "line": 594,
+            "quote": "coverPosition: 2,",
+            "conv": "legacy.dataPoints.coverPosition"
+          }
+        },
+        {
+          "z2m": "position",
+          "dp": 3,
+          "lib": [
+            "percent_state"
+          ],
+          "legacy": {
+            "file": "legacy",
+            "line": 598,
+            "quote": "coverArrived: 3,",
+            "conv": "legacy.dataPoints.coverArrived"
+          },
+          "claim": {
+            "dp": 3,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 3 — позиция шторы",
+            "what": "DP 3 — позиция шторы"
+          }
+        },
+        {
+          "z2m": "motor_direction",
+          "dp": 5,
+          "lib": [
+            "control_back"
+          ],
+          "legacy": {
+            "file": "legacy",
+            "line": 603,
+            "quote": "motorDirection: 5,",
+            "conv": "legacy.dataPoints.motorDirection / config"
+          }
+        },
+        {
+          "z2m": "(coverChange)",
+          "dp": 7,
+          "lib": [],
+          "legacy": {
+            "file": "legacy",
+            "line": 606,
+            "quote": "coverChange: 7,",
+            "conv": "legacy.dataPoints.coverChange"
+          },
+          "note": "Игнорируется как ненадёжная (legacy.ts:3581)."
+        },
+        {
+          "z2m": "motor_speed",
+          "dp": 105,
+          "lib": [],
+          "legacy": {
+            "file": "legacy",
+            "line": 617,
+            "quote": "coverSpeed: 105,",
+            "conv": "legacy.dataPoints.coverSpeed"
+          }
+        },
+        {
+          "z2m": "(список инверсии положения)",
+          "dp": 2,
+          "lib": [],
+          "legacy": {
+            "file": "legacy",
+            "line": 537,
+            "quote": "// Contains all covers which need their position inverted by default",
+            "conv": "legacy.coverPositionInvert: 7 производителей (legacy.ts:541-549)"
+          },
+          "note": "ОСОБЕННОСТЬ совпала: и у converters, и у BMS Integration положение шторы бывает наоборот (0 = открыто, 100 = закрыто). В converters это список из 7 производителей (legacy.ts:541-549), в BMS Integration — настройка position_inverted и калибровка краёв (cover.py:140-179). Библиотечные пресеты cl инверсию не задают (covers.py:23).",
+          "checks": [
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/cover.py",
+              "line": 140,
+              "quote": "def _calibration(config)"
+            },
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/core/ha_entities/covers.py",
+              "line": 23,
+              "quote": "def localtuya_cover(cmd_set, position_mode=None, inverted=False, timed=25):"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "model": "TS0601_thermostat_3",
+      "category": "wk",
+      "group": "Термостат",
+      "why": "Настенный термостат, 20 производителей",
+      "rows": [
+        {
+          "z2m": "system_mode",
+          "dp": 2,
+          "lib": [
+            "systemmode",
+            "switch",
+            "mode"
+          ],
+          "enum": true,
+          "libValues": "hvac_mode",
+          "valuesJudgement": "расходится",
+          "valuesWhy": "библиотека по умолчанию ждёт логический вкл/выкл (HEAT=true, OFF=false), у модели три значения auto/heat/off"
+        },
+        {
+          "z2m": "running_state",
+          "dp": 3,
+          "lib": [
+            "work_state",
+            "work_mode",
+            "work_status"
+          ],
+          "enum": true,
+          "libValues": "hvac_action",
+          "valuesJudgement": "расходится",
+          "valuesWhy": "библиотека по умолчанию ждёт true/false, у модели enum heat/idle"
+        },
+        {
+          "z2m": "current_heating_setpoint",
+          "dp": 4,
+          "lib": [
+            "temp_set"
+          ],
+          "scale": {
+            "libField": "precision"
+          }
+        },
+        {
+          "z2m": "local_temperature",
+          "dp": 5,
+          "lib": [
+            "temp_current"
+          ],
+          "scale": {
+            "libField": "precision"
+          }
+        },
+        {
+          "z2m": "child_lock",
+          "dp": 7,
+          "lib": [
+            "child_lock"
+          ]
+        },
+        {
+          "z2m": "schedule_monday",
+          "dp": 28,
+          "lib": [],
+          "note": "Расписание на неделю: DP 28-34."
+        },
+        {
+          "z2m": "frost_protection",
+          "dp": 36,
+          "lib": []
+        },
+        {
+          "z2m": "scale_protection",
+          "dp": 39,
+          "lib": []
+        },
+        {
+          "z2m": "local_temperature_calibration",
+          "dp": 47,
+          "lib": [
+            "tempcomp"
+          ],
+          "scale": {
+            "libField": "scale"
+          },
+          "note": "tempcomp в библиотеке — число «Calibration offset» -9..9."
+        },
+        {
+          "z2m": "pi_heating_demand",
+          "dp": 101,
+          "lib": []
+        }
+      ]
+    },
+    {
+      "model": "TS0601_thermostat_1",
+      "category": "wkf",
+      "group": "Термостат",
+      "why": "Термоголовка радиатора (TRV) с батареей",
+      "rows": [
+        {
+          "z2m": "system_mode",
+          "dp": 1,
+          "lib": [
+            "systemmode",
+            "mode"
+          ],
+          "note": "Режим и предустановка в одной точке (thermostatSystemModeAndPreset, tuya.ts:2518): индексы 0 auto, 1 manual, 2 off, 3 on. В библиотеке wkf режимы heat=manual, auto=auto (climates.py:255) — совпадает только частично: нет off/on.",
+          "checks": [
+            {
+              "root": "src",
+              "file": "src/lib/tuya.ts",
+              "line": 2518,
+              "quote": "thermostatSystemModeAndPreset: (toKey: string)"
+            },
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/core/ha_entities/climates.py",
+              "line": 255,
+              "quote": "hvac_mode_set={"
+            }
+          ]
+        },
+        {
+          "z2m": "current_heating_setpoint",
+          "dp": 2,
+          "lib": [
+            "temp_set"
+          ],
+          "scale": {
+            "libField": "precision"
+          }
+        },
+        {
+          "z2m": "local_temperature",
+          "dp": 3,
+          "lib": [
+            "temp_current"
+          ],
+          "scale": {
+            "libField": "precision"
+          }
+        },
+        {
+          "z2m": "running_state",
+          "dp": 6,
+          "lib": [
+            "work_state",
+            "work_mode",
+            "work_status"
+          ],
+          "enum": true,
+          "libValues": "hvac_action",
+          "valuesJudgement": "тот же смысл",
+          "valuesWhy": "heat/idle = открыт/закрыт клапан; имена разные"
+        },
+        {
+          "z2m": "window",
+          "dp": 7,
+          "lib": [
+            "window_state"
+          ],
+          "enum": true,
+          "libValues": "state_on",
+          "valuesJudgement": "тот же смысл",
+          "valuesWhy": "OPEN/CLOSE и opened — одно и то же состояние окна"
+        },
+        {
+          "z2m": "window_detection",
+          "dp": 8,
+          "lib": []
+        },
+        {
+          "z2m": "child_lock",
+          "dp": 12,
+          "lib": [
+            "child_lock"
+          ]
+        },
+        {
+          "z2m": "battery",
+          "dp": 13,
+          "lib": [
+            "battery",
+            "battery_percentage"
+          ],
+          "scale": {
+            "libField": "scale"
+          },
+          "claim": {
+            "dp": 4,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 4 — заряд батареи",
+            "what": "DP 4 — заряд батареи"
+          }
+        },
+        {
+          "z2m": "min_temperature",
+          "dp": 15,
+          "lib": [],
+          "note": "Границы уставки в библиотеке берутся из самой точки temp_set (min/max из облака)."
+        },
+        {
+          "z2m": "position",
+          "dp": 102,
+          "lib": [],
+          "note": "Открытие клапана."
+        }
+      ]
+    },
+    {
+      "model": "TS0601_switch_4_gang_1",
+      "category": "kg",
+      "group": "Выключатель",
+      "why": "Четырёхклавишный выключатель, 13 производителей",
+      "rows": [
+        {
+          "z2m": "state_l1",
+          "dp": 1,
+          "lib": [
+            "switch_1"
+          ],
+          "claim": {
+            "dp": 1,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 1 — включено/выключено",
+            "what": "DP 1 — включено/выключено"
+          }
+        },
+        {
+          "z2m": "state_l2",
+          "dp": 2,
+          "lib": [
+            "switch_2"
+          ]
+        },
+        {
+          "z2m": "state_l3",
+          "dp": 3,
+          "lib": [
+            "switch_3"
+          ]
+        },
+        {
+          "z2m": "state_l4",
+          "dp": 4,
+          "lib": [
+            "switch_4"
+          ]
+        }
+      ]
+    },
+    {
+      "model": "TS0601_switch_6_gang",
+      "category": "kg",
+      "group": "Выключатель",
+      "why": "Шестиклавишный выключатель с режимом питания и индикатором",
+      "rows": [
+        {
+          "z2m": "state_l5",
+          "dp": 5,
+          "lib": [
+            "switch_5"
+          ]
+        },
+        {
+          "z2m": "state_l6",
+          "dp": 6,
+          "lib": [
+            "switch_6"
+          ]
+        },
+        {
+          "z2m": "power_on_behavior",
+          "dp": 14,
+          "lib": [
+            "relay_status"
+          ],
+          "enum": true,
+          "libValues": "enum",
+          "valuesJudgement": "частично",
+          "valuesWhy": "вариант библиотеки с именами on/off/memory совпал, но вариант с индексами 0=ON, 1=OFF (selects.py:232) противоречит модели (0=off, 1=on)"
+        },
+        {
+          "z2m": "indicator_mode",
+          "dp": 15,
+          "lib": [
+            "light_mode"
+          ],
+          "enum": true,
+          "libValues": "enum"
+        }
+      ]
+    },
+    {
+      "model": "TS0601_dimmer_1_gang_1",
+      "category": "tgkg",
+      "group": "Выключатель",
+      "why": "Одноканальный диммер, 29 производителей",
+      "rows": [
+        {
+          "z2m": "state",
+          "dp": 1,
+          "lib": [
+            "switch_led_1"
+          ]
+        },
+        {
+          "z2m": "brightness",
+          "dp": 2,
+          "lib": [
+            "bright_value_1"
+          ],
+          "scale": {
+            "z2mRange": 1000,
+            "libField": "max"
+          },
+          "note": "scale0_254to0_1000 (tuya.ts:1574): точка 0..1000, Z2M показывает 0..254. Верхняя граница 1000 в библиотеке (lights.py:24) совпадает.",
+          "checks": [
+            {
+              "root": "src",
+              "file": "src/lib/tuya.ts",
+              "line": 1574,
+              "quote": "scale0_254to0_1000: valueConverterBasic.scale(0, 254, 0, 1000)"
+            },
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/core/ha_entities/lights.py",
+              "line": 24,
+              "quote": "lower=29, upper=1000"
+            }
+          ]
+        },
+        {
+          "z2m": "min_brightness",
+          "dp": 3,
+          "lib": [
+            "brightness_min_1"
+          ]
+        },
+        {
+          "z2m": "light_type",
+          "dp": 4,
+          "lib": [
+            "led_type_1"
+          ],
+          "enum": {
+            "values": {
+              "led": 0,
+              "incandescent": 1,
+              "halogen": 2
+            },
+            "file": "tuyalib",
+            "line": 1572,
+            "quote": "lightType: valueConverterBasic.lookup"
+          },
+          "libValues": "enum"
+        },
+        {
+          "z2m": "max_brightness",
+          "dp": 5,
+          "lib": [
+            "brightness_max_1"
+          ]
+        },
+        {
+          "z2m": "countdown",
+          "dp": 6,
+          "lib": [],
+          "note": "Таймер: в tgkg его нет (есть в kg как countdown_1)."
+        },
+        {
+          "z2m": "power_on_behavior",
+          "dp": 14,
+          "lib": [
+            "relay_status"
+          ],
+          "enum": {
+            "values": {
+              "off": 0,
+              "on": 1,
+              "previous": 2
+            },
+            "file": "tuyalib",
+            "line": 1556,
+            "quote": "powerOnBehavior: valueConverterBasic.lookup"
+          },
+          "libValues": "enum",
+          "valuesJudgement": "частично",
+          "valuesWhy": "имена memory/previous разные; вариант с индексами 0=ON, 1=OFF (selects.py:748) противоречит модели (0=off, 1=on)"
+        },
+        {
+          "z2m": "backlight_mode",
+          "dp": 21,
+          "lib": [
+            "light_mode"
+          ],
+          "enum": {
+            "values": {
+              "off": 0,
+              "normal": 1,
+              "inverted": 2
+            },
+            "file": "tuyalib",
+            "line": 1570,
+            "quote": "backlightModeOffNormalInverted: valueConverterBasic.lookup"
+          },
+          "libValues": "enum",
+          "valuesJudgement": "расходится",
+          "valuesWhy": "у Z2M off/normal/inverted, у библиотеки relay/pos/none — разные наборы режимов подсветки"
+        }
+      ]
+    },
+    {
+      "model": "TS0601_temperature_humidity_sensor_3",
+      "category": "wsdcg",
+      "group": "Датчик",
+      "why": "Датчик температуры и влажности с батареей",
+      "rows": [
+        {
+          "z2m": "temperature",
+          "dp": 1,
+          "lib": [
+            "va_temperature",
+            "temp_current"
+          ],
+          "scale": {
+            "libField": "scale"
+          },
+          "note": "У температуры в библиотеке два кода с разными запасными масштабами: va_temperature 1, temp_current 0.01 (sensors.py:1203, 1210).",
+          "checks": [
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/core/ha_entities/sensors.py",
+              "line": 1203,
+              "quote": "LocalTuyaEntity("
+            },
+            {
+              "root": "bms",
+              "file": "custom_components/bms_integration/core/ha_entities/sensors.py",
+              "line": 1210,
+              "quote": "LocalTuyaEntity("
+            }
+          ]
+        },
+        {
+          "z2m": "humidity",
+          "dp": 2,
+          "lib": [
+            "va_humidity",
+            "humidity_value"
+          ],
+          "scale": {
+            "libField": "scale"
+          }
+        },
+        {
+          "z2m": "battery",
+          "dp": 4,
+          "lib": [
+            "battery_percentage"
+          ],
+          "scale": {
+            "libField": "scale"
+          },
+          "claim": {
+            "dp": 4,
+            "source": "docs/СПРАВОЧНИК.md:43",
+            "quote": "DP 4 — заряд батареи",
+            "what": "DP 4 — заряд батареи"
+          }
+        },
+        {
+          "z2m": "temperature_unit",
+          "dp": 9,
+          "lib": [
+            "c_f",
+            "temp_unit_convert"
+          ],
+          "enum": {
+            "values": {
+              "celsius": 0,
+              "fahrenheit": 1
+            },
+            "file": "tuyalib",
+            "line": 1577,
+            "quote": "temperatureUnitEnum: valueConverterBasic.lookup"
+          },
+          "libValues": "enum",
+          "valuesJudgement": "тот же смысл",
+          "valuesWhy": "celsius/fahrenheit и c/f; индексы 0/1 в библиотеке не заданы"
+        },
+        {
+          "z2m": "temperature_sensitivity",
+          "dp": 19,
+          "lib": [
+            "temp_sensitivity"
+          ],
+          "scale": {
+            "libField": "scale"
+          }
+        }
+      ]
+    },
+    {
+      "model": "TS0601_smoke_4",
+      "category": "ywbj",
+      "group": "Датчик",
+      "why": "Датчик дыма с батареей, 5 производителей",
+      "rows": [
+        {
+          "z2m": "smoke",
+          "dp": 1,
+          "lib": [
+            "smoke_sensor_status",
+            "smoke_sensor_state"
+          ]
+        },
+        {
+          "z2m": "battery_state",
+          "dp": 14,
+          "lib": [
+            "battery_state"
+          ],
+          "enum": {
+            "values": {
+              "low": 0,
+              "medium": 1,
+              "high": 2
+            },
+            "file": "tuyalib",
+            "line": 1578,
+            "quote": "batteryState: valueConverterBasic.lookup"
+          },
+          "libValues": "enum"
+        },
+        {
+          "z2m": "battery",
+          "dp": 15,
+          "lib": [
+            "battery_percentage"
+          ],
+          "scale": {
+            "libField": "scale"
+          }
+        }
+      ]
+    },
+    {
+      "model": "TS0601_soil",
+      "category": "zwjcy",
+      "group": "Датчик",
+      "why": "Датчик почвы, 9 производителей",
+      "rows": [
+        {
+          "z2m": "soil_moisture",
+          "dp": 3,
+          "lib": [
+            "humidity"
+          ],
+          "scale": {
+            "libField": "scale"
+          }
+        },
+        {
+          "z2m": "temperature",
+          "dp": 5,
+          "lib": [
+            "temp_current"
+          ],
+          "scale": {
+            "libField": "scale"
+          },
+          "note": "У этой модели температура raw (масштаб 1), у модели _sensor_3 — divideBy10: масштаб зависит от модели, а не от категории."
+        },
+        {
+          "z2m": "battery_state",
+          "dp": 14,
+          "lib": [
+            "battery_state"
+          ],
+          "enum": {
+            "values": {
+              "low": 0,
+              "medium": 1,
+              "high": 2
+            },
+            "file": "tuyalib",
+            "line": 1578,
+            "quote": "batteryState: valueConverterBasic.lookup"
+          },
+          "libValues": "enum"
+        },
+        {
+          "z2m": "battery",
+          "dp": 15,
+          "lib": [
+            "battery_percentage"
+          ],
+          "scale": {
+            "libField": "scale"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+.work/
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+core/upstream/
+core/dist/
+.DS_Store
+.claude-flow/
+harness/config.yaml

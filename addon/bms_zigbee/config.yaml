@@ -1,0 +1,91 @@
+# Дополнение «BMS Zigbee» — основано на официальном zigbee2mqtt/hassio-zigbee2mqtt v2.14.2-1
+# (zigbee2mqtt/config.json). Формат YAML выбран только ради комментариев: Home Assistant читает
+# config.yaml и config.json одинаково. Всё, что НЕ помечено «BMS:», совпадает с официальным
+# дополнением — так проще переносить его обновления.
+
+name: BMS Zigbee                       # BMS: своё имя
+# BMS: версия = <версия Z2M из versions.json>-bms.<номер нашей сборки>.
+# Часть до «-» Dockerfile берёт как версию Zigbee2MQTT (${BUILD_VERSION%-*}), поэтому
+# менять её руками нельзя: stage.sh сам подтягивает её из versions.json.
+version: 2.14.2-bms.1
+slug: bms_zigbee                       # BMS: свой slug, чтобы жить рядом с официальным Z2M
+description: Zigbee2MQTT с нашим Zigbee-ядром и слоем Tuya для координатора SMLIGHT SLZB-06M
+url: https://github.com/optomtr/bms-zigbee  # BMS: наш репозиторий вместо официального
+uart: true
+udev: true
+startup: application
+services:
+  - mqtt:need
+hassio_api: true
+arch:
+  - aarch64
+  - amd64
+boot: auto
+init: false
+ingress: true
+timeout: 30
+panel_icon: mdi:zigbee
+map:
+  - type: share
+    read_only: false
+  - type: homeassistant_config
+    read_only: false
+    path: /config
+  - type: addon_config
+    read_only: false
+    path: /addon_config
+  - type: ssl
+    read_only: true
+ports:
+  # BMS: порт socat снаружи по умолчанию закрыт (null). Координатор у нас сетевой, socat не нужен,
+  # а открытый 8485 мешал бы запуску рядом с официальным Z2M (тот занимает 8485 на хосте).
+  # Включить можно в разделе «Сеть» дополнения.
+  8485/tcp: null
+  8099/tcp: null
+ports_description:
+  8485/tcp: Socat tcp-listen port
+  8099/tcp: Frontend tcp-listen port
+# BMS: образ собирается на самом Home Assistant из Dockerfile — ключа `image:` нет. Официальное
+# дополнение тянет готовый образ из ghcr.io, а нашего образа в реестре нет (и не должно быть,
+# пока не решено, где его публиковать). Первая установка поэтому долгая — см. README.md.
+options:
+  # BMS: свой каталог данных вместо /config/zigbee2mqtt — чтобы случайно не подхватить базу
+  # и сетевой ключ официального Z2M, если он стоит рядом. Хотите продолжить старую сеть —
+  # впишите сюда прежний путь.
+  data_path: /config/bms_zigbee
+  socat:
+    enabled: false
+    master: pty,raw,echo=0,link=/tmp/ttyZ2M,mode=777
+    slave: tcp-listen:8485,keepalive,nodelay,reuseaddr,keepidle=1,keepintvl=1,keepcnt=5
+    options: -d -d
+    log: false
+  mqtt: {}
+  serial:
+    # BMS: по умолчанию — наш координатор SLZB-06M по сети. Вместо IP_SLZB надо вписать
+    # IP-адрес координатора (например tcp://192.168.1.50:6638). Пока там заглушка, запуск
+    # останавливается с понятным сообщением (проверка в rootfs/docker-entrypoint.sh).
+    adapter: ember
+    port: tcp://IP_SLZB:6638
+schema:
+  data_path: str
+  socat:
+    enabled: bool?
+    master: str?
+    slave: str?
+    options: str?
+    log: bool?
+  mqtt:
+    server: str?
+    ca: str?
+    key: str?
+    cert: str?
+    user: str?
+    password: str?
+    base_topic: str?
+  serial:
+    port: str?
+    adapter: match(zstack|deconz|zigate|ezsp|ember|zboss)?
+    baudrate: int?
+    rtscts: bool?
+  watchdog: str?
+  force_onboarding: bool?

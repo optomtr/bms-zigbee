@@ -1,0 +1,53 @@
+diff --git a/custom_components/bms_integration/coordinator.py b/custom_components/bms_integration/coordinator.py
+--- a/custom_components/bms_integration/coordinator.py
++++ b/custom_components/bms_integration/coordinator.py
+@@ -1589,6 +1589,31 @@
+         self._dispatch_status()
+ 
+     @callback
++    def push_received(self, dps: dict, device_time) -> None:
++        """Каждая посылка шлюза - отдельным событием, без сравнения с кэшем.
++
++        Нужно стенду, чтобы отличать ответ устройства от оптимистичного показа:
++        apply_optimistic_status кладёт ожидаемое значение и в self._status, и в
++        кэш протокола, поэтому status_update молчит, когда устройство
++        подтвердило, а device_dp_triggered видит только посылки с одной точкой
++        и срабатывает ещё и на ответ опроса кэша хаба.
++        """
++        if self._fake_gateway:
++            return
++        event = f"{DOMAIN}_push"
++        if event not in self.hass.bus.async_listeners():
++            return
++        self.hass.bus.async_fire(
++            event,
++            {
++                CONF_DEVICE_ID: self.id,
++                "cid": self._node_id,
++                "dps": dps,
++                "t": device_time,
++            },
++        )
++
++    @callback
+     def disconnected(self, exc=""):
+         """Device disconnected."""
+         if not self._interface:
+diff --git a/custom_components/bms_integration/core/pytuya/__init__.py b/custom_components/bms_integration/core/pytuya/__init__.py
+--- a/custom_components/bms_integration/core/pytuya/__init__.py
++++ b/custom_components/bms_integration/core/pytuya/__init__.py
+@@ -783,6 +783,14 @@
+                 else:
+                     status = self.dps_cache.get("parent", {})
+ 
++                # Сырой push - ровно то, что прислал шлюз, а не кэш. По кэшу
++                # подтверждение устройства не отличить от нашей же записи:
++                # оптимистичная команда кладёт ожидаемое значение в тот же
++                # dps_cache. getattr - чтобы не трогать TuyaListener и
++                # EmptyListener.
++                push_received = getattr(listener, "push_received", None)
++                if push_received is not None and dps_payload:
++                    push_received(dict(dps_payload), decoded_message.get("t"))
+                 listener.status_updated(status)
+ 
+         return MessageDispatcher(self.id, _status_update, self.version, self.local_key)

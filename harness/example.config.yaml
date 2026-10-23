@@ -1,0 +1,69 @@
+# Конфиг замерщика стенда. Скопируйте в config.yaml и впишите свои адреса.
+# Пароли и токены сюда НЕ пишем - только имя переменной окружения.
+
+db: .work/zamer.sqlite            # одна база на все сценарии (путь от папки конфига)
+
+mqtt:                             # брокер, к которому подключён наш Z2M
+  host: 192.168.1.10
+  port: 1883
+  username: bms                   # можно убрать, если брокер без пароля
+  password_env: MQTT_PASSWORD     # пароль - из переменной окружения
+  base_topic: zigbee2mqtt
+
+ha:                               # Home Assistant, где хаб Tuya заведён BMS Integration
+  url: ws://192.168.1.20:8123/api/websocket
+  token_env: HA_TOKEN             # долгоживущий токен АДМИНИСТРАТОРА HA
+  # dp_event   - работает на текущей BMS Integration, но видит только посылки
+  #              с одной точкой данных (нижняя оценка для Tuya);
+  # push_event - точный, нужна правка интеграции patches/bms_integration_push_event.diff.
+  confirm: dp_event
+  # Окно сомнения после таймаута, с (ответ мог прийти из кэша хаба). Не трогать,
+  # пока на железе не проверено обратное (README, «Что проверить на железе»).
+  suspect_window_s: 12
+
+timing:
+  command_interval_s: 10          # команда каждому исполнительному раз в 10 с
+  command_timeout_s: 8            # ждём подтверждения не дольше (максимум 10)
+
+devices:
+  # Исполнительное: розетка. device_id и dp на стороне Tuya замерщик берёт из
+  # реестра HA (unique_id local_<device_id>_<dp>), указывать не обязательно.
+  - name: rozetka_kuhnya
+    type: actuator
+    kind: switch                  # switch (розетка/реле) или cover (шторы)
+    tuya:
+      entity_id: switch.rozetka_kuhnya_tuya
+    ours:
+      friendly_name: rozetka_kuhnya
+
+  # Дальнее реле за повторителем - для сценария 3.
+  - name: rele_garazh
+    type: actuator
+    kind: switch
+    far: true
+    tuya:
+      entity_id: switch.rele_garazh_tuya
+      device_id: bf0123456789abcdef   # можно задать явно, если реестр не помог
+      dp: 1
+    ours:
+      friendly_name: rele_garazh
+
+  # Шторы: значения для Z2M и точки Tuya можно переопределить, если у модели другие.
+  - name: shtory_zal
+    type: actuator
+    kind: cover
+    tuya:
+      entity_id: cover.shtory_zal_tuya
+    ours:
+      friendly_name: shtory_zal
+    # ours_values: [OPEN, CLOSE]
+    # tuya_values: [open, close]
+
+  # Спящий датчик: ожидаемый интервал отчётов, с.
+  - name: datchik_vanna
+    type: sensor
+    report_interval_s: 3600
+    tuya:
+      entity_id: sensor.datchik_vanna_temperature_tuya
+    ours:
+      friendly_name: datchik_vanna
