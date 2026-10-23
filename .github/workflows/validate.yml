@@ -26,6 +26,11 @@ jobs:
           python -m pytest -q
       - name: Build guard tests
         run: node --test addon/test/*.test.cjs
+      - name: Browser checks for BMS UI (isolated WebSocket)
+        run: |
+          npm install --prefix addon/.work/browser-check --no-audit --no-fund playwright@1.62.1
+          addon/.work/browser-check/node_modules/.bin/playwright install --with-deps chromium
+          NODE_PATH="$PWD/addon/.work/browser-check/node_modules" node addon/test/frontend-browser.cjs
       - name: Clean core patches, build and tests
         run: bash core/build.sh
       - name: Clean Z2M patches, build and tests

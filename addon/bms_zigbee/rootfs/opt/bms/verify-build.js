@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const {createHash} = require('node:crypto');
-function verify(manifestFile = '/opt/bms-build-manifest.json', app = '/app', layer = '/opt/bms-layer') {
+function verify(manifestFile = '/opt/bms-build-manifest.json', app = '/app', layer = '/opt/bms-layer', ui = path.join(__dirname, '../bms-ui')) {
     const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
     if (manifest.schema !== 1 || !manifest.herdsman?.includes('-bms.') || !manifest.core_patches?.includes('0005-response-retry-and-confirmed-power.patch')) {
         throw new Error('нет совместимого паспорта BMS/патча ядра');
@@ -28,6 +28,7 @@ function verify(manifestFile = '/opt/bms-build-manifest.json', app = '/app', lay
     if (!manifest.z2m_files?.['dist/controller.js']) throw new Error('в паспорте нет проверенного кода Z2M');
     for (const [name, expected] of Object.entries(manifest.z2m_files)) check(path.join(app, name), expected);
     for (const [name, expected] of Object.entries(manifest.files ?? {})) {
+        if (name.startsWith('rootfs/opt/bms-ui/')) check(path.join(ui, name.slice('rootfs/opt/bms-ui/'.length)), expected);
         if (name.startsWith('bms-layer/')) check(path.join(layer, name.slice('bms-layer/'.length)), expected);
     }
     return `BMS: build=${manifest.build_version}; Z2M=${z2m.version}; herdsman=${core.version}; converters=${manifest.converters}; tree=${manifest.source_tree_sha256}; patches=${manifest.z2m_patches.join(',')}`;

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "build_version": "2.14.2-bms.8",
+  "build_version": "2.14.2-bms.9",
   "zigbee2mqtt": "2.14.2",
   "converters": "26.115.1",
   "herdsman": "10.10.0-bms.3",
@@ -52,8 +52,8 @@
     "dist/extension/externalJS.d.ts.map": "f479df2cb2e597bd5ab73bf09e49b72632f58a9826f6e0bda7d5dd2a99ed27f4",
     "dist/extension/externalJS.js": "5fe59ffe8542ef1b9d8b45283897fb487f141d7ee2dba0904d023dbb24f9505a",
     "dist/extension/frontend.d.ts": "918fae2eead8fb912de5e55539e26703b971efd3ffa32d3be393fed47e0bbcbf",
-    "dist/extension/frontend.d.ts.map": "0c2039931363ae96c761ccaef6e7031681d4752873a0d10529d72b8ba9290ce2",
-    "dist/extension/frontend.js": "1e7700b47a1f590c6f716adaf5a923db43cf07c395473c829f9aac688f0e3cd7",
+    "dist/extension/frontend.d.ts.map": "452c3cbd72bc214f229b833d1f2af4aee5e115c0b7fb004a8a1734690482a1ae",
+    "dist/extension/frontend.js": "fb1435460528cbf04a5691c4dc4f95f460ad7f64ae098bcf50ee47194f8a761f",
     "dist/extension/groups.d.ts": "2088ea1d8f2ccf5ec6f49b8c282b120d07b55ff0c1560f2e206c265542ba4d99",
     "dist/extension/groups.d.ts.map": "a7af863562ba0687ccb961aa9c87756c08897e43c56cdc534a50cab4011b73e5",
     "dist/extension/groups.js": "c444caa140897d95e73354d8384828c239ae64cf5066c7d5c17b45ecc2035432",
@@ -154,7 +154,8 @@
       "0004-command-scheduler.patch": "dc3a965c8d1f2fb9a9880ecd85ff525ce270d6e13d729b986fa54ef93a2d013a",
       "0005-device-report-provenance.patch": "8d53f82134c425c012e7747e0b75594a0ef7835f956c57829097d8a5e082480c",
       "0006-command-inflight.patch": "c7d5650e4de2da60b14e9e4e923cfd9bec1ebb64a814f60cc3a651f73b193831",
-      "0007-extension-status.patch": "6e6c3d79a03e511ca13ed7ed44541fd0d7a1c82a6945e19b58ba0290c50ca282"
+      "0007-extension-status.patch": "6e6c3d79a03e511ca13ed7ed44541fd0d7a1c82a6945e19b58ba0290c50ca282",
+      "0008-friendly-frontend.patch": "08e042917d0fdf8a679943652c8ea075cea84d3da375c64870cf4ab6fe986c10"
     }
   },
   "z2m_patches": [
@@ -164,9 +165,10 @@
     "0004-command-scheduler.patch",
     "0005-device-report-provenance.patch",
     "0006-command-inflight.patch",
-    "0007-extension-status.patch"
+    "0007-extension-status.patch",
+    "0008-friendly-frontend.patch"
   ],
-  "source_tree_sha256": "fc7e79d2f73995fb4e0d30d583f20bd795e531664112ec6506602f23678a2c78",
+  "source_tree_sha256": "428c89fe1ba66b476db0c64f0e963b9dd1c12349b300349555a4dae770f7ff82",
   "files": {
     "vendor/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "vendor/zigbee-herdsman.tgz": "e990da61731f3d4d7c46cecaf74ab60bccfd6a14483f5e5f36be107e7b966e8e",
@@ -177,6 +179,7 @@
     "z2m-patches/0005-device-report-provenance.patch": "8d53f82134c425c012e7747e0b75594a0ef7835f956c57829097d8a5e082480c",
     "z2m-patches/0006-command-inflight.patch": "c7d5650e4de2da60b14e9e4e923cfd9bec1ebb64a814f60cc3a651f73b193831",
     "z2m-patches/0007-extension-status.patch": "6e6c3d79a03e511ca13ed7ed44541fd0d7a1c82a6945e19b58ba0290c50ca282",
+    "z2m-patches/0008-friendly-frontend.patch": "08e042917d0fdf8a679943652c8ea075cea84d3da375c64870cf4ab6fe986c10",
     "bms-layer/bms-models.example.yaml": "88e1a382cffbceeefe905a121ae0f2131319ef22116b32c8cd276b37b074646e",
     "bms-layer/external_converters/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "bms-layer/external_converters/bms-models.mjs": "9b059f0d0ca1be8e45effeda830b31021d2c6c1d8f49fd7c36b444b95ebc0486",
@@ -184,9 +187,14 @@
     "bms-layer/external_extensions/bms-area-groups.mjs": "3f5416e431d8f68bc4aba3a68291ebde337d76b0a02465c12245dd46c2966606",
     "bms-layer/external_extensions/bms-lib/group-membership.mjs": "4984e6c1dba7fc2447b99ef46a4af1ca5665712d7cb03ca00d70e3d4b4c78397",
     "bms-layer/external_extensions/bms-tuya-service.mjs": "4258e0c148984bde2ef3774aa60270cd573394857345acb0b0e88d9c55400729",
-    "rootfs/docker-entrypoint.sh": "e9262339aa5a0349df2e577fe907bc374b5a42bcd68fda540bc386d0c8b253c6",
+    "rootfs/docker-entrypoint.sh": "9400184a150af59ff86e37a2a72edd3366e18623fa454b42d91f060f4f4b58d5",
     "rootfs/opt/bms/coordinator.sh": "2950ff2c680297176f8b6c0936e2e08cfb2208085f66276e9b45309096f4bc12",
     "rootfs/opt/bms/seed-config.js": "6df8e26f2c16a1a7bd3b509e4cd1b5fef0ba45992dc59b445dcca727e8004ccc",
-    "rootfs/opt/bms/verify-build.js": "f9639ba600685b00568f6f5dd7736a6117d65f5617f29598a6b18c3726c52cc0"
+    "rootfs/opt/bms/verify-build.js": "ccdd1c5ef76a25e3879f17600be50139f48deb4ad5f568a86dce105190e0e66d",
+    "rootfs/opt/bms-ui/app.mjs": "73b9270a56ff5a1395942d8f3915b5ebf295c5d538eb5e8460a953f4f9957b9f",
+    "rootfs/opt/bms-ui/demo.mjs": "afb64bf47ac9561477051c4af7dca6d28e0019e6585b0f430acb5c0e1fceefeb",
+    "rootfs/opt/bms-ui/index.html": "fdd5f9d0574ce5c3fc93041f738a554b932a393196453da7ff85a01ae1e2f1a7",
+    "rootfs/opt/bms-ui/model.mjs": "222e3cbcceac4e0fb41c8bab3dab4b8e854d06fde022f374eb059afbc659f7e4",
+    "rootfs/opt/bms-ui/style.css": "6ebcdb4d5f76d1d20e532d2de80d3cf461c1257e16e2ce49f1e8bb59682192c3"
   }
 }
