@@ -168,12 +168,15 @@ pnpm pack --pack-destination "$DIST_DIR"
 # Проверяем сам архив, а не только то, что мы думаем, что в него положили.
 PACKED_VERSION="$(tar -xzOf "$TGZ" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
 [ "$PACKED_VERSION" = "$OUR_VERSION" ] || die "в tgz версия $PACKED_VERSION, ожидалась $OUR_VERSION"
-tar -tzf "$TGZ" | grep -qx 'package/dist/index.js' || die "в tgz нет package/dist/index.js"
+# GNU tar под pipefail получает SIGPIPE, если grep -q закрыл канал после совпадения.
+# Сначала полностью читаем оглавление: наличие файла не должно выглядеть ошибкой архива.
+TGZ_CONTENTS="$(tar -tzf "$TGZ")" || die "не удалось прочитать оглавление $TGZ"
+grep -qx 'package/dist/index.js' <<<"$TGZ_CONTENTS" || die "в tgz нет package/dist/index.js"
 # Контракт с дополнением: оно зовёт энергоскан по этому пути внутри пакета (патч 0003, см. README).
-tar -tzf "$TGZ" | grep -qx 'package/dist/adapter/ember/bms/energyScanCli.js' \
+grep -qx 'package/dist/adapter/ember/bms/energyScanCli.js' <<<"$TGZ_CONTENTS" \
     || die "в tgz нет package/dist/adapter/ember/bms/energyScanCli.js (контракт энергоскана с дополнением)"
 # И поиск координатора в сети по этому пути (патч 0004, см. README).
-tar -tzf "$TGZ" | grep -qx 'package/dist/adapter/ember/bms/coordinatorCli.js' \
+grep -qx 'package/dist/adapter/ember/bms/coordinatorCli.js' <<<"$TGZ_CONTENTS" \
     || die "в tgz нет package/dist/adapter/ember/bms/coordinatorCli.js (контракт поиска координатора с дополнением)"
 
 if command -v shasum >/dev/null 2>&1; then SHA="$(shasum -a 256 "$TGZ")"; else SHA="$(sha256sum "$TGZ")"; fi
