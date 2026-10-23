@@ -466,3 +466,75 @@ diff --git a/test/adapter/ember/emberAdapter.test.ts b/test/adapter/ember/emberA
              });
  
              it("restores base transmit power and clears timers on stop", async () => {
+diff --git a/test/device-ota.test.ts b/test/device-ota.test.ts
+--- a/test/device-ota.test.ts
++++ b/test/device-ota.test.ts
+@@ -2119,28 +2119,48 @@
+                 fileVersion: image.header.fileVersion - 1,
+             };
+             const baseSize = 40;
+-            const responseDelay = 25; // keep this low so we don't have to mock it
++            const responseDelay = 25;
+             const dataSettings: OtaDataSettings = {requestTimeout: 1000, responseDelay, baseSize};
+-            const startTime = performance.now();
+-            const {run, device} = createDevice({
+-                image,
+-                source: {url: "https://example.com/fw.ota"},
+-                requestPayload,
+-                dataSettings,
+-                behavior: {baseSize, sendUpgradeEnd: true},
+-            });
+-
+-            const [from, to] = await run();
+-            const elapsedTime = performance.now() - startTime;
+-
+-            expect(from.fileVersion).toStrictEqual(requestPayload.fileVersion);
+-            expect(to?.fileVersion).toStrictEqual(image.header.fileVersion);
+-
+             const expectedBlocks = Math.ceil(image.header.totalImageSize / baseSize);
+-            const minimumExpectedTime = (expectedBlocks - 1) * responseDelay;
+-
+-            expect(elapsedTime).toBeGreaterThanOrEqual(minimumExpectedTime);
+-            expect(device.otaInProgress).toStrictEqual(false);
++            // BMS: реальные таймеры Linux округляют дробные задержки; проверяем каждый
++            // интервал протокола управляемыми часами, а не длительность всего теста.
++            vi.useFakeTimers({toFake: ["Date", "setTimeout", "clearTimeout"]});
++            vi.setSystemTime(1000);
++            const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => Date.now());
++
++            try {
++                const {run, device, endpoint} = createDevice({
++                    image,
++                    source: {url: "https://example.com/fw.ota"},
++                    requestPayload,
++                    dataSettings,
++                    behavior: {baseSize, sendUpgradeEnd: true},
++                });
++                const responseTimes: number[] = [];
++                vi.mocked(endpoint.commandResponse).mockImplementation((_cluster, command) => {
++                    if (command === "imageBlockResponse") responseTimes.push(performance.now());
++                    return Promise.resolve();
++                });
++                const updating = run();
++                await vi.advanceTimersByTimeAsync(0);
++                expect(responseTimes).toStrictEqual([1000]);
++
++                for (let block = 1; block < expectedBlocks; block++) {
++                    await vi.advanceTimersByTimeAsync(responseDelay - 1);
++                    expect(responseTimes).toHaveLength(block);
++                    await vi.advanceTimersByTimeAsync(1);
++                    expect(responseTimes).toHaveLength(block + 1);
++                }
++
++                const [from, to] = await updating;
++                expect(responseTimes).toStrictEqual(Array.from({length: expectedBlocks}, (_, block) => 1000 + block * responseDelay));
++                expect(from.fileVersion).toStrictEqual(requestPayload.fileVersion);
++                expect(to?.fileVersion).toStrictEqual(image.header.fileVersion);
++                expect(device.otaInProgress).toStrictEqual(false);
++            } finally {
++                nowSpy.mockRestore();
++                vi.useRealTimers();
++            }
+         });
+ 
+         it("cancels scheduled OTA when completed", async () => {
