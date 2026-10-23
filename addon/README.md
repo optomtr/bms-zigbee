@@ -36,7 +36,7 @@
 Везде, где мы правили, в коде стоит пометка `BMS:` с объяснением «почему».
 
 1. `config.yaml` вместо `config.json` — тот же формат для HA, но с комментариями.
-2. Имя «BMS Zigbee», slug `bms_zigbee`, версия `2.14.2-bms.7` (= версия Z2M из `versions.json` + `-bms.<номер нашей сборки>`).
+2. Имя «BMS Zigbee», slug `bms_zigbee`, версия `2.14.2-bms.8` (= версия Z2M из `versions.json` + `-bms.<номер нашей сборки>`).
 3. Нет ключа `image:` — образ собирается на самом Home Assistant из Dockerfile (готового образа в реестре у нас нет). `Dockerfile`, `build.yaml` и `rootfs/` лежат прямо в папке дополнения (у официального их копирует в папку CI).
 4. Настройки по умолчанию: `serial.adapter: ember`, `serial.port: auto` (в bms.1 тут была заглушка `tcp://IP_SLZB:6638`, из-за которой запуск останавливался). `auto` — дополнение само ищет SLZB-06M в сети и ждёт его; вписанный владельцем адрес работает как у официального дополнения. Старая заглушка, оставшаяся в настройках после обновления, считается за `auto`.
 5. Каталог данных по умолчанию `/config/bms_zigbee` (у официального `/config/zigbee2mqtt`) — чтобы рядом стоящий официальный Z2M и наш не делили базу и сетевой ключ.
@@ -52,7 +52,7 @@
 15. Образец `tuya/layer/bms-models.example.yaml` попадает в образ (`bms-layer/`), и entrypoint при каждом запуске копирует его в папку данных как `bms-models.example.yaml` (перезаписывая только его). Рабочий `bms-models.yaml` интегратора (его читает конвертер `bms-models.mjs`: `../bms-models.yaml` от `external_converters/`) дополнение не создаёт, не читает и не меняет никогда; `stage.sh` его тоже не касается.
 16. Entrypoint + `rootfs/opt/bms/coordinator.sh`: режим `serial.port = auto` — поиск координатора в сетях Home Assistant, ожидание, проверка прошивки (см. раздел «Поиск координатора (режим auto)»). Из-за него в `config.yaml` пояснён `hassio_api: true` (он и у официального; роль не повышалась).
 
-17. Dockerfile: после скачивания Z2M накладывает `z2m-patches/*.patch` по порядку имён (`git apply`, строго: не лёг патч — сборка падает с его именем; «Skipped patch» тоже считается ошибкой). Сейчас патчей три — склейка команд, ограничитель групповых и склейка по каналам реле (следующий раздел).
+17. Dockerfile: после скачивания Z2M накладывает `z2m-patches/*.patch` по порядку имён (`git apply`, строго: не лёг патч — сборка падает с его именем; «Skipped patch» тоже считается ошибкой). Сейчас патчей семь: базовые 0001–0003, первый пакет 0004–0005, второй пакет 0006–0007. Все применяются по порядку.
 
 ## Склейка команд в групповую (патч Z2M `0001-group-coalescing`)
 
@@ -91,6 +91,16 @@ advanced:
 - При `advanced.bms_device_reports: true` отдельный `bridge/bms/tx_event` содержит `schema: 1`, `session_id`, `sequence`, `received_at`, `kind: mqtt_intent|group_frame|unicast_frame`. События вызовов имеют `evidence: api_attempt`; считаются `command/read/write/commandResponse/zclCommand` на цели конвертера Publish, включая вложенные `meta.device.getEndpoint`, `entity.getDevice().getEndpoint` и массивы endpoints/members. Proxy общий для одного publish, сохраняет идентичность объектов и native private getter/setter receiver. Замерщик может добавить служебное `__bms_command_id` в JSON команды: оно появляется как `command_id` только в `mqtt_intent` и удаляется до склейки/конвертера. Вызовы из внешних расширений, ядра, фонового опроса и внутренние повторы сюда не входят. `bridge/bms/device_report` из патча `0005` нужен отдельно для проверки ответов устройства. Счётчики очереди доступны в debug-журнале `BMS: tx counters`.
 
 Проверка без радиосети: из подготовленной копии `.work/skleyka/z2m` выполнить `./node_modules/.bin/tsc --noEmit`, затем `./node_modules/.bin/vitest run --config ./test/vitest.config.mts`. Проверены настоящие конвертеры с подставным транспортом: два вызова ZCL в одном сообщении; 20 toggle без обхода бюджета; групповая → участник; пересекающиеся группы; группа за выполняющейся одноадресной; остаток склейки; ручная мутация за lock очистки; отсутствующее членство; раздельная телеметрия. Полный прогон с `--maxWorkers=2 --testTimeout=30000`: 904 из 904 тестов (29 файлов); TypeScript и Biome чистые. При стандартном таймауте 5 секунд на загруженной машине тест Availability, перематывающий сутки fake timers, превышал лимит и вызывал каскадные ошибки; увеличение лимита не меняло тестовый код. Живая «Общая комната», эфир и аппаратное исполнение этими тестами не проверяются. Журнал локального прогона: `.work/first-package-vitest-reviewed.log`; итог на чисто наложенном наборе патчей фиксируется в PR.
+
+### Второй пакет аудита (`0006-command-inflight`, `0007-extension-status`)
+
+Очередь удерживает IEEE до завершения начатых конвертером вызовов, включая вложенные вызовы и ранний выход из `Promise.all` по ошибке. Два вызова группе одновременно не отправляются; пересекающиеся группы и отдельные команды участнику сохраняют порядок. Coalescer получает Promise завершения всей процедуры, а MQTT-приём не блокируется ожиданием. Разные устройства могут обслуживаться параллельно. При `bms_group_throttle: false` отключаются бюджет и слияние, но сохраняется порядок операций.
+
+`bms-tuya-service` подключает свои `bms_dp` и `configureMagicPacket` к той же очереди IEEE. Повторные announce/interview объединяются, пока инициализация идёт; после ошибки следующая попытка разрешена. Ответы на служебные запросы Tuya остаются на прежнем пути. Таймеры, которые сторонний конвертер создаёт на будущее после собственного завершения, этот механизм не охватывает. Завершение API-вызова не доказывает физическое переключение реле; произвольные задержки MCU не добавлены.
+
+В `<base_topic>/bridge/bms/extensions` публикуется retained JSON: `schema: 1`, `status: loading|ready|degraded` и `extensions`, где каждому имени файла соответствует `state` и при ошибке `error`. Состояния: `loading`, `started`, `failed`, `missing`, `invalid`, `removed`, `stopped`. Entrypoint передаёт обязательные имена через `BMS_REQUIRED_EXTENSIONS` из паспорта. Ошибка `start()` больше не считается успешной загрузкой. Отключённый external JS публикует `degraded` с причиной `external_js_disabled`. `ready` означает завершение `start()` всех ожидаемых расширений; доступность HA и устройств проверяется отдельно.
+
+Паспорт содержит SHA закреплённого архива ядра и всех скомпилированных файлов Z2M из чистого успешного прогона тестов (кроме upstream-маркера `dist/.hash`). Docker при сборке и entrypoint при старте сверяют эти файлы. CI также проверяет, что закоммиченный слой совпадает с исходниками до `stage`, а повторная подготовка не меняет файлы выпуска. Подробности и границы проверки — [SECOND-PACKAGE.md](../SECOND-PACKAGE.md).
 
 ### Ограничитель групповых команд (патч `0002-group-throttle`)
 
@@ -230,8 +240,13 @@ advanced:
 
 ```bash
 cd ~/bms-zigbee/addon
-./stage.sh            # положить ядро из core/dist и слой из tuya/ (что есть — то положит, чего нет — напишет)
-./stage.sh --clean    # вернуться к «как официальное»
+# После подготовки точного ядра в core/dist (bash ../core/build.sh):
+# При намеренном изменении ядра сверить и обновить bms-core-sha256 в ../versions.json.
+bash tools/check-z2m.sh  # чистые патчи, сборка, Z2M + Tuya tests; сохраняет .work/z2m-tested.json
+./stage.sh              # обязательное ядро, слой и паспорт проверенного кода
+node tools/verify-stage.cjs
+node --test test/*.test.cjs
+# ./stage.sh --clean    # удаляет подготовленные файлы; сборка запрещена до повторного stage
 ```
 
 `stage.sh` ничего не собирает — он готовит папку `bms_zigbee/`. Образ собирает Home Assistant при установке.
@@ -240,7 +255,7 @@ cd ~/bms-zigbee/addon
 ```bash
 docker build -t bms-zigbee:test \
   --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base:3.24 \
-  --build-arg BUILD_VERSION=2.14.2-bms.2 \
+  --build-arg BUILD_VERSION=2.14.2-bms.8 \
   bms_zigbee
 ```
 
@@ -282,7 +297,7 @@ docker build -t bms-zigbee:test \
 ## Как обновить Z2M или ядро
 
 1. Поменять версию в `../versions.json` (и пересобрать ядро в `core/`, если менялась версия zigbee-herdsman).
-2. `./stage.sh` — подтянет версию Z2M в `config.yaml`; поднять номер `bms.N` в `config.yaml` и добавить запись в `bms_zigbee/CHANGELOG.md`.
+2. Поднять `bms-addon-revision` в `../versions.json`, при изменении ядра закрепить его SHA в `bms-core-sha256`, добавить запись в `bms_zigbee/CHANGELOG.md`. После переноса патчей и проверок ниже выполнить `bash tools/check-z2m.sh`, затем `./stage.sh`: версия в `config.yaml` обновится из `versions.json`.
 3. Посмотреть, что изменилось в официальном дополнении между прежним и новым тегом (`common/Dockerfile`, `common/rootfs/docker-entrypoint.sh`, `zigbee2mqtt/config.json`), и перенести. Наши правки находятся по пометке `BMS:` (`grep -rn "BMS:" bms_zigbee`).
 4. Переложить патчи `bms_zigbee/z2m-patches/` на новый тег (раздел «Склейка команд в групповую», последний абзац): иначе сборка упадёт на `git apply`.
 5. Проверить версию pnpm и формат `pnpm-workspace.yaml` в новом Z2M: подмена ядра зависит от того, что `overrides` читается из этого файла.

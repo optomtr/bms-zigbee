@@ -1,0 +1,272 @@
+BMS package 2: report actual BMS extension import/start lifecycle over retained MQTT.
+Applied after the preceding numbered patches to Zigbee2MQTT 2.14.2.
+
+diff --git a/lib/controller.ts b/lib/controller.ts
+index 1cd7b16..08b59a1 100644
+--- a/lib/controller.ts
++++ b/lib/controller.ts
+@@ -178,6 +178,14 @@ export class Controller {
+             return;
+         }
+ 
++        if (process.env.BMS_REQUIRED_EXTENSIONS && !settings.get().advanced.enable_external_js) {
++            // Retained status прошлого процесса не должен выдавать отключённый слой за рабочий.
++            await this.mqtt.publish("bridge/bms/extensions", JSON.stringify({schema: 1, status: "degraded", reason: "external_js_disabled"}), {
++                clientOptions: {retain: true, qos: 0},
++            });
++            logger.warning("BMS: required extensions disabled");
++        }
++
+         // copy current Set of extensions to ignore possible external extensions added while looping
+         for (const extension of new Set(this.extensions)) {
+             await this.startExtension(extension);
+diff --git a/lib/extension/externalExtensions.ts b/lib/extension/externalExtensions.ts
+index aacd77f..1a12b1b 100644
+--- a/lib/extension/externalExtensions.ts
++++ b/lib/extension/externalExtensions.ts
+@@ -1,11 +1,63 @@
++import fs from "node:fs";
++import path from "node:path";
+ import logger from "../util/logger";
+ import * as settings from "../util/settings";
++import {stringify} from "../util/stringify";
+ import type Extension from "./extension";
+ import ExternalJSExtension from "./externalJS";
+ 
+ type TModule = new (...args: ConstructorParameters<typeof Extension>) => Extension;
+ 
+ export default class ExternalExtensions extends ExternalJSExtension<TModule> {
++    private bmsStates = new Map<string, {state: string; error?: string}>();
++
++    override async start(): Promise<void> {
++        this.bmsStates.clear();
++        const expected = (process.env.BMS_REQUIRED_EXTENSIONS ?? "").split(",").filter(Boolean);
++        for (const name of expected) {
++            if (!/^bms-[a-zA-Z0-9_-]+\.(mjs|cjs|js)$/.test(name)) throw new Error("BMS: invalid required extension filename");
++            const file = path.join(this.basePath, name);
++            this.bmsStates.set(name, {state: fs.existsSync(file) ? "loading" : fs.existsSync(`${file}.invalid`) ? "invalid" : "missing"});
++        }
++        await this.publishBmsStatus();
++        try {
++            await super.start();
++        } catch (error) {
++            for (const [name, value] of this.bmsStates) if (value.state === "loading") await this.reportLoad(name, "failed", error);
++            throw error;
++        }
++        await this.publishBmsStatus();
++    }
++
++    override async stop(): Promise<void> {
++        for (const [name, value] of this.bmsStates) if (value.state === "started") this.bmsStates.set(name, {state: "stopped"});
++        await this.publishBmsStatus();
++        await super.stop();
++    }
++
++    protected override async reportLoad(name: string, state: string, error?: unknown): Promise<void> {
++        if (!name.startsWith("bms-")) return;
++        this.bmsStates.set(name, {state, ...(error ? {error: String(error).slice(0, 500)} : {})});
++        await this.publishBmsStatus();
++    }
++
++    private async publishBmsStatus(): Promise<void> {
++        if (!this.bmsStates.size) return;
++        const extensions = Object.fromEntries(this.bmsStates);
++        const states = [...this.bmsStates.values()].map((v) => v.state);
++        const status = states.every((v) => v === "started")
++            ? "ready"
++            : states.some((v) => !["started", "loading"].includes(v))
++              ? "degraded"
++              : "loading";
++        try {
++            await this.mqtt.publish("bridge/bms/extensions", stringify({schema: 1, status, extensions}), {clientOptions: {retain: true, qos: 0}});
++        } catch (error) {
++            logger.warning(`BMS: extension status publish failed: ${error}`);
++        }
++        if (status === "degraded") logger.warning(`BMS: extensions degraded: ${stringify(extensions)}`);
++    }
++
+     constructor(
+         zigbee: Zigbee,
+         mqtt: Mqtt,
+@@ -38,21 +90,34 @@ export default class ExternalExtensions extends ExternalJSExtension<TModule> {
+         try {
+             // stop if already started
+             await this.enableDisableExtension(false, mod.name);
+-            await this.addExtension(
+-                new mod(
+-                    this.zigbee,
+-                    this.mqtt,
+-                    this.state,
+-                    this.publishEntityState,
+-                    this.eventBus,
+-                    this.enableDisableExtension,
+-                    this.restartCallback,
+-                    this.addExtension,
+-                    // @ts-expect-error additional params that don't fit the internal `Extension` type
+-                    settings,
+-                    logger,
+-                ),
++            const extension = new mod(
++                this.zigbee,
++                this.mqtt,
++                this.state,
++                this.publishEntityState,
++                this.eventBus,
++                this.enableDisableExtension,
++                this.restartCallback,
++                this.addExtension,
++                // @ts-expect-error external extensions receive settings and logger
++                settings,
++                logger,
+             );
++            // Controller логирует и поглощает ошибку start(). Для BMS нужна проверка результата,
++            // иначе импорт ошибочно получает статус Loaded, а очистка частичных подписок не вызывается.
++            if (name.startsWith("bms-")) {
++                const start = extension.start.bind(extension);
++                let started = false;
++                extension.start = async () => {
++                    await start();
++                    started = true;
++                };
++                await this.addExtension(extension);
++                if (!started) {
++                    await this.enableDisableExtension(false, mod.name);
++                    throw new Error(`BMS: start() did not complete for '${name}'`);
++                }
++            } else await this.addExtension(extension);
+ 
+             /* v8 ignore start */
+             logger.info(`Loaded external extension '${newName ?? name}'.`);
+diff --git a/lib/extension/externalJS.ts b/lib/extension/externalJS.ts
+index bfd65d2..e7be01a 100644
+--- a/lib/extension/externalJS.ts
++++ b/lib/extension/externalJS.ts
+@@ -141,6 +141,9 @@ export default abstract class ExternalJSExtension<M> extends Extension {
+         }
+     }
+ 
++    // BMS: hook не меняет поведение обычных внешних конвертеров.
++    protected async reportLoad(_name: string, _state: string, _error?: unknown): Promise<void> {}
++
+     protected abstract removeJS(name: string, mod: M): Promise<void>;
+ 
+     protected abstract loadJS(name: string, mod: M, newName?: string): Promise<void>;
+@@ -159,6 +162,7 @@ export default abstract class ExternalJSExtension<M> extends Extension {
+             const mod = await this.importFile(toBeRemoved);
+ 
+             await this.removeJS(name, mod.default);
++            await this.reportLoad(name, "removed");
+             fs.rmSync(toBeRemoved, {force: true});
+             logger.info(`${name} (${toBeRemoved}) removed.`);
+             await this.publishExternalJS();
+@@ -185,17 +189,20 @@ export default abstract class ExternalJSExtension<M> extends Extension {
+         const filePath = this.getFilePath(name, true);
+ 
+         try {
++            await this.reportLoad(name, "loading");
+             fs.writeFileSync(filePath, code, "utf8");
+             this.symlinkNodeModulesIfNecessary();
+ 
+             const mod = await this.importFile(filePath);
+ 
+             await this.loadJS(name, mod.default, name);
++            await this.reportLoad(name, "started");
+             logger.info(`${name} loaded. Contents written to '${filePath}'.`);
+             await this.publishExternalJS();
+ 
+             return utils.getResponse(message, {});
+         } catch (error) {
++            await this.reportLoad(name, "failed", error);
+             return utils.getResponse(message, {}, `${name} contains invalid code: ${(error as Error).message}`);
+         }
+     }
+@@ -206,9 +213,12 @@ export default abstract class ExternalJSExtension<M> extends Extension {
+             const filePath = this.getFilePath(extension.name);
+ 
+             try {
++                await this.reportLoad(extension.name, "loading");
+                 const mod = await this.importFile(filePath);
+                 await this.loadJS(extension.name, mod.default);
++                await this.reportLoad(extension.name, "started");
+             } catch (error) {
++                await this.reportLoad(extension.name, "failed", error);
+                 logger.error(
+                     `Invalid external ${this.mqttTopic} '${extension.name}' was ignored and renamed to prevent interference with Zigbee2MQTT. (${(error as Error).message})`,
+                 );
+diff --git a/test/extensions/bmsExtensionStatus.test.ts b/test/extensions/bmsExtensionStatus.test.ts
+new file mode 100644
+index 0000000..c8ee074
+--- /dev/null
++++ b/test/extensions/bmsExtensionStatus.test.ts
+@@ -0,0 +1,71 @@
++// biome-ignore assist/source/organizeImports: import mocks first
++import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
++import * as data from "../mocks/data";
++import "../mocks/zigbeeHerdsman";
++import "../mocks/logger";
++import {mockMQTTPublishAsync} from "../mocks/mqtt";
++import {flushPromises} from "../mocks/utils";
++import fs from "node:fs";
++import path from "node:path";
++import {Controller} from "../../lib/controller";
++import type ExternalExtensions from "../../lib/extension/externalExtensions";
++import * as settings from "../../lib/util/settings";
++
++const folder = path.join(data.mockDir, "external_extensions");
++const good = "export default class BmsTest { async start() {} async stop() {} }";
++const status = () => JSON.parse(mockMQTTPublishAsync.mock.calls.filter((c) => c[0] === "zigbee2mqtt/bridge/bms/extensions").at(-1)![1]);
++describe("BMS extension lifecycle truth", () => {
++    let controller: Controller;
++    beforeEach(() => {
++        vi.useFakeTimers();
++        data.writeDefaultConfiguration();
++        settings.reRead();
++        process.env.BMS_REQUIRED_EXTENSIONS = "bms-test.mjs";
++        fs.mkdirSync(folder, {recursive: true});
++        mockMQTTPublishAsync.mockClear();
++    });
++    afterEach(async () => {
++        await controller?.stop();
++        await flushPromises();
++        delete process.env.BMS_REQUIRED_EXTENSIONS;
++        fs.rmSync(folder, {recursive: true, force: true});
++        vi.useRealTimers();
++    });
++    const start = async (code?: string) => {
++        if (code) fs.writeFileSync(path.join(folder, "bms-test.mjs"), code);
++        controller = new Controller(vi.fn(), vi.fn());
++        await controller.start();
++        await flushPromises();
++    };
++    it("publishes started only after start resolved; removal and recovery change retained status", async () => {
++        await start(good);
++        expect(status()).toMatchObject({status: "ready", extensions: {"bms-test.mjs": {state: "started"}}});
++        const loader = controller.getExtension("ExternalExtensions") as ExternalExtensions;
++        await loader.onMQTTMessage({topic: "zigbee2mqtt/bridge/request/extension/remove", message: JSON.stringify({name: "bms-test.mjs"})});
++        expect(status()).toMatchObject({status: "degraded", extensions: {"bms-test.mjs": {state: "removed"}}});
++        await loader.onMQTTMessage({topic: "zigbee2mqtt/bridge/request/extension/save", message: JSON.stringify({name: "bms-test.mjs", code: good})});
++        expect(status().status).toBe("ready");
++    });
++    it("does not mistake a swallowed start exception for a loaded extension", async () => {
++        await start(good.replace("async start() {}", 'async start() { throw new Error("start failed"); }'));
++        expect(status()).toMatchObject({status: "degraded", extensions: {"bms-test.mjs": {state: "failed"}}});
++        expect(controller.getExtension("BmsTest")).toBeUndefined();
++        expect(fs.existsSync(path.join(folder, "bms-test.mjs.invalid"))).toBe(true);
++    });
++    it("detects missing and preexisting invalid required files", async () => {
++        process.env.BMS_REQUIRED_EXTENSIONS += ",bms-broken.mjs";
++        fs.writeFileSync(path.join(folder, "bms-broken.mjs.invalid"), "old failure");
++        await start();
++        expect(status()).toMatchObject({status: "degraded", extensions: {"bms-test.mjs": {state: "missing"}, "bms-broken.mjs": {state: "invalid"}}});
++    });
++    it("records an import error independently of start", async () => {
++        await start('import "./missing-bms-dependency.mjs"; export default class Broken {}');
++        expect(status().extensions["bms-test.mjs"]).toMatchObject({state: "failed"});
++        expect(status().extensions["bms-test.mjs"].error).toContain("missing-bms-dependency");
++    });
++    it("overwrites stale healthy status when external JS is disabled", async () => {
++        settings.set(["advanced", "enable_external_js"], false);
++        await start();
++        expect(status()).toMatchObject({status: "degraded", reason: "external_js_disabled"});
++    });
++});

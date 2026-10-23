@@ -98,6 +98,8 @@ if bashio::config.has_value 'watchdog'; then
     bashio::log.info "Enabled Zigbee2MQTT watchdog with value '$Z2M_WATCHDOG'"
 fi
 
+# BMS: загрузчик публикует degraded, если обязательный файл не импортировался/не запустился.
+export BMS_REQUIRED_EXTENSIONS="$(node -p 'require("/opt/bms-build-manifest.json").required_extensions.join(",")')"
 export NODE_PATH=/app/node_modules
 export ZIGBEE2MQTT_CONFIG_FRONTEND_ENABLED='true'
 export ZIGBEE2MQTT_CONFIG_FRONTEND_PORT='8099'

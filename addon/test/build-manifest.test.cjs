@@ -12,13 +12,14 @@ function fixture(t) {
     t.after(() => fs.rmSync(dir, {recursive: true, force: true}));
     const put = (name, data) => {const p = path.join(dir, name);fs.mkdirSync(path.dirname(p), {recursive: true});fs.writeFileSync(p, data);return p;};
     put('app/package.json', JSON.stringify({version: '2.14.2'}));
+    put('app/dist/controller.js', 'patched z2m');
     put('app/node_modules/zigbee-herdsman/package.json', JSON.stringify({version: '10.10.0-bms.3'}));
     put('app/node_modules/zigbee-herdsman/index.js', '// fixture entry');
     put('app/node_modules/zigbee-herdsman-converters/package.json', JSON.stringify({version: '26.115.1'}));
     const core = put('app/node_modules/zigbee-herdsman/dist/device.js', 'patched core');
     put('layer/external_extensions/bms-test.mjs', 'layer');
     const manifest = {schema: 1,build_version: '2.14.2-bms.7',zigbee2mqtt: '2.14.2',herdsman: '10.10.0-bms.3',converters: '26.115.1',
-        core_patches: ['0005-response-retry-and-confirmed-power.patch'],core_files: {'dist/device.js': digest('patched core')},
+        core_patches: ['0005-response-retry-and-confirmed-power.patch'],core_files: {'dist/device.js': digest('patched core')},z2m_files: {'dist/controller.js': digest('patched z2m')},
         files: {'bms-layer/external_extensions/bms-test.mjs': digest('layer')},z2m_patches: ['0004.patch','0005.patch'],source_tree_sha256: 'test'};
     const file = put('manifest.json', JSON.stringify(manifest));
     return {dir,put,core,file,manifest,run: () => verify(file,path.join(dir,'app'),path.join(dir,'layer'))};
@@ -39,6 +40,14 @@ test('nested core used by converters cannot silently start', t => {
 test('tampered compiled core or missing manifest cannot start', t => {
     const f=fixture(t);fs.writeFileSync(f.core,'stock core');assert.throws(f.run,/контрольная сумма/);
     fs.unlinkSync(f.file);assert.throws(f.run,/ENOENT/);
+});
+test('compiled Z2M must match the tested build', t => {
+    const f = fixture(t);
+    f.put('app/dist/controller.js', 'untested z2m');
+    assert.throws(f.run, /контрольная сумма.*controller/);
+    delete f.manifest.z2m_files;
+    fs.writeFileSync(f.file, JSON.stringify(f.manifest));
+    assert.throws(f.run, /нет проверенного кода Z2M/);
 });
 test('staging fails before a stock fallback when expected archive is missing', t => {
     const f=fixture(t);

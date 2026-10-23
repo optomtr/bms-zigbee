@@ -25,6 +25,8 @@ function verify(manifestFile = '/opt/bms-build-manifest.json', app = '/app', lay
     };
     if (!Object.keys(manifest.core_files ?? {}).length) throw new Error('в паспорте нет контрольных сумм ядра');
     for (const [name, expected] of Object.entries(manifest.core_files)) check(path.join(app, 'node_modules/zigbee-herdsman', name), expected);
+    if (!manifest.z2m_files?.['dist/controller.js']) throw new Error('в паспорте нет проверенного кода Z2M');
+    for (const [name, expected] of Object.entries(manifest.z2m_files)) check(path.join(app, name), expected);
     for (const [name, expected] of Object.entries(manifest.files ?? {})) {
         if (name.startsWith('bms-layer/')) check(path.join(layer, name.slice('bms-layer/'.length)), expected);
     }

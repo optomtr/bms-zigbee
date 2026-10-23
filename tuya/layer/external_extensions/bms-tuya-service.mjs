@@ -85,6 +85,7 @@ export function checkDpCommand(cmd) {
 export default class BmsTuyaService {
     constructor(zigbee, mqtt, state, publishEntityState, eventBus, enableDisableExtension, restartCallback, addExtension, settings, logger) {
         this.zigbee = zigbee;
+        this.initializing = new Map();
         this.membership = groupMembership(zigbee);
         this.publishEntityState = publishEntityState;
         this.eventBus = eventBus;
@@ -175,20 +176,35 @@ export default class BmsTuyaService {
             return;
         }
         try {
-            await TYPES[cmd.type].send(device.zh.endpoints[0], cmd.dp, cmd.value);
+            await this.runDevice(device, () => TYPES[cmd.type].send(device.zh.endpoints[0], cmd.dp, cmd.value));
             this.logger.info(`bms_dp → '${name}': dp ${cmd.dp} (${cmd.type}) = ${JSON.stringify(cmd.value)}`, NS);
         } catch (error) {
             this.logger.error(`bms_dp → '${name}': не отправлено (${error.message})`, NS);
         }
     }
 
+    runDevice(device, task) {
+        const queue = this.zigbee[Symbol.for("bms.commandQueue")];
+        // Слой можно проверить отдельно/загрузить в upstream: там остаётся штатная очередь NWK.
+        return queue ? queue.runDevice(device.zh.ieeeAddr, task) : task();
+    }
+
     async sendMagicPacket(device) {
+        const ieee = device.zh.ieeeAddr;
+        if (this.initializing.has(ieee)) return this.initializing.get(ieee);
+        // Записываем flight до await определения: пачка announce не запускает несколько genBasic.
+        const flight = this.initializeDevice(device).finally(() => this.initializing.delete(ieee));
+        this.initializing.set(ieee, flight);
+        return flight;
+    }
+
+    async initializeDevice(device) {
         if (!isTuyaMaker(device) || (await definitionSendsMagicPacket(device.zh))) return;
         try {
-            await tuya.configureMagicPacket(device.zh, this.zigbee.firstCoordinatorEndpoint());
+            await this.runDevice(device, () => tuya.configureMagicPacket(device.zh, this.zigbee.firstCoordinatorEndpoint()));
             this.logger.debug(`Магический пакет Tuya отправлен '${device.name}'`, NS);
         } catch (error) {
-            // Спящее устройство может не ответить на чтение — это не авария, при следующем объявлении повторим.
+            // Ошибка освобождает flight: следующий announce должен иметь право повторить.
             this.logger.warning(`Магический пакет Tuya для '${device.name}' не прошёл (${error.message})`, NS);
         }
     }

@@ -23,3 +23,4 @@ npx --yes "$PNPM_SPEC" run check
 npx --yes "$PNPM_SPEC" run build
 npx --yes "$PNPM_SPEC" exec vitest run --config test/vitest.config.mts --maxWorkers=2 --testTimeout=30000
 BMS_TEST_Z2M="$CHECK_DIR" node --test "$ROOT"/tuya/layer/test/*.test.mjs
+node "$ROOT/addon/tools/record-z2m-build.cjs" "$CHECK_DIR"
