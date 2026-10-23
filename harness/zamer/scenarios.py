@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 
@@ -55,12 +56,19 @@ class Bench:
     async def run(self, scenario: int, conditions: str = ""):
         self.run_id = self.store.start_run(scenario, conditions, self.cfg.ha.confirm)
         note = ""
+        baseline = {s.name: dict(getattr(s, "counters", {})) for s in self.sides}
         try:
             yield self.run_id
         except BaseException:
             note = "прервано"
             raise
         finally:
+            for side in self.sides:
+                counts = getattr(side, "counters", {})
+                delta = {k: v - baseline.get(side.name, {}).get(k, 0) for k, v in counts.items()}
+                if delta:
+                    self.store.add_observation(self.run_id, side.name, "*", "diagnostic_counters", json.dumps(delta, sort_keys=True),
+                                               "API/MQTT counts, не количество радиокадров")
             self.store.finish_run(self.run_id, note)
             self.op.say(f"\nИтог прогона №{self.run_id} (сценарий {scenario}){' - ' + note if note else ''}:")
             for line in run_summary(self.store, self.run_id):

@@ -327,3 +327,84 @@ test("таблица групп: ошибка команды — строка в
     assert.ok(log.lines.some((l) => l.level === "warning" && /^BMS: таблицу групп на .*endpoint 1\) очистить не удалось: Timeout/.test(l.msg)));
     assert.ok(log.lines.some((l) => l.level === "info" && /endpoint 2\)/.test(l.msg)));
 });
+
+test("служебные возможности: чужие обработчики никогда не исполняются на пробном устройстве", async () => {
+    let calls = 0;
+    const converter = {cluster: "manuSpecificTuya", type: ["commandMcuSyncTime"], convert() { calls++; throw new Error("только реальное сообщение"); }};
+    const definition = {fromZigbee: [converter]};
+    assert.equal(definitionAnswers(definition, "commandMcuSyncTime", {}), true);
+    assert.equal(calls, 0);
+    definition.meta = {bmsTuyaServices: {commandMcuSyncTime: "fallback"}};
+    assert.equal(definitionAnswers(definition, "commandMcuSyncTime", {}), false);
+    assert.equal(calls, 0);
+});
+
+test("служебные возможности: forceTimeUpdates — только реальный обработчик, одно сообщение в эфир", async () => {
+    const definition = zhc.prepareDefinition({model: "force", vendor: "test", description: "test", extend: [tuya.modernExtend.tuyaBase({forceTimeUpdates: true, timeStart: "1970"})]});
+    const dev = await z2mDevice("_TZE200_bmsforce", {definition});
+    const {bus} = await start([dev]);
+    for (let i = 0; i < 5; i++) assert.equal(definitionAnswers(definition, "commandMcuGatewayConnectionStatus", {}), true);
+    assert.equal(dev.zh.endpoints[0].sent.length, 0);
+    const sent = await deliver(bus, dev, "commandMcuGatewayConnectionStatus", {payloadSize: 0});
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].command, "mcuSyncTime");
+    await deliver(bus, dev, "commandMcuGatewayConnectionStatus", {payloadSize: 0});
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].command, "mcuGatewayConnectionStatus");
+});
+
+test("A5: cleanup двух каналов и конкурентный add второго канала сериализуются по IEEE", async () => {
+    const dev = await light();
+    const groups = [];
+    const {service} = await start([dev], groups);
+    const e1 = dev.zh.endpoints[0];
+    const e2 = dev.zh.endpoints[1];
+    const order = [];
+    let release;
+    const paused = new Promise((resolve) => { release = resolve; });
+    let started;
+    const first = new Promise((resolve) => { started = resolve; });
+    const original1 = e1.command.bind(e1);
+    e1.command = async (...args) => {
+        if (args[1] === "removeAll") {
+            order.push("removeAll1");
+            started();
+            await paused;
+        }
+        return original1(...args);
+    };
+    const original2 = e2.command.bind(e2);
+    e2.command = async (...args) => {
+        if (["removeAll", "add"].includes(args[1])) order.push(`${args[1]}2`);
+        return original2(...args);
+    };
+    const cleanup = service.clearForeignGroups(dev);
+    await first;
+    const addition = service.membership.withDeviceLock(dev.ieeeAddr, async () => {
+        service.membership.invalidate(dev.ieeeAddr, 2);
+        await e2.command("genGroups", "add", {groupid: 1000});
+        groups.push({groupID: 1000, members: [e2]});
+        await service.membership.verify(e2);
+    });
+    release();
+    await Promise.all([cleanup, addition]);
+    assert.deepEqual(order, ["removeAll1", "removeAll2", "add2"]);
+    assert.equal(e2.hardwareGroups.has(1000), true);
+    assert.equal(service.membership.isVerified(groups[0]), true);
+    // Проверка членства должна происходить внутри очереди, а не перед ожиданием add.
+    await service.clearForeignGroups(dev);
+    assert.deepEqual(order, ["removeAll1", "removeAll2", "add2"]);
+});
+
+test("cleanup: непроверенное removeAll не помечается успешным", async () => {
+    const dev = await light();
+    const {service, log} = await start([dev]);
+    const endpoint = dev.zh.endpoints[0];
+    endpoint.hardwareGroups.add(7);
+    const original = endpoint.command.bind(endpoint);
+    endpoint.command = async (...args) => args[1] === "removeAll" ? undefined : original(...args);
+    await service.clearForeignGroups(dev);
+    assert.ok(log.lines.some((l) => /устройство сохранило группы/.test(l.msg)));
+    // Проверка вернула старую физическую группу. Это правда, но очищенным endpoint не считается.
+    assert.ok(endpoint.hardwareGroups.has(7));
+});

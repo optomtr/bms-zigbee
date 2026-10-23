@@ -110,14 +110,17 @@ for (const zd of zhDevices) {
         e.addToGroup = async (g) => {
             air.push({cmd: "add", ieee: zd.ieeeAddr, group: g.groupID, at: Date.now()});
             g.addMember(e);
+            e.hardwareGroups.add(g.groupID);
         };
         e.removeFromGroup = async (g) => {
             air.push({cmd: "remove", ieee: zd.ieeeAddr, group: g.groupID, at: Date.now()});
             g.removeMember(e);
+            e.hardwareGroups.delete(g.groupID);
         };
     }
 }
 zhGroups.get(1).members.push(...zhDevices.map((d) => d.endpoints[0]));
+for (const d of zhDevices) d.endpoints[0].hardwareGroups.add(1);
 const devices = zhDevices.map((zd) => new Device(zd));
 const groupLookup = new Map();
 const zigbee = {

@@ -22,22 +22,39 @@ ENT = {"switch.lamp": ("devlamp", "1"), "switch.plug": ("devplug", "1"), "sensor
 def fake_z2m(stop):
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="fake-z2m")
     state = {}
+    sequence = 0
+    report_lock = threading.Lock()
+
+    def report(fn, update):
+        nonlocal sequence
+        with report_lock:
+            sequence += 1
+            raw = {"onOff": int(update["state"] == "ON")} if "state" in update else update
+            envelope = {"schema": 1, "source": "device", "session_id": "e2e", "sequence": sequence,
+                        "received_at": time.time() * 1000, "friendly_name": fn, "ieee_address": "0x01", "endpoint": 1,
+                        "cluster": "genOnOff" if "state" in update else "msTemperatureMeasurement", "type": "attributeReport",
+                        "raw": raw, "payload": update}
+            c.publish("zigbee2mqtt/bridge/bms/device_report", json.dumps(envelope))
 
     def on_connect(cl, *_):
         cl.subscribe("zigbee2mqtt/+/set")
-        info = {"config": {"device_options": {"optimistic": False},
+        info = {"config": {"advanced": {"bms_device_reports": True}, "device_options": {"optimistic": False},
                            "devices": {f"0x0{i}": {"friendly_name": n} for i, n in enumerate(["lamp", "plug", "temp"])}}}
         cl.publish("zigbee2mqtt/bridge/info", json.dumps(info), retain=True)
+        cl.publish("zigbee2mqtt/bridge/bms/capabilities", json.dumps({"schema":1,"device_reports":True,"command_correlation":True,"session_id":"e2e"}), retain=True)
 
     def on_message(cl, _u, msg):
         fn = msg.topic.split("/")[1]
+        cmd = json.loads(msg.payload)
+        command_id = cmd.pop("__bms_command_id", None)
+        cl.publish("zigbee2mqtt/bridge/bms/tx_event", json.dumps({"schema":1,"kind":"mqtt_intent","command_id":command_id,"received_at":time.time()*1000}))
         if fn == "plug":
             err = {"level": "error", "message": f"Publish 'set' 'state' to 'plug' failed: 'Error: Delivery failed {time.time()}'"}
             cl.publish("zigbee2mqtt/bridge/logging", json.dumps(err))
             return
-        cmd = json.loads(msg.payload)
 
         def answer():
+            report(fn, cmd)
             state.setdefault(fn, {}).update(cmd)
             cl.publish(f"zigbee2mqtt/{fn}", json.dumps(state[fn]))
         threading.Timer(0.05, answer).start()
@@ -48,6 +65,7 @@ def fake_z2m(stop):
     i = 0
     while not stop.is_set():
         i += 1
+        report("temp", {"temperature": 20 + i / 10})
         c.publish("zigbee2mqtt/temp", json.dumps({"temperature": 20 + i / 10}))
         stop.wait(1.0)
     c.loop_stop()

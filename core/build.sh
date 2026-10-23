@@ -13,7 +13,7 @@
 # Переменные окружения (нужны для проверок, обычно не трогать):
 #   PATCHES_DIR   откуда брать *.patch   (по умолчанию core/patches)
 #   DIST_DIR      куда класть tgz        (по умолчанию core/dist)
-#   TEST_WORKERS  число воркеров vitest  (по умолчанию 2)
+#   TEST_WORKERS  число воркеров vitest  (по умолчанию 1)
 set -euo pipefail
 
 CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,11 +27,11 @@ UPSTREAM_REPO="https://github.com/Koenkk/zigbee-herdsman.git"
 # по умолчанию), а «Controller start» сам занимает ~4,9 с из этих 5. Пока машина
 # занята чем-то ещё, они случайно краснеют, хотя код исправен (замерено: на чистом
 # теге падали то «Controller start», то «Device OTA > throttles»). Поэтому:
-#  - 2 воркера вместо всех ядер — меньше борьбы за процессор;
+#  - 1 воркер: upstream-тесты controller/ember удаляют общую temp/, параллельный запуск гоняется за файлами;
 #  - таймаут теста 30 с;
 #  - до двух повторов упавшего теста: настоящая поломка (в том числе от нашего
 #    патча) красна все три раза, случайный сбой по времени — нет.
-TEST_WORKERS="${TEST_WORKERS:-2}"
+TEST_WORKERS="${TEST_WORKERS:-1}"
 TEST_ARGS=(--maxWorkers="$TEST_WORKERS" --testTimeout=30000 --retry=2)
 
 PREPARE_ONLY=0

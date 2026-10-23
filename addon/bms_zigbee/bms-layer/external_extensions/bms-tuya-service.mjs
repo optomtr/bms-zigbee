@@ -11,6 +11,8 @@
 // settings, logger)`; события — lib/eventBus.ts (подписка по имени класса, :245).
 import zhc from "zigbee-herdsman-converters";
 import tuya from "zigbee-herdsman-converters/lib/tuya";
+import fz from "zigbee-herdsman-converters/converters/fromZigbee";
+import {groupMembership} from "./bms-lib/group-membership.mjs";
 
 const NS = "bms:tuya";
 const SERVICE = ["commandMcuSyncTime", "commandMcuGatewayConnectionStatus"];
@@ -40,44 +42,28 @@ const REPLIER = tuya.modernExtend.tuyaBase({timeStart: "1970"}).fromZigbee.find(
 // точек признак — само сообщение кластера manuSpecificTuya (0xEF00): его шлёт только Tuya, какой бы ни был префикс.
 const isTuyaMaker = (device) => device?.zh?.type !== "Coordinator" && /^_T[ZY]/.test(device?.zh?.manufacturerName ?? "");
 
-// Подставные устройство и точка для пробы. converters различают сущности по имени класса
-// (utils.isDevice / isEndpoint смотрят constructor.name), поэтому классы названы как в zigbee-herdsman.
-class Device {
-    ieeeAddr = "bms-probe";
-    endpoints = [];
-    meta = {};
-}
-class Endpoint {
-    ID = 1;
-    deviceIeeeAddress = "bms-probe";
-    constructor(sent) {
-        this.sent = sent;
-    }
-    async command(cluster, command) {
-        this.sent.push(command);
-    }
-    async read() {}
-    async write() {}
-}
-
-/**
- * Ответит ли на это описание само. Прогоняем его собственные конвертеры этого сообщения на подставной
- * точке с настройками устройства: что-то отправили — значит отвечает описание (или осознанно иначе,
- * как tuyaBase с forceTimeUpdates), молчат — отвечаем мы. Так учитываются и умолчание tuyaBase,
- * и опция time_start устройства, и любые чужие конвертеры, без разбора их исходников.
- */
-export async function definitionAnswers(definition, type, options) {
+// Явно известные возможности закреплённой версии converters. Фабрика tuyaBase
+// возвращает замыкание без метаданных timeStart; значение по умолчанию опубликовано
+// в описании опции. Сравниваем только форму известного обработчика, не исполняя его.
+// При смене upstream тесты проверяют этот контракт. Незнакомый обработчик сохраняет
+// владение ответом; описания могут явно передать его BMS через meta.bmsTuyaServices.
+const TUYA_BASE_HANDLER = String(REPLIER.convert);
+export function definitionAnswers(definition, type, options = {}) {
+    const ownership = definition?.meta?.bmsTuyaServices?.[type];
+    if (ownership === "definition") return true;
+    if (ownership === "fallback") return false;
     const own = (definition?.fromZigbee ?? []).filter((c) => c.cluster === "manuSpecificTuya" && [c.type].flat().includes(type));
-    if (own.length === 0) return false;
-    const sent = [];
-    const device = new Device();
-    const msg = {type, cluster: "manuSpecificTuya", data: {payloadSize: 0}, endpoint: new Endpoint(sent), device, meta: {}, linkquality: 0};
-    try {
-        for (const c of own) await c.convert(definition, msg, noop, options, {device, state: {}, deviceExposesChanged: noop});
-    } catch {
-        return true; // не смогли понять — молчим: двойной ответ хуже, чем привычное поведение Z2M
+    for (const converter of own) {
+        if (converter === fz.ignore_tuya_set_time) continue;
+        if (String(converter.convert) !== TUYA_BASE_HANDLER) return true;
+        if (type === "commandMcuGatewayConnectionStatus") return true;
+        const defaultTime = definition.options?.find((o) => o.name === "time_start")?.description?.match(/Default for this device: "(1970|2000|off)"/)?.[1];
+        const selectedTime = ["1970", "2000", "off"].includes(options.time_start) ? options.time_start : defaultTime;
+        // Неизвестная версия метаданных: не добавляем второй ответ поверх своего
+        // обработчика устройства. Это явно проверяемый консервативный отказ.
+        if (selectedTime === undefined || selectedTime !== "off") return true;
     }
-    return sent.length > 0;
+    return false;
 }
 
 /** Делает ли описание «магический пакет» само (в configure — напрямую, через tuyaBase/tuyaMagicPacket или внутри своей функции). */
@@ -99,6 +85,7 @@ export function checkDpCommand(cmd) {
 export default class BmsTuyaService {
     constructor(zigbee, mqtt, state, publishEntityState, eventBus, enableDisableExtension, restartCallback, addExtension, settings, logger) {
         this.zigbee = zigbee;
+        this.membership = groupMembership(zigbee);
         this.publishEntityState = publishEntityState;
         this.eventBus = eventBus;
         this.settings = settings;
@@ -114,11 +101,17 @@ export default class BmsTuyaService {
         // Повторное подключение опрошенного устройства его не даёт (controller.ts:902 — интервью не запускается).
         this.eventBus.onDeviceInterview(this, async (data) => {
             if (data.status !== "successful") return;
+            this.membership.invalidate(data.device.zh.ieeeAddr);
             await this.sendMagicPacket(data.device);
             await this.clearForeignGroups(data.device);
         });
         // Повторное подключение известного устройства: интервью уже не будет, пакет шлём здесь.
-        this.eventBus.onDeviceAnnounce(this, (data) => (data.device.interviewed ? this.sendMagicPacket(data.device) : undefined));
+        this.eventBus.onDeviceAnnounce(this, (data) => {
+            // После повторного входа не считаем сохранённую в процессе проверку
+            // доказательством: устройство могло сбросить свою таблицу групп.
+            this.membership.invalidate(data.device.zh.ieeeAddr);
+            return data.device.interviewed ? this.sendMagicPacket(data.device) : undefined;
+        });
         this.eventBus.onMQTTMessage(this, (data) => this.onMqttMessage(data));
     }
 
@@ -207,6 +200,10 @@ export default class BmsTuyaService {
      */
     async clearForeignGroups(device) {
         if (!isTuyaMaker(device)) return;
+        return this.membership.withDeviceLock(device.zh.ieeeAddr, () => this.clearForeignGroupsLocked(device));
+    }
+
+    async clearForeignGroupsLocked(device) {
         const endpoints = device.zh.endpoints;
         const has = (clusters, name) => clusters.some((c) => c.name === name);
         // Пульт и кнопка сцен сами шлют вкл/выкл (клиентский genOnOff): их группы — в таблице привязок, а не в членстве.
@@ -221,9 +218,12 @@ export default class BmsTuyaService {
         const cleared = [];
         for (const endpoint of targets) {
             try {
-                // Та же команда, что шлёт Z2M на remove_all (endpoint.removeFromAllGroups), но без правки базы групп:
-                // базу не трогаем вовсе, даже если владелец добавит устройство в группу, пока команда в пути.
+                // Блокировка всего устройства охватывает ВСЕ endpoint, иначе add
+                // второго канала мог вклиниться между двумя removeAll.
+                this.membership.invalidate(device.zh.ieeeAddr, endpoint.ID);
                 await endpoint.command("genGroups", "removeAll", {}, {disableDefaultResponse: true});
+                const actual = await this.membership.verify(endpoint);
+                if (actual.size > 0) throw new Error("устройство сохранило группы после removeAll");
                 cleared.push(endpoint.ID);
             } catch (error) {
                 this.logger.warning(`BMS: таблицу групп на '${device.name}' (endpoint ${endpoint.ID}) очистить не удалось: ${error.message}`, NS);

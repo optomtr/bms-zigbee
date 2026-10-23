@@ -6,7 +6,8 @@ import {fileURLToPath, pathToFileURL} from "node:url";
 
 export const LAYER = path.resolve(fileURLToPath(import.meta.url), "../..");
 export const WORK = path.resolve(LAYER, "../.work");
-export const Z2M = path.join(WORK, "z2m-app");
+export const Z2M = process.env.BMS_TEST_Z2M ? path.resolve(process.env.BMS_TEST_Z2M) : path.join(WORK, "z2m-app");
+fs.mkdirSync(WORK, {recursive: true});
 if (!fs.existsSync(path.join(Z2M, "dist/controller.js"))) {
     throw new Error(`Нет стенда Z2M в ${Z2M}: запустите tuya/layer/tools/stand.sh`);
 }
@@ -54,6 +55,7 @@ export class Endpoint {
         this.ID = ID;
         this.deviceIeeeAddress = device.ieeeAddr;
         this.sent = [];
+        this.hardwareGroups = new Set();
         this.reads = [];
         this.input = input;
         this.output = output;
@@ -62,6 +64,12 @@ export class Endpoint {
     async command(cluster, command, payload) {
         if (command === this.failOn) throw new Error(`Timeout - ${this.deviceIeeeAddress}, ${this.ID}, ${cluster}.${command}`);
         this.sent.push({cluster, command, payload});
+        if (cluster === "genGroups") {
+            if (command === "removeAll") this.hardwareGroups.clear();
+            if (command === "add") this.hardwareGroups.add(payload.groupid);
+            if (command === "remove") this.hardwareGroups.delete(payload.groupid);
+            if (command === "getMembership") return {groupcount: this.hardwareGroups.size, grouplist: [...this.hardwareGroups]};
+        }
     }
     async read(cluster, attributes) {
         this.reads.push({cluster, attributes});
