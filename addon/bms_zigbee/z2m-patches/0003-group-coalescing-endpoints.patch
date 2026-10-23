@@ -1,0 +1,558 @@
+BMS: склейка по точкам (endpoint) многоканальных реле, дубли, очередь команд одному устройству
+(накладывается после 0001-group-coalescing и 0002-group-throttle).
+
+Зачем: на живой сети карточка HA «Освещение» шлёт 11 каналам реле (3 × Moes ZM4LT1 — `state`,
+4 двухканальных TS0002 — `state_l1`/`state_l2`) и ещё раз через группу HA из тех же каналов. Z2M-группа
+из этих 11 точек есть, но склейка не срабатывала: ключи разные, а покрытие считалось по устройствам.
+Итог при частых нажатиях — до 51 сообщения/с и 15 таймаутов «set» за минуту.
+
+Что меняет в lib/util/bmsGroupCoalescing.ts:
+- единица склейки — точка: `{"state_lN": X}` (и `<dev>/<точка>/set`) — это `{"state": X}` точке lN; имя
+  точки → номер по definition устройства (device.endpoint(), суффикс разбирается тем же регэкспом, что
+  в publish.ts); команда сразу на несколько точек делится по точкам;
+- группа покрывает пачку, если все её участники (ieee + точка) в пачке; конвертер у участника ищется
+  с учётом точки, как в publish.ts; групповая команда — обычная `state` группе, состояния `state_lN`
+  участников обновляет штатное расширение groups (проверено тестом);
+- одинаковая команда той же точке в пределах окна — одна (дубль от группы HA);
+- остаток по отдельности, но команды разным точкам ОДНОГО устройства — по очереди (следующая после
+  ответа на предыдущую): модули Tuya с MCU теряют одновременные команды; другие устройства — параллельно.
+
+Тесты: test/extensions/bmsGroupEndpoints.test.ts (настоящие определения ZM4LT1/ZM4LT2/ZM-104B-M/TS0002).
+
+diff --git a/lib/util/bmsGroupCoalescing.ts b/lib/util/bmsGroupCoalescing.ts
+index 6c7d2b4..d778b66 100644
+--- a/lib/util/bmsGroupCoalescing.ts
++++ b/lib/util/bmsGroupCoalescing.ts
+@@ -5,6 +5,11 @@
+ // эфир — часть команд теряется. Хаб Tuya в такой ситуации шлёт одну групповую команду. Здесь мы
+ // делаем так же, но только по группам, которые уже есть в Z2M: если все участники группы получили
+ // одинаковую команду в одном окне, вместо них уходит одна команда на группу.
++//
++// Единица склейки — точка (endpoint) устройства, а не устройство: участники групп Z2M — точки, а
++// многоканальные реле (Tuya TS0002 и т. п.) получают от HA `{"state_l1": …}` — это команда `state`
++// точке l1. Так пачка из одноканальных `state` и двухканальных `state_l1`/`state_l2` ложится на одну
++// группу из всех этих точек.
+ import type * as zhc from "zigbee-herdsman-converters";
+ import Device from "../model/device";
+ import type Group from "../model/group";
+@@ -22,8 +27,14 @@ export interface CoalesceTopic {
+ 
+ interface Item {
+     device: Device;
++    endpoint: zh.Endpoint;
++    // Имя точки так, как его видит Z2M при поиске конвертера (`l1` из `state_l1` или из топика); нет — undefined.
++    endpointName: string | undefined;
++    // `<ieee>/<номер точки>` — так же, как участник группы.
++    key: string;
+     parsedTopic: CoalesceTopic;
+     data: eventdata.MQTTMessage;
++    // Без суффикса точки: `{"state": "ON"}` и для `state`, и для `state_l1`.
+     message: KeyValue;
+ }
+ 
+@@ -55,9 +66,14 @@ export class GroupCoalescer {
+     private zigbee: Zigbee;
+     private send: Send;
+     private parse: (parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage) => KeyValue | undefined;
+-    // Ключ — содержимое команды; в пачке — устройства с одинаковой командой, в порядке прихода.
++    // Ключ — содержимое команды; в пачке — точки с одинаковой командой, в порядке прихода.
+     private batches = new Map<string, Item[]>();
+-    private pending = new Set<string>();
++    // Ждущие: точка → содержимое её команды (для дублей) и устройства (для порядка команд).
++    private pending = new Map<string, string>();
++    private pendingDevices = new Set<string>();
++    // Последняя запущенная одноадресная команда устройства из пачки: следующая точке того же устройства
++    // ждёт её. Модули Tuya с MCU теряют одновременные команды разным каналам.
++    private chains = new Map<string, Promise<void>>();
+     private timer: NodeJS.Timeout | undefined;
+     private firstAt = 0;
+     private running = new Set<Promise<void>>();
+@@ -74,33 +90,52 @@ export class GroupCoalescer {
+      * одному устройству определяется тем, кто первым дошёл до отправки. Поэтому здесь нет await.
+      */
+     offer(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): boolean {
+-        const item = settings.get().advanced.bms_group_coalescing ? this.toItem(parsedTopic, data) : undefined;
++        const items = settings.get().advanced.bms_group_coalescing ? this.toItems(parsedTopic, data) : undefined;
++
++        if (!items) {
++            const entity = this.zigbee.resolveEntity(parsedTopic.ID);
++
++            // Команда не склеивается, но относится к устройству, чья команда ещё ждёт в пачке или ещё
++            // уходит: отправляем пачку сейчас, а эту команду ставим за ними — порядок как при приходе.
++            if (entity instanceof Device && (this.pendingDevices.has(entity.ID) || this.chains.has(entity.ID))) {
++                this.flush();
++                this.run(parsedTopic, data, entity.ID);
++                return true;
++            }
+ 
+-        if (!item) {
+-            // Команда не склеивается, но относится к устройству, чья команда ещё ждёт в пачке:
+-            // отправляем пачку сейчас, чтобы команды этому устройству ушли в том порядке, в каком пришли.
+-            if (this.pending.size && this.touchesPending(parsedTopic)) {
++            if (entity && !(entity instanceof Device) && entity.zh.members.some((m) => this.pendingDevices.has(m.deviceIeeeAddress))) {
+                 this.flush();
+             }
+ 
+             return false;
+         }
+ 
+-        // Вторая команда тому же устройству в одном окне — сначала отправить первую.
+-        if (this.pending.has(item.device.ID)) {
+-            this.flush();
+-        }
++        for (const item of items) {
++            const key = stringify(Object.entries(item.message).sort(([a], [b]) => (a < b ? -1 : 1)));
++            const prev = this.pending.get(item.key);
+ 
+-        const key = stringify(Object.entries(item.message).sort(([a], [b]) => (a < b ? -1 : 1)));
+-        const batch = this.batches.get(key);
++            // Та же команда той же точке в окне — дубль (кнопка карточки HA + группа HA из тех же каналов).
++            if (prev === key) {
++                continue;
++            }
+ 
+-        if (batch) {
+-            batch.push(item);
+-        } else {
+-            this.batches.set(key, [item]);
++            // Другая команда той же точке в одном окне — сначала отправить первую.
++            if (prev !== undefined) {
++                this.flush();
++            }
++
++            const batch = this.batches.get(key);
++
++            if (batch) {
++                batch.push(item);
++            } else {
++                this.batches.set(key, [item]);
++            }
++
++            this.pending.set(item.key, key);
++            this.pendingDevices.add(item.device.ID);
+         }
+ 
+-        this.pending.add(item.device.ID);
+         const now = Date.now();
+ 
+         if (this.timer === undefined) {
+@@ -122,6 +157,7 @@ export class GroupCoalescer {
+         const batches = [...this.batches.values()];
+         this.batches.clear();
+         this.pending.clear();
++        this.pendingDevices.clear();
+ 
+         for (const batch of batches) {
+             const {groups, rest} = this.plan(batch);
+@@ -141,7 +177,7 @@ export class GroupCoalescer {
+             }
+ 
+             for (const item of rest) {
+-                this.run(item.parsedTopic, item.data);
++                this.run(item.parsedTopic, item.data, item.device.ID);
+             }
+         }
+     }
+@@ -152,15 +188,33 @@ export class GroupCoalescer {
+         await Promise.allSettled([...this.running]);
+     }
+ 
+-    private run(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): void {
+-        const promise = this.send(parsedTopic, data)
++    /** device — одноадресная команда: ставится в очередь этого устройства (см. chains). */
++    private run(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage, device?: string): void {
++        const prev = device === undefined ? undefined : this.chains.get(device);
++        // Без очереди отправка начинается синхронно — как в штатном Z2M.
++        const started = prev ? prev.then(() => this.send(parsedTopic, data)) : this.send(parsedTopic, data);
++        const promise: Promise<void> = started
+             .catch((error) => logger.error(`BMS: отправка '${data.topic}' не удалась: ${error}`))
+-            .finally(() => this.running.delete(promise));
++            .finally(() => {
++                this.running.delete(promise);
++
++                if (device !== undefined && this.chains.get(device) === promise) {
++                    this.chains.delete(device);
++                }
++            });
+         this.running.add(promise);
++
++        if (device !== undefined) {
++            this.chains.set(device, promise);
++        }
+     }
+ 
+-    private toItem(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): Item | undefined {
+-        if (parsedTopic.type !== "set" || parsedTopic.endpoint !== undefined) {
++    /**
++     * Команда устройству → по элементу на каждую точку, к которой она относится. undefined — команда не
++     * склеивается целиком (что-то в ней не из KEYS, точка не найдена или не входит ни в одну группу).
++     */
++    private toItems(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): Item[] | undefined {
++        if (parsedTopic.type !== "set") {
+             return undefined;
+         }
+ 
+@@ -176,43 +230,65 @@ export class GroupCoalescer {
+             return undefined;
+         }
+ 
+-        const keys = Object.keys(message);
+-        const endpoint = device.endpoint();
++        // Суффикс точки — как его разбирает сам Z2M (publish.ts, propertyEndpointRegex).
++        const names = device.getEndpointNames();
++        const suffix = names.length ? new RegExp(`^(.*?)_(${names.join("|")})$`) : undefined;
++        const byEndpoint = new Map<string | undefined, {message: KeyValue; original: KeyValue}>();
+ 
+-        if (!keys.length || !endpoint || keys.some((k) => !Object.hasOwn(KEYS, k) || !KEYS[k].valid(message[k]))) {
+-            return undefined;
+-        }
++        for (const [property, value] of Object.entries(message)) {
++            const match = suffix ? property.match(suffix) : null;
++            const key = match ? match[1] : property;
++            const endpointName = match ? match[2] : parsedTopic.endpoint;
+ 
+-        // Устройство не входит ни в одну группу, которую вообще можно было бы использовать, — держать
+-        // его команду незачем: она уйдёт сразу, как в штатном Z2M.
+-        const inGroup = this.zigbee
+-            .groupsIterator((g) => g.members.length >= 2 && g.members.some((m) => m.deviceIeeeAddress === device.ieeeAddr && m.ID === endpoint.ID))
+-            .next();
++            if (!Object.hasOwn(KEYS, key) || !KEYS[key].valid(value)) {
++                return undefined;
++            }
+ 
+-        if (inGroup.done) {
+-            return undefined;
++            const entry = byEndpoint.get(endpointName) ?? {message: {}, original: {}};
++            entry.message[key] = value;
++            entry.original[property] = value;
++            byEndpoint.set(endpointName, entry);
+         }
+ 
+-        return {device, parsedTopic, data, message};
+-    }
++        const items: Item[] = [];
+ 
+-    private touchesPending(parsedTopic: CoalesceTopic): boolean {
+-        const entity = this.zigbee.resolveEntity(parsedTopic.ID);
++        for (const [endpointName, {message: normalized, original}] of byEndpoint) {
++            const endpoint = device.endpoint(endpointName);
++
++            // Одна transition без команды — не склеиваем.
++            if (!endpoint || Object.keys(normalized).every((k) => k === "transition")) {
++                return undefined;
++            }
++
++            // Точка не входит ни в одну группу из 2+ участников — держать её команду незачем: она уйдёт сразу.
++            const inGroup = this.zigbee
++                .groupsIterator(
++                    (g) => g.members.length >= 2 && g.members.some((m) => m.deviceIeeeAddress === device.ieeeAddr && m.ID === endpoint.ID),
++                )
++                .next();
++
++            if (inGroup.done) {
++                return undefined;
++            }
+ 
+-        if (entity instanceof Device) {
+-            return this.pending.has(entity.ID);
++            // Команда на несколько точек сразу делится: каждой точке — её часть, с исходными именами полей.
++            const own =
++                byEndpoint.size === 1
++                    ? {parsedTopic, data}
++                    : {parsedTopic: {...parsedTopic, attribute: ""}, data: {topic: data.topic, message: stringify(original)}};
++            items.push({device, endpoint, endpointName, key: `${device.ieeeAddr}/${endpoint.ID}`, message: normalized, ...own});
+         }
+ 
+-        return !!entity && entity.zh.members.some((m) => this.pending.has(m.deviceIeeeAddress));
++        return items;
+     }
+ 
+     /**
+-     * Какие группы покрывают пачку: все участники группы получили эту команду (по своей основной
+-     * точке, без повторов), группа не меньше 2 участников, конвертеры у группы и у каждого участника
+-     * те же. Жадно: сначала самые большие, без пересечений. Остальное — по отдельности.
++     * Какие группы покрывают пачку: все участники группы (точки) получили эту команду, группа не меньше
++     * 2 участников, конвертеры у группы и у каждого участника те же. Жадно: сначала самые большие,
++     * без пересечений. Остальное — по отдельности.
+      */
+     private plan(batch: Item[]): {groups: [Group, KeyValue][]; rest: Item[]} {
+-        const rest = new Map(batch.map((i) => [i.device.ID, i]));
++        const rest = new Map(batch.map((i) => [i.key, i]));
+ 
+         if (batch.length < 2) {
+             return {groups: [], rest: batch};
+@@ -231,14 +307,14 @@ export class GroupCoalescer {
+         const groups: [Group, KeyValue][] = [];
+ 
+         for (const group of candidates) {
+-            const members = group.zh.members.map((m) => m.deviceIeeeAddress);
++            const members = group.zh.members.map((m) => `${m.deviceIeeeAddress}/${m.ID}`);
+ 
+-            if (members.every((ieee) => rest.has(ieee))) {
++            if (members.every((key) => rest.has(key))) {
+                 // biome-ignore lint/style/noNonNullAssertion: проверено строкой выше
+                 groups.push([group, rest.get(members[0])!.message]);
+ 
+-                for (const ieee of members) {
+-                    rest.delete(ieee);
++                for (const key of members) {
++                    rest.delete(key);
+                 }
+             }
+         }
+@@ -247,19 +323,20 @@ export class GroupCoalescer {
+     }
+ 
+     private covers(group: Group, items: Map<string, Item>, keys: string[]): boolean {
+-        const seen = new Set<string>();
+         const groupConverters = Array.from(new Set(group.membersDefinitions().flatMap((d) => d.toZigbee)));
+-        const find = (converters: ReadonlyArray<zhc.Tz.Converter>, key: string, device: boolean): zhc.Tz.Converter | undefined =>
+-            converters.find((c) => (!c.key || c.key.includes(key)) && (!device || !c.endpoints));
++        // Как выбирает конвертер publish.ts: для группы — первый по ключу, для устройства — ещё и по точке.
++        const find = (converters: ReadonlyArray<zhc.Tz.Converter>, key: string, device: boolean, endpointName?: string) =>
++            converters.find(
++                (c) => (!c.key || c.key.includes(key)) && (!device || !c.endpoints || (endpointName && c.endpoints.includes(endpointName))),
++            );
+ 
+         for (const member of group.zh.members) {
+-            const item = items.get(member.deviceIeeeAddress);
++            const item = items.get(`${member.deviceIeeeAddress}/${member.ID}`);
+ 
+-            if (!item || seen.has(member.deviceIeeeAddress) || item.device.endpoint()?.ID !== member.ID) {
++            if (!item) {
+                 return false;
+             }
+ 
+-            seen.add(member.deviceIeeeAddress);
+             const clusters = member.getInputClusters().map((c) => c.name);
+             const deviceOptions = item.device.options as KeyValue;
+             const groupOptions = group.options as KeyValue;
+@@ -267,7 +344,7 @@ export class GroupCoalescer {
+             for (const key of keys) {
+                 const cluster = KEYS[key].cluster;
+                 // biome-ignore lint/style/noNonNullAssertion: в пачку попадают только устройства с definition
+-                const converter = find(item.device.definition!.toZigbee, key, true);
++                const converter = find(item.device.definition!.toZigbee, key, true, item.endpointName);
+ 
+                 if ((cluster && !clusters.includes(cluster)) || !converter?.convertSet || converter !== find(groupConverters, key, false)) {
+                     return false;
+diff --git a/test/extensions/bmsGroupCoalescing.test.ts b/test/extensions/bmsGroupCoalescing.test.ts
+index ff98c63..2419990 100644
+--- a/test/extensions/bmsGroupCoalescing.test.ts
++++ b/test/extensions/bmsGroupCoalescing.test.ts
+@@ -219,14 +219,13 @@ describe("BMS: group command coalescing", () => {
+         expect(bulbColor.command).toHaveBeenCalledTimes(1);
+     });
+ 
+-    it("does not delay commands it cannot coalesce (toggle, color, endpoint, get)", async () => {
++    it("does not delay commands it cannot coalesce (toggle, color, get)", async () => {
+         groups.group_1.members.push(bulbColor, bulbColor2);
+         await set("bulb_color", {state: "TOGGLE"});
+         await set("bulb_color_2", {color: {x: 0.1, y: 0.2}});
+-        await mockMQTTEvents.message("zigbee2mqtt/bulb_color/1/set", stringify({state: "OFF"}));
+         await mockMQTTEvents.message("zigbee2mqtt/bulb_color_2/get", stringify({state: ""}));
+         await flushPromises();
+-        expect(bulbColor.command).toHaveBeenCalledTimes(2);
++        expect(bulbColor.command).toHaveBeenCalledTimes(1);
+         expect(bulbColor2.command).toHaveBeenCalledTimes(1);
+         expect(bulbColor2.read).toHaveBeenCalledWith("genOnOff", ["onOff"]);
+         expect(groups.group_1.command).toHaveBeenCalledTimes(0);
+diff --git a/test/extensions/bmsGroupEndpoints.test.ts b/test/extensions/bmsGroupEndpoints.test.ts
+new file mode 100644
+index 0000000..3eecb2c
+--- /dev/null
++++ b/test/extensions/bmsGroupEndpoints.test.ts
+@@ -0,0 +1,193 @@
++// BMS: склейка по точкам (endpoint) многоканальных реле — lib/util/bmsGroupCoalescing.ts.
++// Устройства — как на живой сети владельца: Moes ZM4LT1 (TS0001, один канал) и двухканальные TS0002
++// (Moes ZM4LT2, ZM-104B-M, Tuya); определения берутся настоящие, из zigbee-herdsman-converters.
++// biome-ignore assist/source/organizeImports: import mocks first
++import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
++import * as data from "../mocks/data";
++import {mockLogger} from "../mocks/logger";
++import {events as mockMQTTEvents, mockMQTTPublishAsync} from "../mocks/mqtt";
++import * as mockSleep from "../mocks/sleep";
++import {flushPromises} from "../mocks/utils";
++import {Device, devices, Endpoint, groups, resetGroupMembers} from "../mocks/zigbeeHerdsman";
++
++import {InterviewState} from "zigbee-herdsman/dist/controller/model/device";
++import {clearGlobalStore} from "zigbee-herdsman-converters";
++import {Controller} from "../../lib/controller";
++import {loadTopicGetSetRegex} from "../../lib/extension/publish";
++import * as settings from "../../lib/util/settings";
++import {stringify} from "../../lib/util/stringify";
++
++const RELAYS: [name: string, model: string, manufacturer: string, channels: number][] = [
++    ["zm4lt1_a", "TS0001", "_TZ3000_afgzktgb", 1],
++    ["zm4lt1_b", "TS0001", "_TZ3000_afgzktgb", 1],
++    ["zm4lt1_c", "TS0001", "_TZ3000_afgzktgb", 1],
++    ["zm4lt2", "TS0002", "_TZ3000_criiahcg", 2],
++    ["zm104b_a", "TS0002", "_TZ3000_qaa59zqd", 2],
++    ["zm104b_b", "TS0002", "_TZ3000_qaa59zqd", 2],
++    ["ts0002", "TS0002", "_TZ3000_bmszigbe", 2],
++];
++const ieee = (i: number): string => `0xa4c13800000000${(i + 1).toString(16).padStart(2, "0")}`;
++const relays = RELAYS.map(([name, model, manufacturer, channels], i) => {
++    const endpoints = Array.from({length: channels}, (_, c) => new Endpoint(c + 1, [0, 4, 5, 6], [], ieee(i)));
++    const device = new Device("Router", ieee(i), 0x1000 + i, 4417, endpoints, InterviewState.Successful, "Mains (single phase)", model, manufacturer);
++    (devices as Record<string, Device>)[name] = device;
++    return {name, device, channels};
++});
++// 11 каналов «Общей комнаты»: что шлёт карточка HA каждому из них.
++const channels = relays.flatMap(({name, device, channels}) =>
++    Array.from({length: channels}, (_, c) => ({
++        name,
++        endpoint: device.getEndpoint(c + 1)!,
++        key: channels === 1 ? "state" : `state_l${c + 1}`,
++    })),
++);
++
++describe("BMS: coalescing by endpoint (multi-channel relays)", () => {
++    let controller: Controller;
++    const set = async (name: string, payload: Record<string, unknown>): Promise<void> => {
++        await mockMQTTEvents.message(`zigbee2mqtt/${name}/set`, stringify(payload));
++    };
++    const pressCard = async (value: string): Promise<void> => {
++        for (const ch of channels) await set(ch.name, {[ch.key]: value});
++    };
++    const wait = async (ms: number): Promise<void> => {
++        await vi.advanceTimersByTimeAsync(ms);
++        await flushPromises();
++    };
++    const lastState = (name: string): Record<string, unknown> =>
++        Object.assign({}, ...mockMQTTPublishAsync.mock.calls.filter((c) => c[0] === `zigbee2mqtt/${name}`).map((c) => JSON.parse(c[1])));
++    const coalesceLog = (): string[] =>
++        mockLogger.info.mock.calls.map((c) => c[0]).filter((m): m is string => typeof m === "string" && m.startsWith("BMS: склеено"));
++
++    beforeAll(async () => {
++        vi.useFakeTimers();
++        data.writeEmptyState();
++        controller = new Controller(vi.fn(), vi.fn());
++        mockSleep.mock();
++        await controller.start();
++        await flushPromises();
++    });
++
++    beforeEach(() => {
++        data.writeDefaultConfiguration();
++        settings.reRead();
++        for (const {name, device} of relays) {
++            settings.addDevice(device.ieeeAddr);
++            settings.set(["devices", device.ieeeAddr, "friendly_name"], name);
++        }
++        controller.state.clear();
++        loadTopicGetSetRegex();
++        for (const group of Object.values(groups)) {
++            group.members = [];
++            group.command.mockClear();
++        }
++        for (const ch of channels) ch.endpoint.command.mockReset();
++        mockMQTTPublishAsync.mockClear();
++        mockLogger.info.mockClear();
++        clearGlobalStore();
++    });
++
++    afterEach(async () => {
++        await wait(20000);
++        resetGroupMembers();
++    });
++
++    afterAll(async () => {
++        await vi.runOnlyPendingTimersAsync();
++        mockSleep.restore();
++        await controller?.stop();
++        await flushPromises();
++        vi.useRealTimers();
++    });
++
++    it("resolves the real definitions of the owner's relays", () => {
++        const models = relays.map(
++            ({name}) => (controller.zigbee.resolveEntity(name) as unknown as {definition?: {model: string}})?.definition?.model,
++        );
++        expect(models).toStrictEqual(["ZM4LT1", "ZM4LT1", "ZM4LT1", "ZM4LT2", "ZM-104B-M", "ZM-104B-M", "TS0002"]);
++    });
++
++    it("sends one group command for 11 channels pressed by the card and by the HA group", async () => {
++        groups.group_2.members.push(...channels.map((ch) => ch.endpoint));
++        await pressCard("ON"); // кнопка карточки
++        await pressCard("ON"); // группа HA «Все реле» из тех же каналов — дубли
++        await wait(50);
++
++        expect(groups.group_2.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_2.command.mock.calls[0].slice(0, 2)).toStrictEqual(["genOnOff", "on"]);
++        for (const ch of channels) expect(ch.endpoint.command).toHaveBeenCalledTimes(0);
++        expect(coalesceLog()).toStrictEqual(["BMS: склеено 11 команд → группы [group_2] + 0 по отдельности"]);
++        // Состояния всех 11 каналов в Z2M — как при штатной команде на группу: state у одноканальных, state_lN у двухканальных.
++        for (const {name, channels: n} of relays) {
++            expect(lastState(name)).toMatchObject(n === 1 ? {state: "ON"} : {state_l1: "ON", state_l2: "ON"});
++        }
++        expect(lastState("group_2")).toMatchObject({state: "ON"});
++    });
++
++    it("understands one message for both channels", async () => {
++        groups.group_2.members.push(...channels.map((ch) => ch.endpoint));
++        for (const {name, channels: n} of relays) await set(name, n === 1 ? {state: "OFF"} : {state_l1: "OFF", state_l2: "OFF"});
++        await wait(50);
++        expect(groups.group_2.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_2.command.mock.calls[0][1]).toStrictEqual("off");
++    });
++
++    it("sends the rest one by one, one command at a time per device", async () => {
++        // Группа — только одноканальные и первый канал zm4lt2; остальное по отдельности.
++        const covered = channels.filter((ch) => ch.key === "state" || (ch.name === "zm4lt2" && ch.key === "state_l1"));
++        groups.group_2.members.push(...covered.map((ch) => ch.endpoint));
++        groups.group_1.members.push(...channels.filter((ch) => !covered.includes(ch)).map((ch) => ch.endpoint), devices.bulb.getEndpoint(1)!);
++        // Канал l1 устройства zm104b_a отвечает не сразу: l2 того же устройства должен ждать его.
++        const l1 = relays[4].device.getEndpoint(1)!;
++        const l2 = relays[4].device.getEndpoint(2)!;
++        let release: () => void = () => {};
++        l1.command.mockImplementation(() => new Promise<void>((resolve) => (release = resolve)));
++        await pressCard("ON");
++        await wait(50);
++
++        expect(groups.group_2.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        expect(coalesceLog()).toStrictEqual(["BMS: склеено 11 команд → группы [group_2] + 7 по отдельности"]);
++        expect(l1.command).toHaveBeenCalledTimes(1);
++        expect(l2.command).toHaveBeenCalledTimes(0);
++        // Разные устройства — параллельно, как в штатном Z2M.
++        expect(relays[5].device.getEndpoint(1)!.command).toHaveBeenCalledTimes(1);
++
++        release();
++        await flushPromises();
++        expect(l2.command).toHaveBeenCalledTimes(1);
++        expect(l2.command.mock.calls[0][1]).toStrictEqual("on");
++        expect(lastState("zm104b_a")).toMatchObject({state_l1: "ON", state_l2: "ON"});
++    });
++
++    it("does not use a group when one channel of a device did not get the command", async () => {
++        groups.group_2.members.push(...channels.map((ch) => ch.endpoint));
++        // Карточка с 10 каналами: второй канал zm4lt2 не нажат — группа из 11 не подходит.
++        for (const ch of channels) if (!(ch.name === "zm4lt2" && ch.key === "state_l2")) await set(ch.name, {[ch.key]: "ON"});
++        await wait(50);
++        expect(groups.group_2.command).toHaveBeenCalledTimes(0);
++        expect(relays[3].device.getEndpoint(2)!.command).toHaveBeenCalledTimes(0);
++        expect(relays[3].device.getEndpoint(1)!.command).toHaveBeenCalledTimes(1);
++    });
++
++    it("keeps single-channel devices working as before", async () => {
++        groups.group_2.members.push(...channels.filter((ch) => ch.key === "state").map((ch) => ch.endpoint));
++        await set("zm4lt1_a", {state: "ON"});
++        await wait(50);
++        expect(relays[0].device.getEndpoint(1)!.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_2.command).toHaveBeenCalledTimes(0);
++        expect(lastState("zm4lt1_a")).toMatchObject({state: "ON"});
++    });
++
++    it("still applies the group rate limit (0002)", async () => {
++        groups.group_2.members.push(...channels.map((ch) => ch.endpoint));
++        await pressCard("ON");
++        await wait(50);
++        await wait(50);
++        await pressCard("OFF");
++        await wait(50);
++        expect(groups.group_2.command.mock.calls.map((c) => c[1])).toStrictEqual(["on"]);
++        await wait(900);
++        expect(groups.group_2.command.mock.calls.map((c) => c[1])).toStrictEqual(["on", "off"]);
++    });
++});
