@@ -1,0 +1,794 @@
+BMS: склейка одинаковых команд нескольким устройствам в одну групповую команду Zigbee.
+
+Зачем: Home Assistant, выключая комнату, свою группу или сцену, шлёт каждой лампе отдельный
+<base>/<лампа>/set почти одновременно. На живой сети (18 ламп TS0502B, SLZB-06M) 18 одноадресных
+команд и ответы на них забили эфир — 33 команды не дошли. Хаб Tuya в этом случае шлёт одну групповую.
+
+Что делает: одинаковые set-команды (state on/off, brightness, color_temp, transition) устройствам,
+пришедшие в одном окне (50 мс от последней, не дольше 4 окон от первой), собираются в пачку. Для
+пачки берутся существующие группы Z2M, все участники которых получили эту команду (группа от 2
+участников, по основной точке, те же конвертеры, что у каждого участника), самые большие первыми и
+без пересечений; по ним уходит одна команда тем же путём, что <base>/<группа>/set. Остальные — как
+раньше, по отдельности. Устройства не в группах, toggle, color, команды на точку, get — без
+изменений и без задержки.
+
+Настройки: advanced.bms_group_coalescing (по умолчанию true), advanced.bms_group_coalescing_window (мс, 50).
+Журнал: "BMS: склеено N команд → группы [...] + M по отдельности".
+
+Файлы: новый lib/util/bmsGroupCoalescing.ts; в lib/extension/publish.ts обработка вынесена в
+publishParsed() и перед ней — offer(); настройки в settings.ts/schema/api.ts. Тесты:
+test/extensions/bmsGroupCoalescing.test.ts; в publish/groups.test.ts склейка выключена (они про
+штатное поведение), в bridge.test.ts — две новые настройки в bridge/info.
+
+diff --git a/lib/extension/publish.ts b/lib/extension/publish.ts
+index 733c617..e406aba 100644
+--- a/lib/extension/publish.ts
++++ b/lib/extension/publish.ts
+@@ -2,6 +2,7 @@ import bind from "bind-decorator";
+ import type * as zhc from "zigbee-herdsman-converters";
+ import Device from "../model/device";
+ import Group from "../model/group";
++import {GroupCoalescer} from "../util/bmsGroupCoalescing";
+ import logger from "../util/logger";
+ import * as settings from "../util/settings";
+ import {stringify} from "../util/stringify";
+@@ -19,19 +20,27 @@ const STATE_VALUES: ReadonlyArray<string> = ["on", "off", "toggle", "open", "clo
+ const SCENE_CONVERTER_KEYS: ReadonlyArray<string> = ["scene_store", "scene_add", "scene_remove", "scene_remove_all", "scene_rename"];
+ 
+ interface ParsedTopic {
+-    ID: string;
++    ID: string | number;
+     endpoint: string | undefined;
+     attribute: string;
+     type: "get" | "set";
+ }
+ 
+ export default class Publish extends Extension {
++    // BMS: одинаковые команды нескольким устройствам → одна групповая (lib/util/bmsGroupCoalescing.ts).
++    private coalescer = new GroupCoalescer(this.zigbee, this.publishParsed, this.parseMessage.bind(this));
++
+     // biome-ignore lint/suspicious/useAwait: API
+     override async start(): Promise<void> {
+         loadTopicGetSetRegex();
+         this.eventBus.onMQTTMessage(this, this.onMQTTMessage);
+     }
+ 
++    override async stop(): Promise<void> {
++        await super.stop();
++        await this.coalescer.stop();
++    }
++
+     parseTopic(topic: string): ParsedTopic | undefined {
+         // The function supports the following topic formats (below are for 'set'. 'get' will look the same):
+         // - <base_topic>/device_name/set (auto-matches endpoint and attribute is defined in the payload)
+@@ -92,10 +101,14 @@ export default class Publish extends Extension {
+     @bind async onMQTTMessage(data: eventdata.MQTTMessage): Promise<void> {
+         const parsedTopic = this.parseTopic(data.topic);
+ 
+-        if (!parsedTopic) {
++        if (!parsedTopic || this.coalescer.offer(parsedTopic, data)) {
+             return;
+         }
+ 
++        await this.publishParsed(parsedTopic, data);
++    }
++
++    @bind async publishParsed(parsedTopic: ParsedTopic, data: eventdata.MQTTMessage): Promise<void> {
+         const re = this.zigbee.resolveEntity(parsedTopic.ID);
+ 
+         if (!re) {
+diff --git a/lib/types/api.ts b/lib/types/api.ts
+index 261e032..d7dcbb4 100644
+--- a/lib/types/api.ts
++++ b/lib/types/api.ts
+@@ -218,6 +218,10 @@ export type Zigbee2MQTTSettings = {
+         transmit_power?: number;
+         /** 3.0: default to false (JSON schema & settings `defaults`) */
+         enable_external_js: boolean;
++        /** BMS: склейка одинаковых команд устройствам в групповую команду (lib/util/bmsGroupCoalescing.ts) */
++        bms_group_coalescing: boolean;
++        /** BMS: окно склейки, мс */
++        bms_group_coalescing_window: number;
+     };
+     health: {
+         /** in minutes */
+diff --git a/lib/util/bmsGroupCoalescing.ts b/lib/util/bmsGroupCoalescing.ts
+new file mode 100644
+index 0000000..6c7d2b4
+--- /dev/null
++++ b/lib/util/bmsGroupCoalescing.ts
+@@ -0,0 +1,284 @@
++// BMS: склейка одинаковых команд нескольким устройствам в групповую команду Zigbee.
++//
++// Почему: Home Assistant, выключая комнату, свою группу или сцену, шлёт КАЖДОЙ лампе отдельный
++// `<base>/<лампа>/set` почти одновременно. 18 одноадресных команд и сотни ответов на них забивают
++// эфир — часть команд теряется. Хаб Tuya в такой ситуации шлёт одну групповую команду. Здесь мы
++// делаем так же, но только по группам, которые уже есть в Z2M: если все участники группы получили
++// одинаковую команду в одном окне, вместо них уходит одна команда на группу.
++import type * as zhc from "zigbee-herdsman-converters";
++import Device from "../model/device";
++import type Group from "../model/group";
++import type Zigbee from "../zigbee";
++import logger from "./logger";
++import * as settings from "./settings";
++import {stringify} from "./stringify";
++
++export interface CoalesceTopic {
++    ID: string | number;
++    endpoint: string | undefined;
++    attribute: string;
++    type: "get" | "set";
++}
++
++interface Item {
++    device: Device;
++    parsedTopic: CoalesceTopic;
++    data: eventdata.MQTTMessage;
++    message: KeyValue;
++}
++
++type Send = (parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage) => Promise<void>;
++
++// Что можно склеить и какой кластер ZCL для этого должен быть у лампы. Только простые значения:
++// toggle не склеиваем — групповой toggle Z2M считает по состоянию группы, а лампы переключаются
++// каждая от своего, и оптимистичные состояния участников разошлись бы с правдой.
++// Кластер проверяем, чтобы не отправить групповую команду устройству, которое управляется через
++// точки данных Tuya (TS0601 и т. п.): у них нет genOnOff, и групповой кадр они бы не поняли.
++const KEYS: Readonly<Record<string, {cluster?: string; valid: (v: unknown) => boolean}>> = {
++    state: {cluster: "genOnOff", valid: (v) => typeof v === "string" && ["on", "off"].includes(v.toLowerCase())},
++    brightness: {cluster: "genLevelCtrl", valid: (v) => typeof v === "number"},
++    color_temp: {cluster: "lightingColorCtrl", valid: (v) => typeof v === "number"},
++    transition: {valid: (v) => typeof v === "number"},
++};
++
++// Настройки устройства, которые меняют сам кадр Zigbee у световых конвертеров (transition, color_sync)
++// или то, как Z2M публикует состояние после команды (optimistic). Если у лампы они не такие, как у
++// группы, групповая команда (с настройками группы) была бы не той же командой — такую лампу не склеиваем.
++const OPTIONS_MUST_MATCH = ["transition", "color_sync", "optimistic"];
++
++// Окно ожидания отсчитывается от ПОСЛЕДНЕЙ команды пачки (каждая новая продлевает его), но не дольше
++// MAX_FACTOR окон от первой: на загруженном Home Assistant команды одной сцены приходят не разом,
++// а непрерывный поток команд не должен держать первую бесконечно.
++const MAX_FACTOR = 4;
++
++export class GroupCoalescer {
++    private zigbee: Zigbee;
++    private send: Send;
++    private parse: (parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage) => KeyValue | undefined;
++    // Ключ — содержимое команды; в пачке — устройства с одинаковой командой, в порядке прихода.
++    private batches = new Map<string, Item[]>();
++    private pending = new Set<string>();
++    private timer: NodeJS.Timeout | undefined;
++    private firstAt = 0;
++    private running = new Set<Promise<void>>();
++
++    constructor(zigbee: Zigbee, send: Send, parse: (parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage) => KeyValue | undefined) {
++        this.zigbee = zigbee;
++        this.send = send;
++        this.parse = parse;
++    }
++
++    /**
++     * true — команда взята в пачку и уйдёт по окончании окна; false — обрабатывать как обычно.
++     * Решение синхронное: Z2M обрабатывает MQTT-сообщения параллельно, и порядок отправки команд
++     * одному устройству определяется тем, кто первым дошёл до отправки. Поэтому здесь нет await.
++     */
++    offer(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): boolean {
++        const item = settings.get().advanced.bms_group_coalescing ? this.toItem(parsedTopic, data) : undefined;
++
++        if (!item) {
++            // Команда не склеивается, но относится к устройству, чья команда ещё ждёт в пачке:
++            // отправляем пачку сейчас, чтобы команды этому устройству ушли в том порядке, в каком пришли.
++            if (this.pending.size && this.touchesPending(parsedTopic)) {
++                this.flush();
++            }
++
++            return false;
++        }
++
++        // Вторая команда тому же устройству в одном окне — сначала отправить первую.
++        if (this.pending.has(item.device.ID)) {
++            this.flush();
++        }
++
++        const key = stringify(Object.entries(item.message).sort(([a], [b]) => (a < b ? -1 : 1)));
++        const batch = this.batches.get(key);
++
++        if (batch) {
++            batch.push(item);
++        } else {
++            this.batches.set(key, [item]);
++        }
++
++        this.pending.add(item.device.ID);
++        const now = Date.now();
++
++        if (this.timer === undefined) {
++            this.firstAt = now;
++        } else {
++            clearTimeout(this.timer);
++        }
++
++        const window = settings.get().advanced.bms_group_coalescing_window;
++        this.timer = setTimeout(() => this.flush(), Math.max(0, Math.min(window, this.firstAt + window * MAX_FACTOR - now)));
++
++        return true;
++    }
++
++    /** Отправить всё, что ждёт, сразу. Отправка запускается синхронно (см. offer). */
++    flush(): void {
++        clearTimeout(this.timer);
++        this.timer = undefined;
++        const batches = [...this.batches.values()];
++        this.batches.clear();
++        this.pending.clear();
++
++        for (const batch of batches) {
++            const {groups, rest} = this.plan(batch);
++
++            if (groups.length) {
++                const names = groups.map(([g]) => g.name).join(", ");
++                logger.info(`BMS: склеено ${batch.length} команд → группы [${names}] + ${rest.length} по отдельности`);
++            } else if (batch.length > 1) {
++                logger.debug(`BMS: ${batch.length} одинаковых команд — подходящей группы нет, по отдельности`);
++            }
++
++            for (const [group, message] of groups) {
++                // Отправка ровно тем же путём, что и сообщение `<base>/<группа>/set`: тот же конвертер,
++                // те же оптимистичные состояния группы и её участников (их публикует расширение groups).
++                const groupTopic: CoalesceTopic = {ID: group.ID, endpoint: undefined, attribute: "", type: "set"};
++                this.run(groupTopic, {topic: `${settings.get().mqtt.base_topic}/${group.name}/set`, message: stringify(message)});
++            }
++
++            for (const item of rest) {
++                this.run(item.parsedTopic, item.data);
++            }
++        }
++    }
++
++    /** При остановке Z2M ждущие команды отправляются, а не теряются. */
++    async stop(): Promise<void> {
++        this.flush();
++        await Promise.allSettled([...this.running]);
++    }
++
++    private run(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): void {
++        const promise = this.send(parsedTopic, data)
++            .catch((error) => logger.error(`BMS: отправка '${data.topic}' не удалась: ${error}`))
++            .finally(() => this.running.delete(promise));
++        this.running.add(promise);
++    }
++
++    private toItem(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): Item | undefined {
++        if (parsedTopic.type !== "set" || parsedTopic.endpoint !== undefined) {
++            return undefined;
++        }
++
++        const device = this.zigbee.resolveEntity(parsedTopic.ID);
++
++        if (!(device instanceof Device) || !device.definition) {
++            return undefined;
++        }
++
++        const message = this.parse(parsedTopic, data);
++
++        if (!message || typeof message !== "object" || Array.isArray(message)) {
++            return undefined;
++        }
++
++        const keys = Object.keys(message);
++        const endpoint = device.endpoint();
++
++        if (!keys.length || !endpoint || keys.some((k) => !Object.hasOwn(KEYS, k) || !KEYS[k].valid(message[k]))) {
++            return undefined;
++        }
++
++        // Устройство не входит ни в одну группу, которую вообще можно было бы использовать, — держать
++        // его команду незачем: она уйдёт сразу, как в штатном Z2M.
++        const inGroup = this.zigbee
++            .groupsIterator((g) => g.members.length >= 2 && g.members.some((m) => m.deviceIeeeAddress === device.ieeeAddr && m.ID === endpoint.ID))
++            .next();
++
++        if (inGroup.done) {
++            return undefined;
++        }
++
++        return {device, parsedTopic, data, message};
++    }
++
++    private touchesPending(parsedTopic: CoalesceTopic): boolean {
++        const entity = this.zigbee.resolveEntity(parsedTopic.ID);
++
++        if (entity instanceof Device) {
++            return this.pending.has(entity.ID);
++        }
++
++        return !!entity && entity.zh.members.some((m) => this.pending.has(m.deviceIeeeAddress));
++    }
++
++    /**
++     * Какие группы покрывают пачку: все участники группы получили эту команду (по своей основной
++     * точке, без повторов), группа не меньше 2 участников, конвертеры у группы и у каждого участника
++     * те же. Жадно: сначала самые большие, без пересечений. Остальное — по отдельности.
++     */
++    private plan(batch: Item[]): {groups: [Group, KeyValue][]; rest: Item[]} {
++        const rest = new Map(batch.map((i) => [i.device.ID, i]));
++
++        if (batch.length < 2) {
++            return {groups: [], rest: batch};
++        }
++
++        const keys = Object.keys(batch[0].message);
++        const candidates: Group[] = [];
++
++        for (const group of this.zigbee.groupsIterator((g) => g.members.length >= 2 && g.members.length <= batch.length)) {
++            if (this.covers(group, rest, keys)) {
++                candidates.push(group);
++            }
++        }
++
++        candidates.sort((a, b) => b.zh.members.length - a.zh.members.length || a.ID - b.ID);
++        const groups: [Group, KeyValue][] = [];
++
++        for (const group of candidates) {
++            const members = group.zh.members.map((m) => m.deviceIeeeAddress);
++
++            if (members.every((ieee) => rest.has(ieee))) {
++                // biome-ignore lint/style/noNonNullAssertion: проверено строкой выше
++                groups.push([group, rest.get(members[0])!.message]);
++
++                for (const ieee of members) {
++                    rest.delete(ieee);
++                }
++            }
++        }
++
++        return {groups, rest: [...rest.values()]};
++    }
++
++    private covers(group: Group, items: Map<string, Item>, keys: string[]): boolean {
++        const seen = new Set<string>();
++        const groupConverters = Array.from(new Set(group.membersDefinitions().flatMap((d) => d.toZigbee)));
++        const find = (converters: ReadonlyArray<zhc.Tz.Converter>, key: string, device: boolean): zhc.Tz.Converter | undefined =>
++            converters.find((c) => (!c.key || c.key.includes(key)) && (!device || !c.endpoints));
++
++        for (const member of group.zh.members) {
++            const item = items.get(member.deviceIeeeAddress);
++
++            if (!item || seen.has(member.deviceIeeeAddress) || item.device.endpoint()?.ID !== member.ID) {
++                return false;
++            }
++
++            seen.add(member.deviceIeeeAddress);
++            const clusters = member.getInputClusters().map((c) => c.name);
++            const deviceOptions = item.device.options as KeyValue;
++            const groupOptions = group.options as KeyValue;
++
++            for (const key of keys) {
++                const cluster = KEYS[key].cluster;
++                // biome-ignore lint/style/noNonNullAssertion: в пачку попадают только устройства с definition
++                const converter = find(item.device.definition!.toZigbee, key, true);
++
++                if ((cluster && !clusters.includes(cluster)) || !converter?.convertSet || converter !== find(groupConverters, key, false)) {
++                    return false;
++                }
++            }
++
++            if (OPTIONS_MUST_MATCH.some((o) => deviceOptions[o] !== groupOptions[o])) {
++                return false;
++            }
++        }
++
++        return true;
++    }
++}
+diff --git a/lib/util/settings.schema.json b/lib/util/settings.schema.json
+index 51d0a12..fae28cd 100644
+--- a/lib/util/settings.schema.json
++++ b/lib/util/settings.schema.json
+@@ -824,6 +824,20 @@
+                     "description": "Enable external JavaScript (extensions and converters) that can execute arbitrary user-provided code. WARNING: If unused, it is advised to disable this.",
+                     "default": true,
+                     "requiresRestart": true
++                },
++                "bms_group_coalescing": {
++                    "type": "boolean",
++                    "title": "BMS: group command coalescing",
++                    "description": "Identical set commands (state on/off, brightness, color_temp, transition) sent to several devices within a short window are sent as one Zigbee group command to existing groups whose members all received the command",
++                    "default": true
++                },
++                "bms_group_coalescing_window": {
++                    "type": "number",
++                    "title": "BMS: group command coalescing window (ms)",
++                    "description": "How long to wait for more identical commands, counted from the last one (at most 4 windows from the first)",
++                    "minimum": 10,
++                    "maximum": 1000,
++                    "default": 50
+                 }
+             }
+         },
+diff --git a/lib/util/settings.ts b/lib/util/settings.ts
+index 168f93a..40175e3 100644
+--- a/lib/util/settings.ts
++++ b/lib/util/settings.ts
+@@ -114,6 +114,8 @@ export const defaults = {
+         timestamp_format: "YYYY-MM-DD HH:mm:ss",
+         output: "json",
+         enable_external_js: true,
++        bms_group_coalescing: true,
++        bms_group_coalescing_window: 50,
+     },
+     health: {
+         interval: 10,
+diff --git a/test/extensions/bmsGroupCoalescing.test.ts b/test/extensions/bmsGroupCoalescing.test.ts
+new file mode 100644
+index 0000000..73e0612
+--- /dev/null
++++ b/test/extensions/bmsGroupCoalescing.test.ts
+@@ -0,0 +1,327 @@
++// BMS: склейка одинаковых команд нескольким устройствам в групповую (lib/util/bmsGroupCoalescing.ts).
++// biome-ignore assist/source/organizeImports: import mocks first
++import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
++import * as data from "../mocks/data";
++import {mockLogger} from "../mocks/logger";
++import {events as mockMQTTEvents, mockMQTTPublishAsync} from "../mocks/mqtt";
++import * as mockSleep from "../mocks/sleep";
++import {flushPromises} from "../mocks/utils";
++import {devices, groups, resetGroupMembers} from "../mocks/zigbeeHerdsman";
++
++import {clearGlobalStore} from "zigbee-herdsman-converters";
++import {Controller} from "../../lib/controller";
++import type Device from "../../lib/model/device";
++import {loadTopicGetSetRegex} from "../../lib/extension/publish";
++import * as settings from "../../lib/util/settings";
++import {stringify} from "../../lib/util/stringify";
++
++describe("BMS: group command coalescing", () => {
++    let controller: Controller;
++    const bulbColor = devices.bulb_color.getEndpoint(1)!;
++    const bulbColor2 = devices.bulb_color_2.getEndpoint(1)!;
++    const bulb2 = devices.bulb_2.getEndpoint(1)!;
++    const bulb = devices.bulb.getEndpoint(1)!;
++    // Третья лампа Hue (другая модель, те же конвертеры, что у bulb_color*); основная точка — 1.
++    const twilight = devices.hue_twilight.getEndpoint(1)!;
++    const allEndpoints = [bulbColor, bulbColor2, bulb2, bulb, twilight];
++
++    const set = async (name: string, payload: Record<string, unknown> | string): Promise<void> => {
++        await mockMQTTEvents.message(`zigbee2mqtt/${name}/set`, typeof payload === "string" ? payload : stringify(payload));
++    };
++    const passWindow = async (ms = 50): Promise<void> => {
++        await vi.advanceTimersByTimeAsync(ms);
++        await flushPromises();
++    };
++    const published = (topic: string): Record<string, unknown>[] =>
++        mockMQTTPublishAsync.mock.calls.filter((c) => c[0] === `zigbee2mqtt/${topic}`).map((c) => JSON.parse(c[1]));
++    const coalesceLog = (): string[] =>
++        mockLogger.info.mock.calls.map((c) => c[0]).filter((m): m is string => typeof m === "string" && m.startsWith("BMS: склеено"));
++
++    beforeAll(async () => {
++        vi.useFakeTimers();
++        data.writeEmptyState();
++        controller = new Controller(vi.fn(), vi.fn());
++        mockSleep.mock();
++        await controller.start();
++        await flushPromises();
++    });
++
++    beforeEach(() => {
++        data.writeDefaultConfiguration();
++        controller.state.clear();
++        settings.reRead();
++        loadTopicGetSetRegex();
++        // Группы — только те, что задаёт сам тест: группы из общих фикстур давали бы лишние совпадения.
++        for (const group of Object.values(groups)) {
++            group.members = [];
++            group.command.mockClear();
++        }
++        for (const ep of allEndpoints) {
++            ep.command.mockClear();
++            ep.read.mockClear();
++        }
++        mockMQTTPublishAsync.mockClear();
++        mockLogger.info.mockClear();
++        clearGlobalStore();
++    });
++
++    afterEach(async () => {
++        await passWindow(1000);
++        resetGroupMembers();
++    });
++
++    afterAll(async () => {
++        await vi.runOnlyPendingTimersAsync();
++        mockSleep.restore();
++        await controller?.stop();
++        await flushPromises();
++        vi.useRealTimers();
++    });
++
++    it("is on by default", () => {
++        expect(settings.get().advanced.bms_group_coalescing).toBe(true);
++        expect(settings.get().advanced.bms_group_coalescing_window).toBe(50);
++    });
++
++    it("sends one group command when the batch is exactly a group", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        await set("bulb_color", {state: "OFF"});
++        await set("bulb_color_2", "OFF");
++        await flushPromises();
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++
++        await passWindow();
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_1.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(bulbColor.command).toHaveBeenCalledTimes(0);
++        expect(bulbColor2.command).toHaveBeenCalledTimes(0);
++        expect(coalesceLog()).toStrictEqual(["BMS: склеено 2 команд → группы [group_1] + 0 по отдельности"]);
++        // Состояния — как при команде на группу: и группа, и каждый участник.
++        expect(published("group_1")).toStrictEqual([{state: "OFF"}]);
++        expect(published("bulb_color")).toStrictEqual([{state: "OFF"}]);
++        expect(published("bulb_color_2")).toStrictEqual([{state: "OFF"}]);
++    });
++
++    it("sends the group plus the rest one by one when the batch is wider than a group", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        // bulb_2 в группе с лампой, которой команды нет: группа не подходит, а сама команда ждёт пачку.
++        groups.group_2.members.push(bulb2, bulb);
++        await set("bulb_color", {state: "ON", brightness: 100});
++        await set("bulb_2", {brightness: 100, state: "ON"});
++        await set("bulb_color_2", {state: "ON", brightness: 100});
++        await passWindow();
++
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_1.command).toHaveBeenCalledWith(
++            "genLevelCtrl",
++            "moveToLevelWithOnOff",
++            {level: 100, transtime: 0, optionsMask: 0, optionsOverride: 0},
++            {},
++        );
++        expect(bulbColor.command).toHaveBeenCalledTimes(0);
++        expect(bulbColor2.command).toHaveBeenCalledTimes(0);
++        expect(bulb2.command).toHaveBeenCalledTimes(1);
++        expect(bulb2.command).toHaveBeenCalledWith(
++            "genLevelCtrl",
++            "moveToLevelWithOnOff",
++            {level: 100, transtime: 0, optionsMask: 0, optionsOverride: 0},
++            {},
++        );
++        expect(coalesceLog()).toStrictEqual(["BMS: склеено 3 команд → группы [group_1] + 1 по отдельности"]);
++        expect(published("bulb_color")).toStrictEqual([{state: "ON", brightness: 100}]);
++        expect(published("bulb_2")).toStrictEqual([{state: "ON", brightness: 100}]);
++    });
++
++    it("picks the biggest groups first and never sends to overlapping groups", async () => {
++        // В фикстурах нет третьей и четвёртой лампы той же модели, а конвертеры Hue создаются на каждую
++        // модель свои (такие группы склейка не берёт — см. тест ниже). На время теста даём hue_twilight
++        // и bulb_2 определение bulb_color.
++        const hacked = ["hue_twilight", "bulb_2"].map((name) => controller.zigbee.resolveEntity(name) as Device);
++        const saved = hacked.map((d) => d.definition);
++        for (const d of hacked) d.definition = (controller.zigbee.resolveEntity("bulb_color") as Device).definition;
++        groups.group_2.members.push(bulbColor, bulbColor2, twilight);
++        // Пересекается с group_2 по hue_twilight: после group_2 её брать нельзя, иначе twilight получит команду дважды.
++        groups.group_1.members.push(twilight, bulb2);
++        // Целиком внутри group_2.
++        groups.group_tradfri_remote.members.push(bulbColor, bulbColor2);
++        for (const name of ["bulb_color", "bulb_color_2", "hue_twilight", "bulb_2"]) await set(name, {state: "OFF"});
++        await passWindow();
++        hacked.forEach((d, i) => {
++            d.definition = saved[i];
++        });
++
++        expect(groups.group_2.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_2.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        expect(groups.group_tradfri_remote.command).toHaveBeenCalledTimes(0);
++        expect(bulb2.command).toHaveBeenCalledTimes(1);
++        expect(bulb2.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        for (const ep of [bulbColor, bulbColor2, twilight]) expect(ep.command).toHaveBeenCalledTimes(0);
++        expect(coalesceLog()).toStrictEqual(["BMS: склеено 4 команд → группы [group_2] + 1 по отдельности"]);
++    });
++
++    it("does not use a group whose members need different converters", async () => {
++        // Hue (bulb_color*) и TRADFRI (bulb_2) включаются разными конвертерами: групповая команда Z2M
++        // пошла бы через конвертер Hue и для TRADFRI — это не та же команда, что одноадресная.
++        groups.group_2.members.push(bulbColor, bulbColor2, bulb2);
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        for (const name of ["bulb_color", "bulb_color_2", "bulb_2"]) await set(name, {state: "OFF"});
++        await passWindow();
++
++        expect(groups.group_2.command).toHaveBeenCalledTimes(0);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        expect(bulb2.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(coalesceLog()).toStrictEqual(["BMS: склеено 3 команд → группы [group_1] + 1 по отдельности"]);
++    });
++
++    it("does not use a group when one of its members did not get the command", async () => {
++        groups.group_2.members.push(bulbColor, bulbColor2, bulb2);
++        await set("bulb_color", {state: "OFF"});
++        await set("bulb_color_2", {state: "OFF"});
++        await passWindow();
++
++        expect(groups.group_2.command).toHaveBeenCalledTimes(0);
++        expect(bulbColor.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(bulbColor2.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(coalesceLog()).toStrictEqual([]);
++    });
++
++    it("does not coalesce different payloads", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        await set("bulb_color", {state: "OFF"});
++        await set("bulb_color_2", {state: "ON"});
++        await passWindow();
++
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        expect(bulbColor.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(bulbColor2.command).toHaveBeenCalledWith("genOnOff", "on", {}, {});
++    });
++
++    it("sends a single command unchanged, right after the window", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        await set("bulb_color", {state: "OFF"});
++        await passWindow(49);
++        expect(bulbColor.command).toHaveBeenCalledTimes(0);
++
++        await passWindow(1);
++        expect(bulbColor.command).toHaveBeenCalledTimes(1);
++        expect(bulbColor.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        expect(published("bulb_color")).toStrictEqual([{state: "OFF"}]);
++        expect(coalesceLog()).toStrictEqual([]);
++    });
++
++    it("does not delay devices that are in no group", async () => {
++        await set("bulb_color", {state: "OFF"});
++        await flushPromises();
++        expect(bulbColor.command).toHaveBeenCalledTimes(1);
++    });
++
++    it("does not delay commands it cannot coalesce (toggle, color, endpoint, get)", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        await set("bulb_color", {state: "TOGGLE"});
++        await set("bulb_color_2", {color: {x: 0.1, y: 0.2}});
++        await mockMQTTEvents.message("zigbee2mqtt/bulb_color/1/set", stringify({state: "OFF"}));
++        await mockMQTTEvents.message("zigbee2mqtt/bulb_color_2/get", stringify({state: ""}));
++        await flushPromises();
++        expect(bulbColor.command).toHaveBeenCalledTimes(2);
++        expect(bulbColor2.command).toHaveBeenCalledTimes(1);
++        expect(bulbColor2.read).toHaveBeenCalledWith("genOnOff", ["onOff"]);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++    });
++
++    it("behaves like upstream when turned off", async () => {
++        settings.set(["advanced", "bms_group_coalescing"], false);
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        await set("bulb_color", {state: "OFF"});
++        await set("bulb_color_2", {state: "OFF"});
++        await flushPromises();
++
++        expect(bulbColor.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(bulbColor2.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        expect(coalesceLog()).toStrictEqual([]);
++    });
++
++    it("keeps the order of commands to one device", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        await set("bulb_color", {state: "ON"});
++        // Не склеивается и относится к ждущему устройству: ждущая пачка уходит первой.
++        await set("bulb_color", {color_temp: "warm"});
++        await flushPromises();
++        expect(bulbColor.command.mock.calls.map((c) => c[1])).toStrictEqual(["on", "moveToColorTemp"]);
++
++        bulbColor.command.mockClear();
++        // Вторая склеиваемая команда тому же устройству: первая уходит сразу, вторая ждёт своё окно.
++        await set("bulb_color", {state: "OFF"});
++        await set("bulb_color", {state: "ON"});
++        await flushPromises();
++        expect(bulbColor.command.mock.calls.map((c) => c[1])).toStrictEqual(["off"]);
++        await passWindow();
++        expect(bulbColor.command.mock.calls.map((c) => c[1])).toStrictEqual(["off", "on"]);
++    });
++
++    it("extends the window from the last command, but not beyond 4 windows", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        groups.group_2.members.push(bulb2, bulb);
++        await set("bulb_color", {state: "OFF"});
++        await passWindow(40);
++        await set("bulb_color_2", {state: "OFF"});
++        await passWindow(40);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        await set("bulb_2", {state: "OFF"});
++        await passWindow(40);
++        await set("bulb", {state: "OFF"});
++        // 120 мс от первой команды: до предела (200 мс) осталось 80, окно 50 — ждём 50.
++        await passWindow(49);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        await passWindow(1);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        expect(groups.group_2.command).toHaveBeenCalledTimes(1);
++        expect(coalesceLog()).toStrictEqual(["BMS: склеено 4 команд → группы [group_1, group_2] + 0 по отдельности"]);
++    });
++
++    it("sends the batch after 4 windows even if commands keep coming", async () => {
++        settings.set(["advanced", "bms_group_coalescing_window"], 30);
++        const plug = devices.ZNCZ02LM.getEndpoint(1)!;
++        plug.command.mockClear();
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        groups.group_2.members.push(bulb2, bulb, plug);
++        // Каждые 25 мс новая команда продлевает окно (30 мс), но предел — 4 окна = 120 мс от первой.
++        const names = ["bulb_color", "bulb_color_2", "bulb_2", "bulb", "power_plug"];
++        for (const [i, name] of names.entries()) {
++            if (i) await passWindow(25);
++            await set(name, {state: "OFF"});
++        }
++        // Сейчас 100 мс: обычное окно дало бы 130, предел — 120.
++        await passWindow(19);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        expect(plug.command).toHaveBeenCalledTimes(0);
++        await passWindow(1);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        // Группа 2 (лампы и розетка) — разные конвертеры: её участники ушли по отдельности.
++        expect(groups.group_2.command).toHaveBeenCalledTimes(0);
++        expect(plug.command).toHaveBeenCalledWith("genOnOff", "off", {}, {});
++    });
++
++    it("uses the configured window", async () => {
++        settings.set(["advanced", "bms_group_coalescing_window"], 100);
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        await set("bulb_color", {state: "OFF"});
++        await set("bulb_color_2", {state: "OFF"});
++        await passWindow(99);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        await passWindow(1);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++    });
++
++    it("does not use a group whose member is a non-default endpoint", async () => {
++        const qbkg = devices.QBKG03LM.getEndpoint(2)!;
++        groups.group_1.members.push(bulbColor, qbkg);
++        await set("bulb_color", {state: "OFF"});
++        await set("wall_switch_double", {state: "OFF"});
++        await passWindow();
++        expect(groups.group_1.command).toHaveBeenCalledTimes(0);
++        expect(bulbColor.command).toHaveBeenCalledTimes(1);
++    });
++});
+diff --git a/test/extensions/bridge.test.ts b/test/extensions/bridge.test.ts
+index 3917cac..c8b3022 100644
+--- a/test/extensions/bridge.test.ts
++++ b/test/extensions/bridge.test.ts
+@@ -122,6 +122,8 @@ describe("Extension: Bridge", () => {
+                     advanced: {
+                         adapter_concurrent: undefined,
+                         adapter_delay: undefined,
++                        bms_group_coalescing: true,
++                        bms_group_coalescing_window: 50,
+                         cache_state: true,
+                         cache_state_persistent: true,
+                         cache_state_send_on_startup: true,
+diff --git a/test/extensions/groups.test.ts b/test/extensions/groups.test.ts
+index 0787863..43841e9 100644
+--- a/test/extensions/groups.test.ts
++++ b/test/extensions/groups.test.ts
+@@ -42,6 +42,8 @@ describe("Extension: Groups", () => {
+         resetGroupMembers();
+         data.writeDefaultConfiguration();
+         settings.reRead();
++        // BMS: эти тесты — про штатное поведение (команда уходит сразу); склейку проверяет bmsGroupCoalescing.test.ts.
++        settings.set(["advanced", "bms_group_coalescing"], false);
+         mockMQTTPublishAsync.mockClear();
+         groups.gledopto_group.command.mockClear();
+         zhcGlobalStore.clear();
+diff --git a/test/extensions/publish.test.ts b/test/extensions/publish.test.ts
+index 8c8507e..ed29dd0 100644
+--- a/test/extensions/publish.test.ts
++++ b/test/extensions/publish.test.ts
+@@ -44,6 +44,8 @@ describe("Extension: Publish", () => {
+         data.writeDefaultConfiguration();
+         controller.state.clear();
+         settings.reRead();
++        // BMS: эти тесты — про штатное поведение (команда уходит сразу); склейку проверяет bmsGroupCoalescing.test.ts.
++        settings.set(["advanced", "bms_group_coalescing"], false);
+         loadTopicGetSetRegex();
+         for (const mock of mocksClear) mock.mockClear();
+         for (const key in devices) {

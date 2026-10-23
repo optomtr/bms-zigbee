@@ -7,7 +7,7 @@ name: BMS Zigbee                       # BMS: своё имя
 # BMS: версия = <версия Z2M из versions.json>-bms.<номер нашей сборки>.
 # Часть до «-» Dockerfile берёт как версию Zigbee2MQTT (${BUILD_VERSION%-*}), поэтому
 # менять её руками нельзя: stage.sh сам подтягивает её из versions.json.
-version: 2.14.2-bms.3
+version: 2.14.2-bms.4
 slug: bms_zigbee                       # BMS: свой slug, чтобы жить рядом с официальным Z2M
 description: Zigbee2MQTT с нашим Zigbee-ядром и слоем Tuya для координатора SMLIGHT SLZB-06M
 url: https://github.com/optomtr/bms-zigbee  # BMS: наш репозиторий вместо официального
@@ -21,6 +21,11 @@ services:
 # hassio_role по умолчанию (default) пускает на любой «/…/info», а без hassio_api запрос получает 403.
 # Выше роль (manager и т.д.) не просим — лишние права дополнению ни к чему.
 hassio_api: true
+# BMS: homeassistant_api — доступ к API самого Home Assistant через прокси Supervisor
+# (ws://supervisor/core/websocket с SUPERVISOR_TOKEN). Нужен расширению bms-area-groups: оно читает реестры
+# областей, устройств и сущностей (они есть только в WebSocket API) и держит группы Zigbee по комнатам.
+# Без этого ключа Supervisor не пустит токен дополнения к Core, и расширение выключится одной строкой в журнале.
+homeassistant_api: true
 arch:
   - aarch64
   - amd64

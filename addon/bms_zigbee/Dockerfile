@@ -21,6 +21,9 @@ ARG BUILD_VERSION
 # zigbee-herdsman.tgz лежит там только если его положил stage.sh. Нет файла — собираем
 # штатный zigbee-herdsman, как официальное дополнение.
 COPY vendor /vendor
+# BMS: наши патчи к самому Z2M (z2m-patches/*.patch, по порядку имён) — накладываются на исходники
+# закреплённой версии до сборки. Что делает каждый — текст в начале файла патча.
+COPY z2m-patches /z2m-patches
 
 RUN apk add --no-cache --virtual .buildtools npm make gcc g++ linux-headers udev git python3 && \
     if [ "${BUILD_VERSION}" = "edge" ]; \
@@ -41,6 +44,14 @@ RUN apk add --no-cache --virtual .buildtools npm make gcc g++ linux-headers udev
     fi; \
     echo "Installed Zigbee2MQTT @ version $(cat /app/dist/.hash)" && \
     cd /app && \
+    # BMS: патчи Z2M — строго: не лёг хоть один, сборка падает и называет его. «Skipped patch» ловим
+    # отдельно: git apply внутри чужого git-репозитория молча пропускает файлы и выходит с кодом 0.
+    for p in /z2m-patches/*.patch; do \
+        [ -e "$p" ] || continue; \
+        out="$(git apply --verbose "$p" 2>&1)" && case "$out" in *"Skipped patch"*) false ;; esac || \
+            { echo "$out"; echo "BMS: ОШИБКА: патч Z2M $(basename "$p") не лёг на версию $(cat /app/dist/.hash)"; exit 1; }; \
+        echo "BMS: наложен патч Z2M $(basename "$p")"; \
+    done && \
     npm install -g $(jq -r '.packageManager' package.json) && \
     # BMS: если в vendor/ лежит наше ядро — подменяем им zigbee-herdsman целиком (и тот, что
     # просит сам Z2M, и тот, что просит zigbee-herdsman-converters, иначе в образе окажутся две
