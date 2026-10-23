@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "build_version": "2.14.2-bms.7",
+  "zigbee2mqtt": "2.14.2",
+  "converters": "26.115.1",
+  "herdsman": "10.10.0-bms.3",
+  "core_patches": [
+    "0001-aps-retry-unicast.patch",
+    "0002-rejoin-power-and-routes.patch",
+    "0003-energy-scan-cli.patch",
+    "0004-coordinator-probe-cli.patch",
+    "0005-response-retry-and-confirmed-power.patch"
+  ],
+  "core_files": {
+    "dist/controller/model/device.js": "f42bea49a9213086f7f6e1c9cfeee32479819fbce94732457b5d2237ed76b29f",
+    "dist/adapter/ember/adapter/emberAdapter.js": "c0c62d0d7e1ad960910ef4e4fd6cebec0433940b3d606775ccb296b9985ff739"
+  },
+  "z2m_patches": [
+    "0001-group-coalescing.patch",
+    "0002-group-throttle.patch",
+    "0003-group-coalescing-endpoints.patch",
+    "0004-command-scheduler.patch",
+    "0005-device-report-provenance.patch"
+  ],
+  "source_tree_sha256": "a1a5a9fd352ba59a8d45cde47a1b454eb62f77b7304e9ea3d82e369364ce3473",
+  "files": {
+    "vendor/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vendor/zigbee-herdsman.tgz": "e990da61731f3d4d7c46cecaf74ab60bccfd6a14483f5e5f36be107e7b966e8e",
+    "z2m-patches/0001-group-coalescing.patch": "2a9fa24defb9a3cf8569c09e98ce78a06ac85ab45c9287efaef7cdb115cb83bd",
+    "z2m-patches/0002-group-throttle.patch": "4bb98a9c36a4026a73d98aeff3cf74bc94d89f9e7f810ead17b478af20104670",
+    "z2m-patches/0003-group-coalescing-endpoints.patch": "050557795fb4102d6a6a6d487311d1de8b7f4ce97796d5cca9f60477da0d92b2",
+    "z2m-patches/0004-command-scheduler.patch": "dc3a965c8d1f2fb9a9880ecd85ff525ce270d6e13d729b986fa54ef93a2d013a",
+    "z2m-patches/0005-device-report-provenance.patch": "8d53f82134c425c012e7747e0b75594a0ef7835f956c57829097d8a5e082480c",
+    "bms-layer/bms-models.example.yaml": "88e1a382cffbceeefe905a121ae0f2131319ef22116b32c8cd276b37b074646e",
+    "bms-layer/external_converters/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bms-layer/external_converters/bms-models.mjs": "9b059f0d0ca1be8e45effeda830b31021d2c6c1d8f49fd7c36b444b95ebc0486",
+    "bms-layer/external_extensions/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "bms-layer/external_extensions/bms-area-groups.mjs": "3f5416e431d8f68bc4aba3a68291ebde337d76b0a02465c12245dd46c2966606",
+    "bms-layer/external_extensions/bms-lib/group-membership.mjs": "4984e6c1dba7fc2447b99ef46a4af1ca5665712d7cb03ca00d70e3d4b4c78397",
+    "bms-layer/external_extensions/bms-tuya-service.mjs": "2266746b3c30cef95e30b7881d5e60bd05e1ab87daac8a57e8208817165b42cd",
+    "rootfs/docker-entrypoint.sh": "4147c964c00b876a570bd540db0ddaeb3d1183485709c9c7bb97292c571d0f52",
+    "rootfs/opt/bms/coordinator.sh": "2950ff2c680297176f8b6c0936e2e08cfb2208085f66276e9b45309096f4bc12",
+    "rootfs/opt/bms/seed-config.js": "6df8e26f2c16a1a7bd3b509e4cd1b5fef0ba45992dc59b445dcca727e8004ccc",
+    "rootfs/opt/bms/verify-build.js": "3677742324b1291db372cbae1db05f70d16656c848b7e974dc0a1bfbf5769ef2"
+  }
+}

@@ -18,9 +18,10 @@ FROM base as dependencies_and_build
 ARG BUILD_VERSION
 
 # BMS: каталог vendor/ есть всегда (в нём .gitkeep), чтобы COPY не падал; наше ядро
-# zigbee-herdsman.tgz лежит там только если его положил stage.sh. Нет файла — собираем
-# штатный zigbee-herdsman, как официальное дополнение.
+# zigbee-herdsman.tgz и паспорт обязательны: отсутствие — ошибка сборки.
 COPY vendor /vendor
+COPY build-manifest.json /bms-build-manifest.json
+RUN test -s /vendor/zigbee-herdsman.tgz || (echo "BMS: обязательное ядро отсутствует" && exit 1)
 # BMS: наши патчи к самому Z2M (z2m-patches/*.patch, по порядку имён) — накладываются на исходники
 # закреплённой версии до сборки. Что делает каждый — текст в начале файла патча.
 COPY z2m-patches /z2m-patches
@@ -64,7 +65,7 @@ RUN apk add --no-cache --virtual .buildtools npm make gcc g++ linux-headers udev
         printf '\noverrides:\n  zigbee-herdsman: file:/vendor/zigbee-herdsman.tgz\n' >> pnpm-workspace.yaml && \
         FROZEN="--no-frozen-lockfile" ; \
     else \
-        echo "BMS: vendor/zigbee-herdsman.tgz нет — штатный zigbee-herdsman, как в официальном дополнении" ; \
+        echo "BMS: обязательное ядро отсутствует"; exit 1 ; \
     fi && \
     pnpm install $FROZEN --unsafe-perm && \
     pnpm run build && \
@@ -85,9 +86,12 @@ COPY rootfs /
 # при каждом запуске копирует docker-entrypoint.sh: папка данных живёт на диске Home Assistant,
 # а обновление дополнения должно обновлять и слой.
 COPY bms-layer /opt/bms-layer
+COPY build-manifest.json /opt/bms-build-manifest.json
 COPY --from=dependencies_and_build /app/node_modules ./node_modules
 COPY --from=dependencies_and_build /app/dist ./dist
 COPY --from=dependencies_and_build /app/package.json /app/LICENSE /app/index.js ./
+
+RUN node /opt/bms/verify-build.js
 
 ENV NODE_ENV production
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from zamer import config as config_mod
 from zamer.tuya_ha import EVENT_DP, EVENT_PUSH, EVENT_STATUS
@@ -77,6 +78,7 @@ class FakeZ2M:
         self.delay = delay
         self.behavior: dict[str, str] = {}  # confirm | fail | silent | unrelated
         self.state: dict[str, dict] = {}
+        self.sequence = 0
         mqtt.listeners.append(self._on_publish)
 
     def bridge_info(self, names, optimistic=None, device_options=None, extra=None) -> None:
@@ -87,7 +89,8 @@ class FakeZ2M:
                 opts["optimistic"] = optimistic
             opts.update((extra or {}).get(name, {}))
             devices[f"0x{i:016x}"] = opts
-        self.mqtt.deliver(f"{BASE}/bridge/info", {"config": {"devices": devices, "device_options": device_options or {}}},
+        self.capabilities()
+        self.mqtt.deliver(f"{BASE}/bridge/info", {"config": {"advanced": {"bms_device_reports": True}, "devices": devices, "device_options": device_options or {}}},
                           retained=True)
 
     def _on_publish(self, topic: str, payload: str) -> None:
@@ -95,10 +98,13 @@ class FakeZ2M:
             return
         fn = topic[len(BASE) + 1: -len("/set")]
         cmd = json.loads(payload)
+        self.capabilities()
+        command_id = cmd.pop("__bms_command_id", None)
+        self.mqtt.deliver(f"{BASE}/bridge/bms/tx_event", {"schema":1,"kind":"mqtt_intent","command_id":command_id,"received_at":time.time()*1000})
         loop = asyncio.get_running_loop()
         behavior = self.behavior.get(fn, "confirm")
         if self.optimistic:
-            loop.call_soon(self.publish_state, fn, cmd)
+            loop.call_soon(self.mqtt.deliver, f"{BASE}/{fn}", cmd)
         if behavior == "confirm":
             loop.call_later(self.delay, self.publish_state, fn, cmd)
         elif behavior == "fail":
@@ -109,7 +115,18 @@ class FakeZ2M:
             # Посторонний отчёт (мощность): Z2M кладёт в него весь кэш, включая СТАРЫЙ state.
             loop.call_later(self.delay, self.publish_state, fn, {"power": 12.5})
 
+    def capabilities(self):
+        self.mqtt.deliver(f"{BASE}/bridge/bms/capabilities", {"schema": 1, "device_reports": True, "command_correlation": True, "session_id": "test-session"}, retained=True)
+
     def publish_state(self, fn: str, update: dict) -> None:
+        self.capabilities()
+        self.sequence += 1
+        raw = {"onOff": int(update["state"] == "ON")} if update.get("state") in ("ON", "OFF") else dict(update)
+        self.mqtt.deliver(f"{BASE}/bridge/bms/device_report", {
+            "schema": 1, "source": "device", "session_id": "test-session", "sequence": self.sequence,
+            "received_at": time.time() * 1000, "friendly_name": fn, "ieee_address": "0x01", "endpoint": 1,
+            "cluster": "genOnOff" if "onOff" in raw else "testCluster", "type": "attributeReport", "raw": raw, "payload": update,
+        })
         st = self.state.setdefault(fn, {})
         st.update(update)
         self.mqtt.deliver(f"{BASE}/{fn}", dict(st))

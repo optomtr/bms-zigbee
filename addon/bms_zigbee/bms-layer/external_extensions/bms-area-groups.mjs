@@ -17,6 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
+import {groupMembership} from "./bms-lib/group-membership.mjs";
 
 const NS = "bms:area-groups";
 export const PREFIX = "Комната · ";
@@ -30,7 +31,7 @@ export const DEFAULT_URL = "ws://supervisor/core/websocket";
 // реестров (переименование области в HA даёт пачку событий); pause — между командами в эфир: пачка
 // genGroups.add на живой сети забивала эфир и ловила таймауты; reply — ждём ответа bridge (add к спящему/
 // дальнему устройству идёт с повторами zigbee-herdsman); retry — повтор после неудачи, растёт до retryMax.
-export const TIMING = {startDelay: 30_000, debounce: 10_000, pause: 1500, reply: 90_000, retry: 120_000, retryMax: 1_800_000, reconnect: 10_000, reconnectMax: 300_000};
+export const TIMING = {startDelay: 30_000, debounce: 10_000, pause: 1500, reply: 90_000, retry: 120_000, retryMax: 1_800_000, reconnect: 10_000, reconnectMax: 300_000, connect: 15_000, auth: 15_000, request: 20_000};
 
 export const groupName = (areaName) =>
     // Z2M не пускает в имя «#», «+» (шаблоны MQTT) и «/цифры» в конце (utils.ts: validateFriendlyName).
@@ -83,15 +84,17 @@ export function desiredAreas({areas, devices, entities}, z2mDevices, baseTopic) 
 /** Клиент WebSocket API Home Assistant: вход по токену, вызовы с ответом, подписка на события, переподключение. */
 export class HaClient {
     constructor({url, token, WebSocket, timing, onReady, onEvent, onFatal, onDown}) {
-        Object.assign(this, {url, token, WebSocket, timing, onReady, onEvent, onFatal, onDown});
+        Object.assign(this, {url, token, WebSocket, onReady, onEvent, onFatal, onDown});
+        this.timing = {...TIMING, ...timing};
         this.seq = 0;
         this.calls = new Map();
         this.closed = false;
-        this.backoff = timing.reconnect;
+        this.backoff = this.timing.reconnect;
     }
 
     connect() {
-        if (this.closed) return;
+        if (this.closed || this.ws) return;
+        clearTimeout(this.timer);
         let ws;
         try {
             ws = new this.WebSocket(this.url);
@@ -100,18 +103,43 @@ export class HaClient {
             return;
         }
         this.ws = ws;
-        ws.addEventListener("message", (ev) => this.onMessage(ws, ev.data));
-        ws.addEventListener("error", () => {}); // причина придёт в close; без слушателя ws бросил бы исключение
-        ws.addEventListener("close", (ev) => {
-            if (this.ws !== ws) return;
-            this.ws = undefined;
-            this.down(ev?.reason || `соединение закрыто (${ev?.code ?? "?"})`);
+        this.authenticated = false;
+        this.deadline(ws, this.timing.connect, "таймаут подключения");
+        ws.addEventListener("open", () => {
+            if (this.ws === ws) this.deadline(ws, this.timing.auth, "таймаут авторизации");
         });
+        ws.addEventListener("message", (ev) => this.onMessage(ws, ev.data));
+        ws.addEventListener("error", () => this.disconnect(ws, "ошибка WebSocket"));
+        ws.addEventListener("close", (ev) => this.disconnect(ws, ev?.reason || `соединение закрыто (${ev?.code ?? "?"})`));
+    }
+
+    deadline(ws, delay, reason) {
+        clearTimeout(this.phaseTimer);
+        this.phaseTimer = setTimeout(() => this.disconnect(ws, reason), delay);
+    }
+
+    disconnect(ws, reason) {
+        if (this.ws !== ws) return;
+        this.ws = undefined;
+        this.authenticated = false;
+        clearTimeout(this.phaseTimer);
+        // Сначала отвязываем сокет: синхронный close и запоздалый result старого
+        // соединения не должны ломать новое и создавать два таймера переподключения.
+        try { ws.close(); } catch {}
+        this.down(reason);
+    }
+
+    rejectCalls(reason) {
+        for (const [, c] of this.calls) {
+            clearTimeout(c.timer);
+            c.reject(new Error(`Home Assistant: ${reason}`));
+        }
+        this.calls.clear();
     }
 
     down(reason) {
-        for (const [, c] of this.calls) c.reject(new Error(`Home Assistant: ${reason}`));
-        this.calls.clear();
+        this.rejectCalls(reason);
+        clearTimeout(this.timer);
         if (this.closed) return;
         this.onDown?.(reason);
         this.timer = setTimeout(() => this.connect(), this.backoff);
@@ -119,57 +147,63 @@ export class HaClient {
     }
 
     async onMessage(ws, raw) {
+        if (this.ws !== ws || this.closed) return;
         let msg;
-        try {
-            msg = JSON.parse(String(raw));
-        } catch {
-            return;
-        }
+        try { msg = JSON.parse(String(raw)); } catch { return; }
         if (msg.type === "auth_required") {
-            ws.send(JSON.stringify({type: "auth", access_token: this.token}));
+            this.deadline(ws, this.timing.auth, "таймаут авторизации");
+            try { ws.send(JSON.stringify({type: "auth", access_token: this.token})); }
+            catch (error) { this.disconnect(ws, error.message); }
         } else if (msg.type === "auth_invalid") {
-            // Токен не принят: дополнению не дали homeassistant_api. Повторять бессмысленно.
             this.close();
             this.onFatal?.(msg.message ?? "auth_invalid");
         } else if (msg.type === "auth_ok") {
-            this.backoff = this.timing.reconnect;
+            if (this.authenticated) return;
+            clearTimeout(this.phaseTimer);
+            this.authenticated = true;
             try {
                 for (const event_type of HA_EVENTS) await this.call("subscribe_events", {event_type});
+                if (this.ws !== ws || this.closed) return;
+                this.backoff = this.timing.reconnect;
                 this.onReady?.();
             } catch (error) {
-                this.onDown?.(error.message);
+                // Неполная подписка не считается рабочим подключением: новый сеанс
+                // заново подпишется на все три реестра, включая уже успешные подписки.
+                this.disconnect(ws, error.message);
             }
         } else if (msg.type === "result") {
             const c = this.calls.get(msg.id);
             if (!c) return;
             this.calls.delete(msg.id);
+            clearTimeout(c.timer);
             if (msg.success) c.resolve(msg.result);
             else c.reject(new Error(`Home Assistant: ${msg.error?.message ?? msg.error?.code ?? "ошибка"}`));
-        } else if (msg.type === "event" && HA_EVENTS.includes(msg.event?.event_type)) {
+        } else if (msg.type === "event" && this.authenticated && HA_EVENTS.includes(msg.event?.event_type)) {
             this.onEvent?.(msg.event);
         }
     }
 
     call(type, extra = {}) {
         const ws = this.ws;
-        if (!ws) return Promise.reject(new Error("Home Assistant: нет соединения"));
+        if (!ws || !this.authenticated) return Promise.reject(new Error("Home Assistant: нет авторизованного соединения"));
         const id = ++this.seq;
         return new Promise((resolve, reject) => {
-            this.calls.set(id, {resolve, reject});
-            ws.send(JSON.stringify({id, type, ...extra}));
+            const timer = setTimeout(() => this.disconnect(ws, `нет ответа на ${type} за ${this.timing.request} мс`), this.timing.request);
+            this.calls.set(id, {resolve, reject, timer});
+            try { ws.send(JSON.stringify({id, type, ...extra})); }
+            catch (error) { this.disconnect(ws, error.message); }
         });
     }
 
     close() {
         this.closed = true;
         clearTimeout(this.timer);
+        clearTimeout(this.phaseTimer);
         const ws = this.ws;
         this.ws = undefined;
-        for (const [, c] of this.calls) c.reject(new Error("Home Assistant: соединение закрыто"));
-        this.calls.clear();
-        try {
-            ws?.close();
-        } catch {}
+        this.authenticated = false;
+        this.rejectCalls("соединение закрыто");
+        try { ws?.close(); } catch {}
     }
 }
 
@@ -177,6 +211,7 @@ export default class BmsAreaGroups {
     // 11-й аргумент Z2M не передаёт (externalExtensions.ts:42) — он только для проверок: подставной WebSocket, сроки.
     constructor(zigbee, mqtt, state, publishEntityState, eventBus, enableDisableExtension, restartCallback, addExtension, settings, logger, opts = {}) {
         Object.assign(this, {zigbee, eventBus, settings, logger});
+        this.membership = groupMembership(zigbee);
         this.opts = opts;
         this.timing = {...TIMING, ...opts.timing};
         if (process.env.BMS_AREA_GROUPS_TIMING) Object.assign(this.timing, JSON.parse(process.env.BMS_AREA_GROUPS_TIMING));
@@ -197,6 +232,10 @@ export default class BmsAreaGroups {
         }
         const WebSocket = this.opts.WebSocket ?? globalThis.WebSocket ?? (await import("ws")).default;
         this.eventBus.onMQTTMessagePublished(this, (data) => this.onPublished(data));
+        this.eventBus.onDeviceAnnounce?.(this, () => this.schedule(this.timing.debounce));
+        this.eventBus.onDeviceInterview?.(this, (data) => {
+            if (data.status === "successful") this.schedule(this.timing.debounce);
+        });
         this.startupUntil = Date.now() + this.timing.startDelay;
         let downLogged = false;
         this.ha = new HaClient({
@@ -362,7 +401,19 @@ export default class BmsAreaGroups {
             else ok = false;
         }
         for (const [key, m] of area.members) {
-            if (have.has(key) || this.stopped) continue;
+            if (this.stopped) continue;
+            if (have.has(key)) {
+                try {
+                    const groups = await this.verifyMember(m.ieee, m.endpointID);
+                    if (groups.has(id)) continue;
+                } catch (error) {
+                    this.logger.warning(`BMS: членство '${m.deviceName}/${m.endpointID}' не подтверждено: ${error.message}`, NS);
+                    ok = false;
+                    continue;
+                }
+                // База могла пережить сброс устройства. Повторный add разрешён ZCL,
+                // даже если база уже считает endpoint участником этой группы.
+            }
             if (await this.member("add", area.name, id, m.ieee, m.endpointID, m.deviceName)) done.add.push(`${m.deviceName}/${m.endpointID}`);
             else ok = false;
         }
@@ -399,10 +450,28 @@ export default class BmsAreaGroups {
         if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
         const r = await this.request(`group/members/${action}`, {group: String(id), device: ieee, endpoint});
         this.lastCommandAt = Date.now();
-        if (r.status === "ok") return true;
+        if (r.status === "ok") {
+            try {
+                const groups = await this.verifyMember(ieee, endpoint);
+                if (groups.has(id) !== (action === "add")) throw new Error("устройство не подтвердило новое членство");
+                return true;
+            } catch (error) {
+                this.logger.warning(`BMS: '${deviceName}/${endpoint}' — членство не подтверждено: ${error.message}`, NS);
+                return false;
+            }
+        }
         const verb = action === "add" ? "не добавлено в" : "не убрано из";
         this.logger.warning(`BMS: '${deviceName}' (endpoint ${endpoint}) ${verb} '${groupName}': ${r.error} — повторю позже`, NS);
         return false;
+    }
+
+    async verifyMember(ieee, endpointID) {
+        return this.membership.withDeviceLock(ieee, async () => {
+            const device = this.zigbee.resolveEntity(ieee);
+            const endpoint = device?.zh?.endpoints.find((e) => e.ID === endpointID);
+            if (!endpoint) throw new Error(`нет endpoint ${ieee}/${endpointID}`);
+            return this.membership.verify(endpoint);
+        });
     }
 
     findGroup(id) {

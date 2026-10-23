@@ -108,6 +108,12 @@ function fakeZ2M({devices = [], groups = [], failAdd = new Set()} = {}) {
             ID,
             deviceIeeeAddress: d.ieee,
             supportsInputCluster: (name) => name === "genGroups" && hasGroups,
+            hardwareGroups: new Set(),
+            async command(cluster, command) {
+                assert.equal(cluster, "genGroups");
+                assert.equal(command, "getMembership");
+                return {groupcount: this.hardwareGroups.size, grouplist: [...this.hardwareGroups]};
+            },
         }));
         const names = d.endpointNames ?? {};
         byIeee.set(d.ieee, {
@@ -127,6 +133,7 @@ function fakeZ2M({devices = [], groups = [], failAdd = new Set()} = {}) {
     for (const g of groups) {
         z.settingsGroups[g.id] = {friendly_name: g.name};
         z.zhGroups.set(g.id, {groupID: g.id, members: g.members.map(([ieee, id]) => ep(ieee, id))});
+        for (const [ieee, id] of g.members) ep(ieee, id).hardwareGroups.add(g.id);
     }
     const groupByKey = (key) => {
         const id = z.settingsGroups[key] ? Number(key) : Number(Object.entries(z.settingsGroups).find(([, v]) => v.friendly_name === key)?.[0]);
@@ -190,10 +197,12 @@ function fakeZ2M({devices = [], groups = [], failAdd = new Set()} = {}) {
         if (name === "group/members/add") {
             if (z.failAdd.has(req.device)) throw new Error(`Failed to add to group (Timeout - ${req.device})`);
             z.commands.push({action: "add", group: g.ID, ieee: req.device, ep: e.ID, at: Date.now()});
-            g.zh.members.push(e);
+            if (!g.zh.members.includes(e)) g.zh.members.push(e);
+            e.hardwareGroups.add(g.ID);
         } else if (name === "group/members/remove") {
             z.commands.push({action: "remove", group: g.ID, ieee: req.device, ep: e.ID, at: Date.now()});
             g.zh.members.splice(g.zh.members.indexOf(e), 1);
+            e.hardwareGroups.delete(g.ID);
         }
         return {};
     }
@@ -426,4 +435,25 @@ test("HA перезапустился — переподключение, под
     ha.fire("device_registry_updated");
     await until(() => z.members(1000).length === 4 && !ext.running, "lamp5 на кухне");
     assert.equal(lines().filter((l) => l.startsWith("warning BMS: группы по комнатам — нет связи")).length, 1);
+});
+
+test("A5: база уже содержит участника, но устройство потеряло группу — add и физическая проверка", async () => {
+    const {devices, ha: registries} = house();
+    const z = fakeZ2M({devices, groups: [{id: 1000, name: "Комната · Кухня", members: [[L(1), 1], [L(2), 1], [L(6), 1]]}]});
+    const lost = z.zigbee.resolveEntity(L(1)).endpoint();
+    lost.hardwareGroups.clear();
+    const {ext} = await start(z, fakeHA(registries));
+    await settled(z, ext);
+    assert.ok(z.commands.some((c) => c.action === "add" && c.ieee === L(1) && c.group === 1000));
+    assert.equal(lost.hardwareGroups.has(1000), true);
+    assert.equal(ext.membership.isVerified(z.zigbee.resolveEntity("1000")), true);
+});
+
+test("A5: неподтверждённое физическое членство блокирует оптимизацию группы", async () => {
+    const {devices, ha: registries} = house();
+    const z = fakeZ2M({devices, groups: [{id: 1000, name: "Комната · Кухня", members: [[L(1), 1], [L(2), 1], [L(6), 1]]}]});
+    z.zigbee.resolveEntity(L(1)).endpoint().command = async () => { throw new Error("Timeout"); };
+    const {ext, log} = await start(z, fakeHA(registries));
+    await until(() => log.lines.some((l) => /членство.*не подтверждено/.test(l.msg)), "ошибка проверки членства");
+    assert.equal(ext.membership.isVerified(z.zigbee.resolveEntity("1000")), false);
 });

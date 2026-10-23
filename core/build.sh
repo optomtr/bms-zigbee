@@ -13,7 +13,7 @@
 # Переменные окружения (нужны для проверок, обычно не трогать):
 #   PATCHES_DIR   откуда брать *.patch   (по умолчанию core/patches)
 #   DIST_DIR      куда класть tgz        (по умолчанию core/dist)
-#   TEST_WORKERS  число воркеров vitest  (по умолчанию 2)
+#   TEST_WORKERS  число воркеров vitest  (по умолчанию 1)
 set -euo pipefail
 
 CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,11 +27,11 @@ UPSTREAM_REPO="https://github.com/Koenkk/zigbee-herdsman.git"
 # по умолчанию), а «Controller start» сам занимает ~4,9 с из этих 5. Пока машина
 # занята чем-то ещё, они случайно краснеют, хотя код исправен (замерено: на чистом
 # теге падали то «Controller start», то «Device OTA > throttles»). Поэтому:
-#  - 2 воркера вместо всех ядер — меньше борьбы за процессор;
+#  - 1 воркер: upstream-тесты controller/ember удаляют общую temp/, параллельный запуск гоняется за файлами;
 #  - таймаут теста 30 с;
 #  - до двух повторов упавшего теста: настоящая поломка (в том числе от нашего
 #    патча) красна все три раза, случайный сбой по времени — нет.
-TEST_WORKERS="${TEST_WORKERS:-2}"
+TEST_WORKERS="${TEST_WORKERS:-1}"
 TEST_ARGS=(--maxWorkers="$TEST_WORKERS" --testTimeout=30000 --retry=2)
 
 PREPARE_ONLY=0
@@ -168,12 +168,15 @@ pnpm pack --pack-destination "$DIST_DIR"
 # Проверяем сам архив, а не только то, что мы думаем, что в него положили.
 PACKED_VERSION="$(tar -xzOf "$TGZ" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
 [ "$PACKED_VERSION" = "$OUR_VERSION" ] || die "в tgz версия $PACKED_VERSION, ожидалась $OUR_VERSION"
-tar -tzf "$TGZ" | grep -qx 'package/dist/index.js' || die "в tgz нет package/dist/index.js"
+# GNU tar под pipefail получает SIGPIPE, если grep -q закрыл канал после совпадения.
+# Сначала полностью читаем оглавление: наличие файла не должно выглядеть ошибкой архива.
+TGZ_CONTENTS="$(tar -tzf "$TGZ")" || die "не удалось прочитать оглавление $TGZ"
+grep -qx 'package/dist/index.js' <<<"$TGZ_CONTENTS" || die "в tgz нет package/dist/index.js"
 # Контракт с дополнением: оно зовёт энергоскан по этому пути внутри пакета (патч 0003, см. README).
-tar -tzf "$TGZ" | grep -qx 'package/dist/adapter/ember/bms/energyScanCli.js' \
+grep -qx 'package/dist/adapter/ember/bms/energyScanCli.js' <<<"$TGZ_CONTENTS" \
     || die "в tgz нет package/dist/adapter/ember/bms/energyScanCli.js (контракт энергоскана с дополнением)"
 # И поиск координатора в сети по этому пути (патч 0004, см. README).
-tar -tzf "$TGZ" | grep -qx 'package/dist/adapter/ember/bms/coordinatorCli.js' \
+grep -qx 'package/dist/adapter/ember/bms/coordinatorCli.js' <<<"$TGZ_CONTENTS" \
     || die "в tgz нет package/dist/adapter/ember/bms/coordinatorCli.js (контракт поиска координатора с дополнением)"
 
 if command -v shasum >/dev/null 2>&1; then SHA="$(shasum -a 256 "$TGZ")"; else SHA="$(sha256sum "$TGZ")"; fi

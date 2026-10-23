@@ -1,6 +1,8 @@
 #!/usr/bin/env bashio
 
 bashio::log.info "Preparing to start..."
+# BMS: до подключения к координатору проверяем реальную композицию образа.
+node /opt/bms/verify-build.js || bashio::exit.nok "BMS: состав образа не соответствует паспорту"
 
 # Check if HA supervisor started
 # Workaround for:

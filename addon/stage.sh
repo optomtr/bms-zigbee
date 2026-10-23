@@ -13,14 +13,14 @@
 #                                        ->  bms_zigbee/bms-layer/bms-models.example.yaml (образец для интегратора)
 #   3. подтягивает версию Z2M из versions.json в bms_zigbee/config.yaml
 #
-# Чего нет — пропускает и пишет об этом: сборка без ядра даёт штатный zigbee-herdsman, без слоя — пустой слой.
-# Падает только на настоящих ошибках: битый tgz и синтаксическая ошибка в файле слоя.
+# Ядро обязательно: точная версия из versions.json + core/BMS_REVISION. Штатный fallback запрещён.
+# Отсутствующее/неверное ядро, битый tgz или синтаксическая ошибка слоя останавливают подготовку.
 # Берутся только файлы bms-*: по приставке entrypoint отличает наши файлы от чужих в папке данных.
 # Всё остальное в tuya/layer/... (чужое, вспомогательное) пропускается, но с заметной строкой в выводе.
 #
 # Использование:
 #   ./stage.sh           положить всё, что есть
-#   ./stage.sh --clean   убрать подложенное (вернуться к «как официальное»)
+#   ./stage.sh --clean   убрать подложенное (сборка затем запрещена до stage)
 set -euo pipefail
 
 ADDON_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,44 +70,40 @@ Z2M_VERSION="$(json_get "$VERSIONS_JSON" zigbee2mqtt)" || die "в versions.json 
 [[ "$Z2M_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "версия Z2M '$Z2M_VERSION' в versions.json не вида X.Y.Z"
 CUR_VERSION="$(sed -n 's/^version: *//p' "$APP_DIR/config.yaml" | tr -d "\"' ")"
 [[ "$CUR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-bms\.([0-9]+)$ ]] || die "version в config.yaml ('$CUR_VERSION') не вида X.Y.Z-bms.N"
-BMS_BUILD="${BASH_REMATCH[1]}"
+BMS_BUILD="$(json_get "$VERSIONS_JSON" bms-addon-revision)"
+[[ "$BMS_BUILD" =~ ^[0-9]+$ ]] || die "bms-addon-revision должен быть целым"
 NEW_VERSION="$Z2M_VERSION-bms.$BMS_BUILD"
 if [ "$CUR_VERSION" = "$NEW_VERSION" ]; then
     note "config.yaml: $CUR_VERSION — совпадает с versions.json"
 else
-    # Меняем только Z2M-часть; номер нашей сборки (bms.N) человек поднимает сам, когда выпускает.
+    # Обе части версии берутся из versions.json.
     sed -i.bak "s/^version: .*/version: $NEW_VERSION/" "$APP_DIR/config.yaml" && rm -f "$APP_DIR/config.yaml.bak"
-    note "config.yaml: $CUR_VERSION -> $NEW_VERSION (Z2M из versions.json). Номер сборки bms.$BMS_BUILD при выпуске поднимите сами."
+    note "config.yaml: $CUR_VERSION -> $NEW_VERSION (версия и номер сборки из versions.json)."
 fi
 
 # --- 2. Ядро --------------------------------------------------------------------------------------
 log "Ядро zigbee-herdsman (core/dist -> vendor/)"
-CORE_TGZ=""
-if [ -d "$CORE_DIST" ]; then
-    # Берём самый свежий tgz: после пересборки ядра старые могут лежать рядом.
-    CORE_TGZ="$(ls -t "$CORE_DIST"/zigbee-herdsman-*.tgz 2>/dev/null | head -n 1 || true)"
-fi
-if [ -z "$CORE_TGZ" ]; then
-    miss "в $CORE_DIST нет zigbee-herdsman-*.tgz — ядро не подменяется, соберётся штатный zigbee-herdsman"
-    if [ -f "$VENDOR_TGZ" ]; then
-        note "ВНИМАНИЕ: в vendor/ остался прежний zigbee-herdsman.tgz — он и будет использован. Убрать: ./stage.sh --clean"
-    fi
-else
-    [ "$(ls "$CORE_DIST"/zigbee-herdsman-*.tgz | wc -l)" -le 1 ] || note "в core/dist несколько tgz, взят самый свежий: $(basename "$CORE_TGZ")"
+BASE_HERDSMAN="$(json_get "$VERSIONS_JSON" zigbee-herdsman)"
+CORE_REVISION="$(tr -d '[:space:]' < "$REPO_ROOT/core/BMS_REVISION")"
+CORE_VERSION="$BASE_HERDSMAN-bms.$CORE_REVISION"
+CORE_TGZ="$CORE_DIST/zigbee-herdsman-$CORE_VERSION.tgz"
+[ -f "$CORE_TGZ" ] || die "нет обязательного $CORE_TGZ — сначала собрать ядро; fallback запрещён"
+{
     # Проверка, что это именно собранный пакет herdsman: Dockerfile ставит его как есть и не собирает.
     TGZ_LIST="$(tar -tzf "$CORE_TGZ" 2>/dev/null)" || die "$CORE_TGZ не читается как tgz"
     grep -qx 'package/package.json' <<<"$TGZ_LIST" || die "в $CORE_TGZ нет package/package.json"
     grep -q '^package/dist/' <<<"$TGZ_LIST" || die "в $CORE_TGZ нет package/dist/ — это не собранный пакет (нужен результат npm pack после сборки)"
     PKG_NAME="$(tar -xOzf "$CORE_TGZ" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);console.log(p.name+" "+p.version)})')"
     [ "${PKG_NAME%% *}" = "zigbee-herdsman" ] || die "в $CORE_TGZ пакет '${PKG_NAME%% *}', а нужен zigbee-herdsman"
+    [ "${PKG_NAME#* }" = "$CORE_VERSION" ] || die "ожидалось ядро $CORE_VERSION, получено ${PKG_NAME#* }"
     cp "$CORE_TGZ" "$VENDOR_TGZ"
     note "положено: $(basename "$CORE_TGZ") -> vendor/zigbee-herdsman.tgz (версия ${PKG_NAME#* }, sha256 $(shasum -a 256 "$VENDOR_TGZ" | cut -c1-16)…)"
     BASE_HERDSMAN="$(json_get "$VERSIONS_JSON" zigbee-herdsman || true)"
     case "${PKG_NAME#* }" in
         "$BASE_HERDSMAN"|"$BASE_HERDSMAN"-*) ;;
-        *) note "ВНИМАНИЕ: версия ядра ${PKG_NAME#* } не из линии $BASE_HERDSMAN (versions.json)" ;;
+        *) die "версия ядра ${PKG_NAME#* } не из линии $BASE_HERDSMAN (versions.json)" ;;
     esac
-fi
+}
 
 # --- 3. Слой Tuya ---------------------------------------------------------------------------------
 log "Слой Tuya (tuya/layer -> bms-layer/)"
@@ -157,6 +153,8 @@ else
     miss "tuya/layer/$EXAMPLE_NAME — образца для интегратора в образе не будет"
 fi
 [ "$LAYER_TOTAL" -gt 0 ] || note "слой Tuya пуст — образ соберётся без наших конвертеров и расширений"
+
+node "$ADDON_ROOT/tools/manifest.cjs"
 
 echo
 log "Готово. Дальше: образ собирает Home Assistant при установке (см. README.md), локально — docker build из bms_zigbee/."

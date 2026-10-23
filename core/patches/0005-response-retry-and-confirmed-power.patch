@@ -1,0 +1,540 @@
+BMS: retry default responses after failed sends; bounded identity-aware deduplication.
+Serialize rejoin power changes and update confirmed state only after EZSP success.
+
+diff --git a/src/controller/model/device.ts b/src/controller/model/device.ts
+--- a/src/controller/model/device.ts
++++ b/src/controller/model/device.ts
+@@ -30,6 +30,10 @@
+ import Entity from "./entity";
+ 
+ const NS = "zh:controller:device";
++// BMS: короткое окно подавляет транспортные дубли, но позволяет устройству повторить запрос,
++// если успешная отправка ответа не означала его доставку устройству.
++const DEFAULT_RESPONSE_DEDUP_MSEC = 1000;
++const DEFAULT_RESPONSE_CACHE_LIMIT = 128;
+ 
+ const INTERVIEW_GENBASIC_ATTRIBUTES = [
+     "modelId",
+@@ -71,7 +75,9 @@
+     private _linkquality?: number;
+     private _skipDefaultResponse: boolean;
+     private _customReadResponse?: CustomReadResponse;
+-    private _lastDefaultResponseSequenceNumber?: number;
++    readonly #defaultResponseSuccess = new Map<string, number>();
++    readonly #defaultResponseInflight = new Map<string, Promise<boolean>>();
++    #defaultResponseEpoch = 0;
+     private _checkinInterval?: number;
+     private _pendingRequestTimeout: number;
+     private _customClusters: CustomClusters = {};
+@@ -301,7 +307,8 @@
+      *   Should be set to true when device potentially changed its internal data to prevent mismatching state/config.
+      */
+     resetTransient(cache: boolean): void {
+-        this._lastDefaultResponseSequenceNumber = undefined;
++        this.#defaultResponseSuccess.clear();
++        this.#defaultResponseEpoch++;
+ 
+         if (cache) {
+             // force retrieving this data again
+@@ -553,18 +560,15 @@
+         // Send a default response if necessary.
+         /* v8 ignore next */
+         const disableTuyaDefaultResponse = this.manufacturerName?.startsWith("_TZ") && process.env.DISABLE_TUYA_DEFAULT_RESPONSE;
+-        // Sometimes messages are received twice, prevent responding twice
+-        const alreadyResponded = this._lastDefaultResponseSequenceNumber === header.transactionSequenceNumber;
+-
+         if (
+             !this._skipDefaultResponse &&
+             sendDefaultResponse &&
+             (!header.frameControl.disableDefaultResponse || defaultResponseStatus !== Zcl.Status.SUCCESS) &&
+-            !alreadyResponded &&
+             !disableTuyaDefaultResponse
+         ) {
+-            try {
+-                this._lastDefaultResponseSequenceNumber = header.transactionSequenceNumber;
++            // TSN имеет всего 8 бит: одного номера недостаточно даже в пределах одного устройства.
++            const key = `${endpoint.ID}/${cluster.ID}/${defaultResponseStatus}/${dataPayload.data.toString("hex")}`;
++            await this.respondOnce(key, async () => {
+                 const direction =
+                     header.frameControl.direction === Zcl.Direction.CLIENT_TO_SERVER
+                         ? Zcl.Direction.SERVER_TO_CLIENT
+@@ -573,9 +577,53 @@
+                 await endpoint.defaultResponse(command.ID, defaultResponseStatus, cluster.ID, header.transactionSequenceNumber, {
+                     direction,
+                 });
++            });
++        }
++    }
++
++    private async respondOnce(key: string, send: () => Promise<void>): Promise<void> {
++        // Дубль ждёт текущую отправку. После ошибки он имеет право отправить ответ заново.
++        while (this.#defaultResponseInflight.has(key)) {
++            await this.#defaultResponseInflight.get(key);
++        }
++
++        const now = Date.now();
++        for (const [cachedKey, expires] of this.#defaultResponseSuccess) {
++            if (expires <= now) {
++                this.#defaultResponseSuccess.delete(cachedKey);
++            }
++        }
++        if (this.#defaultResponseSuccess.has(key)) {
++            return;
++        }
++
++        const epoch = this.#defaultResponseEpoch;
++        const task = (async (): Promise<boolean> => {
++            try {
++                await send();
++                if (epoch === this.#defaultResponseEpoch) {
++                    if (this.#defaultResponseSuccess.size >= DEFAULT_RESPONSE_CACHE_LIMIT) {
++                        const oldestKey = this.#defaultResponseSuccess.keys().next().value;
++                        if (oldestKey !== undefined) {
++                            this.#defaultResponseSuccess.delete(oldestKey);
++                        }
++                    }
++                    this.#defaultResponseSuccess.set(key, Date.now() + DEFAULT_RESPONSE_DEDUP_MSEC);
++                }
++                return true;
+             } catch (error) {
+                 logger.debug(`Default response to ${this.ieeeAddr} failed (${error})`, NS);
+-            }
++                return false;
++            }
++        })();
++        // При потоке разных запросов память ограничена; переполнение не запрещает отвечать.
++        const tracked = this.#defaultResponseInflight.size < DEFAULT_RESPONSE_CACHE_LIMIT;
++        if (tracked) {
++            this.#defaultResponseInflight.set(key, task);
++        }
++        await task;
++        if (tracked) {
++            this.#defaultResponseInflight.delete(key);
+         }
+     }
+ 
+diff --git a/src/adapter/ember/adapter/emberAdapter.ts b/src/adapter/ember/adapter/emberAdapter.ts
+--- a/src/adapter/ember/adapter/emberAdapter.ts
++++ b/src/adapter/ember/adapter/emberAdapter.ts
+@@ -264,6 +264,9 @@
+     private bmsBaseTxPower?: number;
+     /** BMS: сейчас стоит повышенная мощность переподключения. */
+     private bmsTxPowerBoosted: boolean;
++    /** BMS: желаемое состояние может измениться, пока EZSP-команда ждёт очередь. */
++    private bmsTxPowerBoostWanted = false;
++    private bmsStopping = false;
+     /** BMS: возврат базовой мощности через 60 с после последнего переподключения. */
+     private bmsTxPowerRestoreHandle?: NodeJS.Timeout;
+     /** BMS: узлы, которые переподключились и ещё ничего не прислали. */
+@@ -694,44 +697,52 @@
+      * переподключения. При базе 18/19 ничего не делаем.
+      */
+     private async bmsBoostTxPowerOnRejoin(nodeId: NodeId): Promise<void> {
+-        if (this.bmsBaseTxPower === undefined || this.bmsBaseTxPower >= BMS_REJOIN_TX_POWER_MIN_BASE) {
++        if (this.bmsStopping || this.bmsBaseTxPower === undefined || this.bmsBaseTxPower >= BMS_REJOIN_TX_POWER_MIN_BASE) {
+             return;
+         }
+ 
+         clearTimeout(this.bmsTxPowerRestoreHandle);
+         this.bmsTxPowerRestoreHandle = setTimeout(this.bmsRestoreTxPower.bind(this), BMS_REJOIN_TX_POWER_HOLD_MSEC);
+ 
+-        if (!this.bmsTxPowerBoosted) {
+-            this.bmsTxPowerBoosted = true;
+-
+-            await this.bmsSetTxPower(BMS_REJOIN_TX_POWER, `rejoin of ${nodeId}`);
+-        }
++        this.bmsTxPowerBoostWanted = true;
++        await this.bmsReconcileTxPower(`rejoin of ${nodeId}`);
+     }
+ 
+     /** BMS: вернуть базовую мощность (по таймеру или при остановке адаптера). */
+     private async bmsRestoreTxPower(): Promise<void> {
+         clearTimeout(this.bmsTxPowerRestoreHandle);
+         this.bmsTxPowerRestoreHandle = undefined;
+-
+-        if (this.bmsTxPowerBoosted && this.bmsBaseTxPower !== undefined) {
+-            this.bmsTxPowerBoosted = false;
+-
+-            await this.bmsSetTxPower(this.bmsBaseTxPower, "rejoin window over");
+-        }
+-    }
+-
+-    private async bmsSetTxPower(power: number, reason: string): Promise<void> {
+-        try {
+-            const status = await this.queue.execute<SLStatus>(async () => await this.ezsp.ezspSetRadioPower(power));
+-
+-            if (status === SLStatus.OK) {
+-                logger.info(`BMS: transmit power set to ${power} dBm (${reason}).`, NS);
+-            } else {
+-                logger.error(`BMS: failed to set transmit power to ${power} dBm (${reason}) status=${SLStatus[status]}.`, NS);
+-            }
+-        } catch (error) {
+-            logger.error(`BMS: failed to set transmit power to ${power} dBm (${reason}): ${(error as Error).message}`, NS);
+-        }
++        this.bmsTxPowerBoostWanted = false;
++        await this.bmsReconcileTxPower("rejoin window over");
++
++        // Не выдаём отказ чипа за восстановленную мощность. Повтор ограничен частотой,
++        // а при остановке — одной попыткой: нельзя бесконечно задерживать закрытие адаптера.
++        if (this.bmsTxPowerBoosted && !this.bmsTxPowerBoostWanted && !this.bmsStopping) {
++            this.bmsTxPowerRestoreHandle = setTimeout(this.bmsRestoreTxPower.bind(this), 5000);
++        }
++    }
++
++    private async bmsReconcileTxPower(reason: string): Promise<void> {
++        await this.queue.execute(async () => {
++            // Общий ключ сериализует изменения даже при concurrent=16. Цель читается
++            // внутри очереди: устаревший restore не отменит более новое переподключение.
++            const boosted = this.bmsTxPowerBoostWanted;
++            const power = boosted ? BMS_REJOIN_TX_POWER : this.bmsBaseTxPower;
++            if (power === undefined || boosted === this.bmsTxPowerBoosted) {
++                return;
++            }
++            try {
++                const status = await this.ezsp.ezspSetRadioPower(power);
++                if (status === SLStatus.OK) {
++                    this.bmsTxPowerBoosted = boosted;
++                    logger.info(`BMS: transmit power set to ${power} dBm (${reason}).`, NS);
++                } else {
++                    logger.error(`BMS: failed to set transmit power to ${power} dBm (${reason}) status=${SLStatus[status]}.`, NS);
++                }
++            } catch (error) {
++                logger.error(`BMS: failed to set transmit power to ${power} dBm (${reason}): ${(error as Error).message}`, NS);
++            }
++        }, "bms-radio-power");
+     }
+ 
+     /**
+@@ -1687,6 +1698,7 @@
+     //-- START Adapter implementation
+ 
+     public async start(): Promise<TsType.StartResult> {
++        this.bmsStopping = false;
+         logger.info("======== Ember Adapter Starting ========", NS);
+         const result = await this.initEzsp();
+ 
+@@ -1694,6 +1706,7 @@
+     }
+ 
+     public async stop(): Promise<void> {
++        this.bmsStopping = true;
+         clearInterval(this.watchdogCountersHandle);
+         // BMS: таймеры снимаем, повышенную мощность не оставляем на радио после остановки
+         clearTimeout(this.bmsMtorrHoldoffHandle);
+diff --git a/test/controller.test.ts b/test/controller.test.ts
+--- a/test/controller.test.ts
++++ b/test/controller.test.ts
+@@ -2865,6 +2865,119 @@
+                 ),
+             ),
+         );
++    });
++
++    describe("BMS: default response retry and bounded deduplication", () => {
++        const responseFrame = (cluster = "genOnOff", value = 1, tsn = 29) =>
++            Zcl.Frame.create(
++                Zcl.FrameType.GLOBAL,
++                Zcl.Direction.SERVER_TO_CLIENT,
++                false,
++                undefined,
++                tsn,
++                "report",
++                cluster,
++                [{attrId: 0, dataType: 0x20, attrData: value}],
++                {},
++            );
++
++        const setupResponse = async () => {
++            await controller.start();
++            await mockAdapterEvents.deviceJoined({networkAddress: 129, ieeeAddr: "0x129"});
++            const device = controller.getDeviceByIeeeAddr("0x129")!;
++            const endpoint = device.getEndpoint(1)!;
++            const send = vi.spyOn(endpoint, "defaultResponse").mockResolvedValue(undefined);
++            const receive = (frame = responseFrame(), target = endpoint) =>
++                device.onZclData(
++                    {
++                        wasBroadcast: false,
++                        address: 129,
++                        clusterID: frame.cluster.ID,
++                        data: frame.toBuffer(),
++                        header: frame.header,
++                        endpoint: target.ID,
++                        linkquality: 19,
++                        groupID: 0,
++                    },
++                    frame,
++                    target,
++                    undefined,
++                );
++            return {device, endpoint, send, receive};
++        };
++
++        it("retries the same request after send failure, then suppresses its immediate duplicate", async () => {
++            const {send, receive} = await setupResponse();
++            send.mockRejectedValueOnce(new Error("radio busy"));
++            await receive();
++            await receive();
++            await receive();
++            expect(send).toHaveBeenCalledTimes(2);
++        });
++
++        it("shares a successful in-flight response between concurrent duplicates", async () => {
++            const {send, receive} = await setupResponse();
++            let resolve!: () => void;
++            send.mockImplementationOnce(
++                () =>
++                    new Promise<void>((done) => {
++                        resolve = done;
++                    }),
++            );
++            const first = receive();
++            const duplicate = receive();
++            expect(send).toHaveBeenCalledTimes(1);
++            resolve();
++            await Promise.all([first, duplicate]);
++            expect(send).toHaveBeenCalledTimes(1);
++        });
++
++        it("a waiting duplicate retries an unsuccessful in-flight response", async () => {
++            const {send, receive} = await setupResponse();
++            let reject!: (error: Error) => void;
++            send.mockImplementationOnce(
++                () =>
++                    new Promise<void>((_done, fail) => {
++                        reject = fail;
++                    }),
++            );
++            const first = receive();
++            const duplicates = [receive(), receive()];
++            reject(new Error("delivery failed"));
++            await Promise.all([first, ...duplicates]);
++            expect(send).toHaveBeenCalledTimes(2);
++        });
++
++        it("does not confuse the same TSN across endpoints, clusters or payloads", async () => {
++            const {device, send, receive} = await setupResponse();
++            const second = await device.createEndpoint(2);
++            const secondSend = vi.spyOn(second, "defaultResponse").mockResolvedValue(undefined);
++            await receive();
++            await receive(responseFrame(), second);
++            await receive(responseFrame("genLevelCtrl"));
++            await receive(responseFrame("genOnOff", 0));
++            expect(send).toHaveBeenCalledTimes(3);
++            expect(secondSend).toHaveBeenCalledTimes(1);
++        });
++
++        it("responds again after the retry window or transient device reset", async () => {
++            const {device, send, receive} = await setupResponse();
++            await receive();
++            vi.setSystemTime(Date.now() + 1000);
++            await receive();
++            device.resetTransient(false);
++            await receive();
++            expect(send).toHaveBeenCalledTimes(3);
++        });
++
++        it("evicts old completed responses instead of keeping unbounded history", async () => {
++            const {send, receive} = await setupResponse();
++            for (let tsn = 0; tsn < 129; tsn++) {
++                await receive(responseFrame("genOnOff", 1, tsn));
++            }
++            await receive(responseFrame("genOnOff", 1, 0));
++            expect(send).toHaveBeenCalledTimes(130);
++        });
+     });
+ 
+     it("Receive zclData dont send default resopnse with skipDefaultResponse", async () => {
+diff --git a/test/adapter/ember/emberAdapter.test.ts b/test/adapter/ember/emberAdapter.test.ts
+--- a/test/adapter/ember/emberAdapter.test.ts
++++ b/test/adapter/ember/emberAdapter.test.ts
+@@ -1982,23 +1982,107 @@
+                 expect(mockEzspSendManyToOneRouteRequest).toHaveBeenCalledTimes(0);
+             });
+ 
+-            it("logs and keeps going when setting transmit power fails", async () => {
++            it("retries failed boosts on the next rejoin and only records successful EZSP state", async () => {
+                 mockEzspSetRadioPower.mockResolvedValueOnce(SLStatus.FAIL).mockRejectedValueOnce(new EzspError(EzspStatus.NOT_CONNECTED));
+-
+                 await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
+-
+-                expect(loggerSpies.error).toHaveBeenCalledWith(
+-                    "BMS: failed to set transmit power to 19 dBm (rejoin of 1234) status=FAIL.",
+-                    "zh:ember",
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(false);
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(false);
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(true);
++                expect(mockEzspSetRadioPower.mock.calls).toStrictEqual([[19], [19], [19]]);
++            });
++
++            it("does not restore an unsuccessful boost", async () => {
++                mockEzspSetRadioPower.mockResolvedValueOnce(SLStatus.FAIL);
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                await vi.advanceTimersByTimeAsync(60000);
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(1);
++            });
++
++            it("keeps the boosted state after restore failure and retries after 5s", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                mockEzspSetRadioPower.mockResolvedValueOnce(SLStatus.FAIL);
++                await vi.advanceTimersByTimeAsync(60000);
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(true);
++                await vi.advanceTimersByTimeAsync(5000);
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(false);
++                expect(mockEzspSetRadioPower.mock.calls).toStrictEqual([
++                    [19],
++                    [DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower],
++                    [DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower],
++                ]);
++            });
++
++            it("does not let a queued old restore undo a newer rejoin", async () => {
++                let resolve!: (status: SLStatus) => void;
++                mockEzspSetRadioPower.mockImplementationOnce(
++                    () =>
++                        new Promise<SLStatus>((done) => {
++                            resolve = done;
++                        }),
+                 );
+-
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
+                 await vi.advanceTimersByTimeAsync(60000);
+-
++                await emitTrustCenterJoin(5678, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                resolve(SLStatus.OK);
++                await flushPromises();
++                expect(mockEzspSetRadioPower.mock.calls).toStrictEqual([[19]]);
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(true);
++                await vi.advanceTimersByTimeAsync(60000);
++                expect(mockEzspSetRadioPower).toHaveBeenLastCalledWith(DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower);
++            });
++
++            it("serializes a rejoin behind an already running restore", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                let resolve!: (status: SLStatus) => void;
++                mockEzspSetRadioPower.mockImplementationOnce(
++                    () =>
++                        new Promise<SLStatus>((done) => {
++                            resolve = done;
++                        }),
++                );
++                await vi.advanceTimersByTimeAsync(60000);
++                await emitTrustCenterJoin(5678, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
+                 expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(2);
+-                expect(loggerSpies.error).toHaveBeenCalledWith(
+-                    `BMS: failed to set transmit power to ${DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower} dBm (rejoin window over): ${new EzspError(EzspStatus.NOT_CONNECTED).message}`,
+-                    "zh:ember",
++                resolve(SLStatus.OK);
++                await flushPromises();
++                expect(mockEzspSetRadioPower.mock.calls).toStrictEqual([[19], [DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower], [19]]);
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(true);
++            });
++
++            it("waits for an in-flight boost and restores before stopping EZSP", async () => {
++                let resolve!: (status: SLStatus) => void;
++                mockEzspSetRadioPower.mockImplementationOnce(
++                    () =>
++                        new Promise<SLStatus>((done) => {
++                            resolve = done;
++                        }),
+                 );
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                const stopping = adapter.stop();
++                expect(mockEzspStop).not.toHaveBeenCalled();
++                resolve(SLStatus.OK);
++                await stopping;
++                expect(mockEzspSetRadioPower.mock.calls).toStrictEqual([[19], [DEFAULT_ADAPTER_NETWORK_PARAMETERS.radioTxPower]]);
++                expect(mockEzspSetRadioPower.mock.invocationCallOrder[1]).toBeLessThan(mockEzspStop.mock.invocationCallOrder[0]);
++            });
++
++            it("logs failed restore on stop without pretending that power changed or retrying after close", async () => {
++                await emitTrustCenterJoin(1234, EmberDeviceUpdate.STANDARD_SECURITY_SECURED_REJOIN);
++                mockEzspSetRadioPower.mockResolvedValueOnce(SLStatus.FAIL);
++                await adapter.stop();
++                // @ts-expect-error private
++                expect(adapter.bmsTxPowerBoosted).toBe(true);
++                await vi.advanceTimersByTimeAsync(120000);
++                expect(mockEzspSetRadioPower).toHaveBeenCalledTimes(2);
+             });
+ 
+             it("restores base transmit power and clears timers on stop", async () => {
+diff --git a/test/device-ota.test.ts b/test/device-ota.test.ts
+--- a/test/device-ota.test.ts
++++ b/test/device-ota.test.ts
+@@ -2119,28 +2119,48 @@
+                 fileVersion: image.header.fileVersion - 1,
+             };
+             const baseSize = 40;
+-            const responseDelay = 25; // keep this low so we don't have to mock it
++            const responseDelay = 25;
+             const dataSettings: OtaDataSettings = {requestTimeout: 1000, responseDelay, baseSize};
+-            const startTime = performance.now();
+-            const {run, device} = createDevice({
+-                image,
+-                source: {url: "https://example.com/fw.ota"},
+-                requestPayload,
+-                dataSettings,
+-                behavior: {baseSize, sendUpgradeEnd: true},
+-            });
+-
+-            const [from, to] = await run();
+-            const elapsedTime = performance.now() - startTime;
+-
+-            expect(from.fileVersion).toStrictEqual(requestPayload.fileVersion);
+-            expect(to?.fileVersion).toStrictEqual(image.header.fileVersion);
+-
+             const expectedBlocks = Math.ceil(image.header.totalImageSize / baseSize);
+-            const minimumExpectedTime = (expectedBlocks - 1) * responseDelay;
+-
+-            expect(elapsedTime).toBeGreaterThanOrEqual(minimumExpectedTime);
+-            expect(device.otaInProgress).toStrictEqual(false);
++            // BMS: реальные таймеры Linux округляют дробные задержки; проверяем каждый
++            // интервал протокола управляемыми часами, а не длительность всего теста.
++            vi.useFakeTimers({toFake: ["Date", "setTimeout", "clearTimeout"]});
++            vi.setSystemTime(1000);
++            const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => Date.now());
++
++            try {
++                const {run, device, endpoint} = createDevice({
++                    image,
++                    source: {url: "https://example.com/fw.ota"},
++                    requestPayload,
++                    dataSettings,
++                    behavior: {baseSize, sendUpgradeEnd: true},
++                });
++                const responseTimes: number[] = [];
++                vi.mocked(endpoint.commandResponse).mockImplementation((_cluster, command) => {
++                    if (command === "imageBlockResponse") responseTimes.push(performance.now());
++                    return Promise.resolve();
++                });
++                const updating = run();
++                await vi.advanceTimersByTimeAsync(0);
++                expect(responseTimes).toStrictEqual([1000]);
++
++                for (let block = 1; block < expectedBlocks; block++) {
++                    await vi.advanceTimersByTimeAsync(responseDelay - 1);
++                    expect(responseTimes).toHaveLength(block);
++                    await vi.advanceTimersByTimeAsync(1);
++                    expect(responseTimes).toHaveLength(block + 1);
++                }
++
++                const [from, to] = await updating;
++                expect(responseTimes).toStrictEqual(Array.from({length: expectedBlocks}, (_, block) => 1000 + block * responseDelay));
++                expect(from.fileVersion).toStrictEqual(requestPayload.fileVersion);
++                expect(to?.fileVersion).toStrictEqual(image.header.fileVersion);
++                expect(device.otaInProgress).toStrictEqual(false);
++            } finally {
++                nowSpy.mockRestore();
++                vi.useRealTimers();
++            }
+         });
+ 
+         it("cancels scheduled OTA when completed", async () => {

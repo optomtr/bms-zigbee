@@ -1,0 +1,1575 @@
+BMS: bounded ZCL API attempts, ordered conflicting intents and verified group membership.
+
+Apply after 0001–0003; runtime bms_device_reports option comes from 0005.
+Counts API attempts, not physical radio transmissions or device delivery.
+
+diff --git a/lib/util/bmsGroupThrottle.ts b/lib/util/bmsGroupThrottle.ts
+--- a/lib/util/bmsGroupThrottle.ts
++++ b/lib/util/bmsGroupThrottle.ts
+@@ -1,18 +1,9 @@
+-// BMS: ограничитель групповых команд Zigbee.
+-//
+-// Почему: групповая команда в Zigbee — это широковещание. Его пересылает каждый повторитель сети (до 3 раз),
+-// и каждый узел держит запись о нём в таблице широковещаний (BTT) около 9 с. В EmberZNet таблица по умолчанию
+-// на 15 записей, и часть её занимают чужие широковещания (запросы маршрутов, объявления устройств). Когда
+-// владелец водил ползунком яркости/цвета группы, Home Assistant слал команду несколько раз в секунду: на живой
+-// сети (28 повторителей) это дало до 49 сообщений/с, NCP отвечал BUSY, шли ROUTE_ERROR, а одноадресные команды
+-// реле висели по 10 с. В тишине те же реле отвечают за 0,1–0,3 с. Значит, ограничивать надо частоту широковещаний.
+-//
+-// Правило: на одну группу — не чаще одной команды за окно группы; на всю сеть — не больше N групповых за
+-// скользящее окно (бюджет). Пока ограничение действует, новые команды группе не копятся очередью: они
+-// сливаются в одну отложенную, побеждает последнее значение каждого поля, и по истечении ограничения уходит
+-// одна команда. Состояния Z2M обновляются только тогда, когда команда действительно отправлена.
++// BMS: порядок намерений и бюджет фактических групповых вызовов ZCL.
++// Считаем попытки command/read/write, а не MQTT: один конвертер может отправить несколько кадров.
++import type Device from "../model/device";
+ import Group from "../model/group";
+ import type Zigbee from "../zigbee";
++import {assertGroupMutable, groupMembership, groupMutationVersion} from "./bmsGroupMembership";
+ import logger from "./logger";
+ import * as settings from "./settings";
+ import {stringify} from "./stringify";
+@@ -23,28 +14,34 @@
+     attribute: string;
+     type: "get" | "set";
+ }
+-
+-type Send = (parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage) => Promise<void>;
+-type Parse = (parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage) => KeyValue | undefined;
+-
+-interface Pending {
+-    group: Group;
+-    message: KeyValue;
+-    merged: number;
++type Send = (topic: ThrottleTopic, data: eventdata.MQTTMessage, members?: string[], version?: number, epochs?: [string, number][]) => Promise<void>;
++type Parse = (topic: ThrottleTopic, data: eventdata.MQTTMessage) => KeyValue | undefined;
++interface Job {
++    topic: ThrottleTopic;
++    data: eventdata.MQTTMessage;
++    resources: Set<string>;
++    group?: Group;
++    members?: string[];
++    version?: number;
++    epochs?: [string, number][];
++    message?: KeyValue;
++    started: boolean;
++    done: Promise<void>;
++    resolve: () => void;
+ }
+ 
+-// Поля, которые можно сливать «последнее побеждает». Остальное (toggle, сцены, эффекты, *_move/*_step,
+-// get) по смыслу нельзя ни объединить, ни отбросить — такие команды уходят сразу, как в штатном Z2M.
+ const MERGEABLE = new Set(["state", "brightness", "brightness_percent", "color_temp", "color_temp_percent", "color", "transition"]);
+ const BRIGHTNESS = ["brightness", "brightness_percent"];
+ const COLOR = ["color_temp", "color_temp_percent", "color"];
+-const LOG_INTERVAL_MS = 1000;
+ 
+ const isState = (value: unknown, state: string): boolean => typeof value === "string" && value.toLowerCase() === state;
+ 
+ /** Слить новую команду в отложенную: последнее значение каждого поля побеждает, смена state не теряется. */
+ export function mergeGroupMessage(pending: KeyValue, next: KeyValue): KeyValue {
+     const merged = {...pending};
++    // transition — контекст одной команды, не состояние лампы. Новое действие без
++    // transition использует штатное значение, а не старую длительность перехода.
++    if (next.transition === undefined && Object.keys(next).some((key) => key !== "transition")) delete merged.transition;
+ 
+     // Выключение новее отложенных яркости и цвета: выключенной лампе они уже не нужны (конвертер Z2M при OFF
+     // яркость всё равно отбрасывает), а цвет после OFF ушёл бы лишним кадром.
+@@ -69,182 +66,237 @@
+ }
+ 
+ export class GroupThrottle {
+-    private zigbee: Zigbee;
+-    private send: Send;
+-    private parse: Parse;
++    private jobs: Job[] = [];
+     private lastSent = new Map<number, number>();
+-    // Отправленные групповые за последнее окно бюджета (время), по возрастанию.
+     private sentTimes: number[] = [];
+-    // Отложенные по группам; порядок Map = порядок, в котором группы были отложены (кто раньше ждёт — раньше уйдёт).
+-    private pending = new Map<number, Pending>();
+-    private lastLog = new Map<number, number>();
+     private timer: NodeJS.Timeout | undefined;
+-    private running = new Set<Promise<void>>();
+-
+-    constructor(zigbee: Zigbee, send: Send, parse: Parse) {
+-        this.zigbee = zigbee;
+-        this.send = send;
+-        this.parse = parse;
+-    }
+-
+-    /**
+-     * true — команда группе взята ограничителем (отправлена сразу или отложена); false — обрабатывать как обычно
+-     * (не группа, get, ограничитель выключен). Синхронно, как и склейка: порядок команд определяется здесь.
+-     */
+-    offer(parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage): boolean {
+-        if (!settings.get().advanced.bms_group_throttle || parsedTopic.type !== "set") {
+-            return false;
+-        }
+-
+-        const group = this.zigbee.resolveEntity(parsedTopic.ID);
+-
+-        if (!(group instanceof Group)) {
+-            return false;
+-        }
+-
+-        const message = this.parse(parsedTopic, data);
+-
+-        if (!message || typeof message !== "object" || Array.isArray(message)) {
+-            // Не разбирается — пусть штатный код напишет свою ошибку.
+-            return false;
+-        }
+-
++    private stopped = false;
++    private admitted = 0;
++    private merged = 0;
++    private attempts = 0;
++
++    constructor(
++        private zigbee: Zigbee,
++        private send: Send,
++        private parse: Parse,
++        private report: (event: KeyValue) => void = () => {},
++    ) {}
++
++    offer(topic: ThrottleTopic, data: eventdata.MQTTMessage): boolean {
++        if (!settings.get().advanced.bms_group_throttle) return false;
++        const entity = this.zigbee.resolveEntity(topic.ID);
++        if (!entity) return false;
++        if (this.stopped) {
++            logger.warning(`BMS: команда '${data.topic}' отклонена при остановке`);
++            return true;
++        }
++        this.admitted += 1;
++        const message = this.parse(topic, data);
++        const group = entity instanceof Group ? entity : undefined;
++        const version = group ? groupMutationVersion(this.zigbee, group.ID) : undefined;
++        const membership = groupMembership(this.zigbee);
++        const ieeeAddresses = group ? [...new Set(group.zh.members.map((member) => member.deviceIeeeAddress))] : [];
++        if (ieeeAddresses.some((ieee) => membership?.isChanging?.(ieee))) {
++            logger.error(`BMS: состав группы '${group?.name}' проверяется/изменяется; команда отменена, повторите намерение`);
++            return true;
++        }
++        const getEpoch = membership?.getEpoch?.bind(membership);
++        const epochs = getEpoch ? ieeeAddresses.map((ieee) => [ieee, getEpoch(ieee)] as [string, number]) : undefined;
++        const members = group?.zh.members.map((member) => `${member.deviceIeeeAddress}/${member.ID}`).sort();
++        const resources = new Set<string>(
++            group ? [`group:${group.ID}`, ...group.zh.members.map((member) => member.deviceIeeeAddress)] : [(entity as Device).ID],
++        );
++        const mergeable =
++            !!group &&
++            topic.type === "set" &&
++            topic.endpoint === undefined &&
++            !!message &&
++            typeof message === "object" &&
++            !Array.isArray(message) &&
++            Object.keys(message).every((key) => MERGEABLE.has(key)) &&
++            (message.state === undefined || isState(message.state, "on") || isState(message.state, "off"));
++
++        // Нельзя перескочить через более новое намерение участнику или пересекающейся группе.
++        // Сливаем только с последней конфликтующей командой, пока конвертер ещё не запускался.
++        const previous = this.jobs.findLast((job) => this.overlaps(job.resources, resources));
++        if (
++            mergeable &&
++            message &&
++            previous &&
++            !previous.started &&
++            previous.group?.ID === group?.ID &&
++            previous.version === version &&
++            stringify(previous.epochs ?? []) === stringify(epochs ?? []) &&
++            stringify(previous.members ?? []) === stringify(members ?? []) &&
++            previous.message
++        ) {
++            this.merged += 1;
++            previous.message = mergeGroupMessage(previous.message, message);
++            previous.data = {...data, message: stringify(previous.message)};
++            previous.topic = {...topic, attribute: ""};
++            this.counters();
++            return true;
++        }
++        let resolve!: () => void;
++        const done = new Promise<void>((r) => {
++            resolve = r;
++        });
++        this.jobs.push({
++            topic,
++            data,
++            resources,
++            group,
++            members,
++            version,
++            epochs,
++            message: mergeable ? message : undefined,
++            started: false,
++            done,
++            resolve,
++        });
++        this.pump();
++        this.counters();
++        return true;
++    }
++
++    // Proxy принадлежит одному publish, исходный объект herdsman не изменяется.
++    // Привязка остальных методов к исходному объекту сохраняет приватное состояние модели.
++    view(members?: string[], version?: number, epochs?: [string, number][]): <T extends zh.Group | zh.Endpoint | zh.Device>(entity: T) => T {
++        const cache = new WeakMap<object, object>();
++        return <T extends zh.Group | zh.Endpoint | zh.Device>(entity: T): T => this.wrap(entity, members, cache, version, epochs);
++    }
++
++    wrap<T extends zh.Group | zh.Endpoint | zh.Device>(
++        entity: T,
++        members?: string[],
++        cache = new WeakMap<object, object>(),
++        version?: number,
++        epochs?: [string, number][],
++    ): T {
++        const cached = cache.get(entity);
++        if (cached) return cached as T;
++        const proxy = new Proxy(entity, {
++            set: (target, property, value) => Reflect.set(target, property, value, target),
++            get: (target, property) => {
++                // Getter herdsman может читать #private: receiver обязан быть исходным объектом.
++                const value = Reflect.get(target, property, target);
++                if ((property === "members" || property === "endpoints") && Array.isArray(value)) {
++                    return value.map((endpoint: zh.Endpoint) => this.wrap(endpoint, members, cache, version, epochs));
++                }
++                if (typeof value !== "function" || property === "constructor") return value;
++                if (property === "getDevice" || property === "getEndpoint") {
++                    return (...args: unknown[]) => {
++                        const nested = Reflect.apply(value, target, args);
++                        return nested ? this.wrap(nested, members, cache, version, epochs) : nested;
++                    };
++                }
++                if (!["command", "write", "read", "commandResponse", "zclCommand"].includes(String(property))) return value.bind(target);
++                return async (...args: unknown[]) => {
++                    const group = "groupID" in target;
++                    const endpoint = target as unknown as zh.Endpoint;
++                    if (group) {
++                        await this.reserve(target.groupID);
++                        assertGroupMutable(this.zigbee, target.groupID, version);
++                        const membership = groupMembership(this.zigbee);
++                        if (epochs?.some(([ieee, epoch]) => membership?.isChanging?.(ieee) || membership?.getEpoch?.(ieee) !== epoch)) {
++                            throw new Error("BMS: членство участника изменилось во время ожидания; команда отменена");
++                        }
++                        const current = this.zigbee.resolveEntity(target.groupID);
++                        if (members && (!(current instanceof Group) || current.zh !== (target as unknown as zh.Group))) {
++                            throw new Error("BMS: группа удалена или пересоздана; команда отменена");
++                        }
++                        if (
++                            members &&
++                            stringify(target.members.map((member) => `${member.deviceIeeeAddress}/${member.ID}`).sort()) !== stringify(members)
++                        ) {
++                            throw new Error("BMS: состав группы изменился во время ожидания; команда отменена, повторите намерение");
++                        }
++                    }
++                    if (group) {
++                        this.attempts += 1;
++                        this.counters();
++                    }
++                    this.report({
++                        kind: group ? "group_frame" : "unicast_frame",
++                        evidence: "api_attempt",
++                        target: group ? target.groupID : endpoint.deviceIeeeAddress,
++                        endpoint: group ? undefined : endpoint.ID,
++                        operation: property,
++                        cluster: typeof args[0] === "string" || typeof args[0] === "number" ? args[0] : undefined,
++                        command: property === "command" || property === "commandResponse" ? args[1] : undefined,
++                    });
++                    return Reflect.apply(value, target, args);
++                };
++            },
++        });
++        cache.set(entity, proxy);
++        return proxy;
++    }
++
++    // При выключении не снимаем бюджет: очередь дренируется тем же темпом, без последнего шторма.
++    async stop(): Promise<void> {
++        this.stopped = true;
++        await Promise.all(this.jobs.map((job) => job.done));
++        clearTimeout(this.timer);
++    }
++
++    private counters(): void {
++        logger.debug(
++            `BMS: tx counters admitted=${this.admitted} merged=${this.merged} group_zcl_attempts=${this.attempts} pending=${this.jobs.filter((j) => !j.started).length} active=${this.jobs.filter((j) => j.started).length}`,
++        );
++    }
++
++    private overlaps(a: Set<string>, b: Set<string>): boolean {
++        return [...a].some((key) => b.has(key));
++    }
++
++    private waitFor(id: number): number {
+         const now = Date.now();
+-        const mergeable =
+-            parsedTopic.endpoint === undefined &&
+-            Object.keys(message).every((k) => MERGEABLE.has(k)) &&
+-            (message.state === undefined || isState(message.state, "on") || isState(message.state, "off"));
+-
+-        if (!mergeable) {
+-            // Не сливается (toggle, сцена, эффект, *_move…). Отложенная команда этой группы уходит первой, чтобы
+-            // порядок команд группе не перевернулся; обе — сразу (как в штатном Z2M), но в учёт бюджета.
+-            this.sendPending(group.ID, now);
+-            this.record(group.ID, now);
+-            this.run(parsedTopic, data);
+-            this.schedule();
+-            return true;
+-        }
+-
+-        const pending = this.pending.get(group.ID);
+-
+-        if (pending) {
+-            pending.message = mergeGroupMessage(pending.message, message);
+-            pending.merged += 1;
+-            this.log(group, now, `объединена с отложенной (${pending.merged} шт.): ${stringify(pending.message)}`);
+-            return true;
+-        }
+-
+-        const wait = this.waitFor(group.ID, now);
+-
+-        if (wait <= 0) {
+-            this.record(group.ID, now);
+-            this.run(parsedTopic, data);
+-            return true;
+-        }
+-
+-        this.pending.set(group.ID, {group, message, merged: 1});
+-        this.log(group, now, `отложена на ${wait} мс (${this.reason(group.ID, now)})`);
+-        this.schedule();
+-        return true;
+-    }
+-
+-    /** При остановке отложенные команды уходят сразу, а не теряются. */
+-    async stop(): Promise<void> {
+-        clearTimeout(this.timer);
+-        this.timer = undefined;
+-
+-        for (const ID of [...this.pending.keys()]) {
+-            this.sendPending(ID, Date.now());
+-        }
+-
+-        await Promise.allSettled([...this.running]);
+-    }
+-
+-    private window(): {group: number; budget: number; budgetWindow: number} {
+         const a = settings.get().advanced;
+-        return {group: a.bms_group_throttle_window, budget: a.bms_broadcast_budget, budgetWindow: a.bms_broadcast_budget_window};
+-    }
+-
+-    private prune(now: number): void {
+-        const {budgetWindow} = this.window();
+-        while (this.sentTimes.length && this.sentTimes[0] <= now - budgetWindow) this.sentTimes.shift();
+-    }
+-
+-    /** Через сколько мс группе можно отправить (0 — можно сейчас). */
+-    private waitFor(Id: number, now: number): number {
+-        const w = this.window();
+-        this.prune(now);
+-        const last = this.lastSent.get(Id);
+-        const groupWait = last === undefined ? 0 : last + w.group - now;
+-        // Бюджет занят: ждём, пока самая старая из учтённых выйдет из окна.
+-        const budgetWait = this.sentTimes.length >= w.budget ? this.sentTimes[this.sentTimes.length - w.budget] + w.budgetWindow - now : 0;
++        const budget = Number.isFinite(a.bms_broadcast_budget) ? Math.max(1, Math.floor(a.bms_broadcast_budget)) : 8;
++        while (this.sentTimes.length && this.sentTimes[0] <= now - a.bms_broadcast_budget_window) this.sentTimes.shift();
++        const last = this.lastSent.get(id);
++        const groupWait = last === undefined ? 0 : last + a.bms_group_throttle_window - now;
++        const budgetWait = this.sentTimes.length >= budget ? this.sentTimes[this.sentTimes.length - budget] + a.bms_broadcast_budget_window - now : 0;
+         return Math.max(0, groupWait, budgetWait);
+     }
+ 
+-    private reason(Id: number, now: number): string {
+-        const w = this.window();
+-        const last = this.lastSent.get(Id);
+-        return last !== undefined && last + w.group > now ? `окно группы ${w.group} мс` : `бюджет сети ${w.budget} групповых за ${w.budgetWindow} мс`;
+-    }
+-
+-    private record(Id: number, now: number): void {
+-        this.lastSent.set(Id, now);
++    private async reserve(id: number): Promise<void> {
++        if (!settings.get().advanced.bms_group_throttle) return;
++        // Повторная проверка после ожидания обязательна: несколько групп делят один бюджет.
++        for (let wait = this.waitFor(id); wait > 0; wait = this.waitFor(id)) {
++            await new Promise<void>((resolve) => setTimeout(resolve, wait));
++        }
++        const now = Date.now();
++        this.lastSent.set(id, now);
+         this.sentTimes.push(now);
+-    }
+-
+-    private sendPending(Id: number, now: number): void {
+-        const pending = this.pending.get(Id);
+-
+-        if (!pending) {
+-            return;
+-        }
+-
+-        this.pending.delete(Id);
+-        this.record(Id, now);
+-
+-        if (pending.merged > 1) {
+-            logger.debug(`BMS: групповая к '${pending.group.name}': ${pending.merged} команд → одна ${stringify(pending.message)}`);
+-        }
+-
+-        const topic: ThrottleTopic = {ID: Id, endpoint: undefined, attribute: "", type: "set"};
+-        this.run(topic, {topic: `${settings.get().mqtt.base_topic}/${pending.group.name}/set`, message: stringify(pending.message)});
+-    }
+-
+-    /** Один таймер на всё: отпускает отложенные по порядку, пока позволяют окно группы и бюджет сети. */
+-    private schedule(): void {
++        logger.debug(`BMS: ZCL group budget reserved id=${id} budget_used=${this.sentTimes.length}`);
++        this.counters();
++    }
++
++    private pump(): void {
+         clearTimeout(this.timer);
+         this.timer = undefined;
+         let next = Number.POSITIVE_INFINITY;
+-        const now = Date.now();
+-
+-        for (const ID of [...this.pending.keys()]) {
+-            const wait = this.waitFor(ID, now);
+-
+-            if (wait <= 0) {
+-                this.sendPending(ID, now);
+-            } else {
++        for (const job of [...this.jobs]) {
++            if (job.started) continue;
++            const earlier = this.jobs.slice(0, this.jobs.indexOf(job));
++            if (earlier.some((old) => this.overlaps(old.resources, job.resources))) continue;
++            const wait = job.group ? this.waitFor(job.group.ID) : 0;
++            if (wait > 0) {
+                 next = Math.min(next, wait);
++                continue;
+             }
+-        }
+-
+-        if (next !== Number.POSITIVE_INFINITY) {
+-            this.timer = setTimeout(() => this.schedule(), next);
+-        }
+-    }
+-
+-    private log(group: Group, now: number, text: string): void {
+-        const last = this.lastLog.get(group.ID);
+-
+-        if (last === undefined || now - last >= LOG_INTERVAL_MS) {
+-            this.lastLog.set(group.ID, now);
+-            logger.info(`BMS: групповая к '${group.name}' ${text}`);
+-        }
+-    }
+-
+-    private run(parsedTopic: ThrottleTopic, data: eventdata.MQTTMessage): void {
+-        const promise = this.send(parsedTopic, data)
+-            .catch((error) => logger.error(`BMS: отправка '${data.topic}' не удалась: ${error}`))
+-            .finally(() => this.running.delete(promise));
+-        this.running.add(promise);
++            job.started = true;
++            // Запуск синхронный до первого await: слот ZCL резервируется до следующего job.
++            void this.send(job.topic, job.data, job.members, job.version, job.epochs)
++                .catch((error) => logger.error(`BMS: отправка '${job.data.topic}' не удалась: ${error}`))
++                .finally(() => {
++                    this.jobs.splice(this.jobs.indexOf(job), 1);
++                    job.resolve();
++                    this.pump();
++                });
++        }
++        if (next !== Number.POSITIVE_INFINITY) this.timer = setTimeout(() => this.pump(), next);
+     }
+ }
+diff --git a/lib/util/bmsGroupCoalescing.ts b/lib/util/bmsGroupCoalescing.ts
+--- a/lib/util/bmsGroupCoalescing.ts
++++ b/lib/util/bmsGroupCoalescing.ts
+@@ -14,6 +14,7 @@
+ import Device from "../model/device";
+ import type Group from "../model/group";
+ import type Zigbee from "../zigbee";
++import {groupMembership} from "./bmsGroupMembership";
+ import logger from "./logger";
+ import * as settings from "./settings";
+ import {stringify} from "./stringify";
+@@ -71,9 +72,6 @@
+     // Ждущие: точка → содержимое её команды (для дублей) и устройства (для порядка команд).
+     private pending = new Map<string, string>();
+     private pendingDevices = new Set<string>();
+-    // Последняя запущенная одноадресная команда устройства из пачки: следующая точке того же устройства
+-    // ждёт её. Модули Tuya с MCU теряют одновременные команды разным каналам.
+-    private chains = new Map<string, Promise<void>>();
+     private timer: NodeJS.Timeout | undefined;
+     private firstAt = 0;
+     private running = new Set<Promise<void>>();
+@@ -95,11 +93,10 @@
+         if (!items) {
+             const entity = this.zigbee.resolveEntity(parsedTopic.ID);
+ 
+-            // Команда не склеивается, но относится к устройству, чья команда ещё ждёт в пачке или ещё
+-            // уходит: отправляем пачку сейчас, а эту команду ставим за ними — порядок как при приходе.
+-            if (entity instanceof Device && (this.pendingDevices.has(entity.ID) || this.chains.has(entity.ID))) {
++            // Регистрация старой пачки в общей очереди должна предшествовать новой команде участнику.
++            if (entity instanceof Device && this.pendingDevices.has(entity.ID)) {
+                 this.flush();
+-                this.run(parsedTopic, data, entity.ID);
++                this.run(parsedTopic, data);
+                 return true;
+             }
+ 
+@@ -177,7 +174,7 @@
+             }
+ 
+             for (const item of rest) {
+-                this.run(item.parsedTopic, item.data, item.device.ID);
++                this.run(item.parsedTopic, item.data);
+             }
+         }
+     }
+@@ -188,25 +185,13 @@
+         await Promise.allSettled([...this.running]);
+     }
+ 
+-    /** device — одноадресная команда: ставится в очередь этого устройства (см. chains). */
+-    private run(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage, device?: string): void {
+-        const prev = device === undefined ? undefined : this.chains.get(device);
+-        // Без очереди отправка начинается синхронно — как в штатном Z2M.
+-        const started = prev ? prev.then(() => this.send(parsedTopic, data)) : this.send(parsedTopic, data);
+-        const promise: Promise<void> = started
++    private run(parsedTopic: CoalesceTopic, data: eventdata.MQTTMessage): void {
++        // Очередь конфликтующих устройств и групп общая в GroupThrottle. Локальная цепочка
++        // откладывала бы регистрацию старой команды и позволяла новой группе обогнать её.
++        const promise = this.send(parsedTopic, data)
+             .catch((error) => logger.error(`BMS: отправка '${data.topic}' не удалась: ${error}`))
+-            .finally(() => {
+-                this.running.delete(promise);
+-
+-                if (device !== undefined && this.chains.get(device) === promise) {
+-                    this.chains.delete(device);
+-                }
+-            });
++            .finally(() => this.running.delete(promise));
+         this.running.add(promise);
+-
+-        if (device !== undefined) {
+-            this.chains.set(device, promise);
+-        }
+     }
+ 
+     /**
+@@ -323,6 +308,7 @@
+     }
+ 
+     private covers(group: Group, items: Map<string, Item>, keys: string[]): boolean {
++        if (!groupMembership(this.zigbee)?.isVerified(group)) return false;
+         const groupConverters = Array.from(new Set(group.membersDefinitions().flatMap((d) => d.toZigbee)));
+         // Как выбирает конвертер publish.ts: для группы — первый по ключу, для устройства — ещё и по точке.
+         const find = (converters: ReadonlyArray<zhc.Tz.Converter>, key: string, device: boolean, endpointName?: string) =>
+diff --git a/lib/util/bmsGroupMembership.ts b/lib/util/bmsGroupMembership.ts
+new file mode 100644
+--- /dev/null
++++ b/lib/util/bmsGroupMembership.ts
+@@ -0,0 +1,57 @@
++// Один реестр для встроенной работы с группами и внешнего слоя Tuya.
++// Если слой ещё не запущен, база сама по себе не доказывает членство на устройстве.
++import type Group from "../model/group";
++import type Zigbee from "../zigbee";
++
++export interface GroupMembership {
++    withDeviceLock<T>(ieee: string, task: () => Promise<T>): Promise<T>;
++    invalidate(ieee: string, endpointID?: number): void;
++    verify(endpoint: zh.Endpoint): Promise<Set<number>>;
++    isVerified(group: Group): boolean;
++    getEpoch?(ieee: string): number;
++    isChanging?(ieee: string): boolean;
++}
++export function groupMembership(zigbee: Zigbee): GroupMembership | undefined {
++    return (zigbee as unknown as Record<symbol, GroupMembership>)[Symbol.for("bms.groupMembership")];
++}
++
++// Удаление группы затрагивает много IEEE. Версия закрывает также запрос, который
++// разобрал старую группу, а затем ждал lock устройства до окончания удаления.
++const mutations = new WeakMap<Zigbee, Map<number, {version: number; changing: boolean}>>();
++function mutation(zigbee: Zigbee, id: number): {version: number; changing: boolean} {
++    let groups = mutations.get(zigbee);
++    if (!groups) {
++        groups = new Map();
++        mutations.set(zigbee, groups);
++    }
++    let state = groups.get(id);
++    if (!state) {
++        state = {version: 0, changing: false};
++        groups.set(id, state);
++    }
++    return state;
++}
++export function groupMutationVersion(zigbee: Zigbee, id: number): number {
++    return mutation(zigbee, id).version;
++}
++export function assertGroupMutable(zigbee: Zigbee, id: number, version = groupMutationVersion(zigbee, id)): void {
++    const state = mutation(zigbee, id);
++    if (state.changing || state.version !== version) throw new Error("BMS: состав группы изменяется или изменился во время ожидания");
++}
++export function beginGroupMutation(zigbee: Zigbee, ids: number[]): () => void {
++    for (const id of ids) assertGroupMutable(zigbee, id);
++    const states = [...new Set(ids)].map((id) => mutation(zigbee, id));
++    for (const state of states) {
++        state.changing = true;
++        state.version += 1;
++    }
++    return () => {
++        for (const state of states) {
++            state.changing = false;
++            state.version += 1;
++        }
++    };
++}
++export function beginGroupRemoval(zigbee: Zigbee, id: number): () => void {
++    return beginGroupMutation(zigbee, [id]);
++}
+diff --git a/lib/extension/publish.ts b/lib/extension/publish.ts
+--- a/lib/extension/publish.ts
++++ b/lib/extension/publish.ts
+@@ -1,3 +1,4 @@
++import {randomUUID} from "node:crypto";
+ import bind from "bind-decorator";
+ import type * as zhc from "zigbee-herdsman-converters";
+ import Device from "../model/device";
+@@ -28,14 +29,17 @@
+ }
+ 
+ export default class Publish extends Extension {
++    private txSession = "";
++    private txSequence = 0;
+     // BMS: ограничитель частоты групповых команд (широковещаний) — lib/util/bmsGroupThrottle.ts.
+-    private throttle = new GroupThrottle(this.zigbee, this.publishParsed, this.parseMessage.bind(this));
++    private throttle = new GroupThrottle(this.zigbee, this.publishParsed, this.parseMessage.bind(this), this.reportTransmit);
+     // BMS: одинаковые команды нескольким устройствам → одна групповая (lib/util/bmsGroupCoalescing.ts).
+     // Её групповые команды идут через ограничитель так же, как прямые команды на группу.
+     private coalescer = new GroupCoalescer(this.zigbee, this.publishOrThrottle, this.parseMessage.bind(this));
+ 
+     // biome-ignore lint/suspicious/useAwait: API
+     override async start(): Promise<void> {
++        this.txSession = randomUUID();
+         loadTopicGetSetRegex();
+         this.eventBus.onMQTTMessage(this, this.onMQTTMessage);
+     }
+@@ -79,7 +83,9 @@
+             }
+         } else {
+             try {
+-                return JSON.parse(data.message);
++                const message = JSON.parse(data.message);
++                if (message && typeof message === "object" && !Array.isArray(message)) delete message.__bms_command_id;
++                return message;
+             } catch {
+                 return STATE_VALUES.includes(data.message.toLowerCase()) ? {state: data.message} : undefined;
+             }
+@@ -106,11 +112,38 @@
+     @bind async onMQTTMessage(data: eventdata.MQTTMessage): Promise<void> {
+         const parsedTopic = this.parseTopic(data.topic);
+ 
++        if (parsedTopic) {
++            let commandId: string | undefined;
++            try {
++                const value = JSON.parse(data.message)?.__bms_command_id;
++                if (typeof value === "string" && value.length <= 128) commandId = value;
++            } catch {
++                /* Скалярные штатные команды не имеют метаданных замерщика. */
++            }
++            this.reportTransmit({
++                kind: "mqtt_intent",
++                target: parsedTopic.ID,
++                endpoint: parsedTopic.endpoint,
++                type: parsedTopic.type,
++                command_id: commandId,
++            });
++        }
+         if (!parsedTopic || this.coalescer.offer(parsedTopic, data)) {
+             return;
+         }
+ 
+         await this.publishOrThrottle(parsedTopic, data);
++    }
++
++    @bind private reportTransmit(event: KeyValue): void {
++        if (!settings.get().advanced.bms_device_reports) return;
++        // Телеметрия не задерживает радио и не является подтверждением доставки устройства.
++        void this.mqtt
++            .publish(
++                "bridge/bms/tx_event",
++                stringify({schema: 1, session_id: this.txSession, sequence: ++this.txSequence, received_at: Date.now(), ...event}),
++            )
++            .catch((error) => logger.warning(`BMS: tx telemetry: ${error}`));
+     }
+ 
+     @bind async publishOrThrottle(parsedTopic: ParsedTopic, data: eventdata.MQTTMessage): Promise<void> {
+@@ -119,7 +152,13 @@
+         }
+     }
+ 
+-    @bind async publishParsed(parsedTopic: ParsedTopic, data: eventdata.MQTTMessage): Promise<void> {
++    @bind async publishParsed(
++        parsedTopic: ParsedTopic,
++        data: eventdata.MQTTMessage,
++        expectedMembers?: string[],
++        expectedVersion?: number,
++        expectedEpochs?: [string, number][],
++    ): Promise<void> {
+         const re = this.zigbee.resolveEntity(parsedTopic.ID);
+ 
+         if (!re) {
+@@ -138,7 +177,9 @@
+         } else {
+             definition = re.membersDefinitions();
+         }
+-        const target = re instanceof Group ? re.zh : re.endpoint(parsedTopic.endpoint);
++        const view = this.throttle.view(expectedMembers, expectedVersion, expectedEpochs);
++        const rawTarget = re instanceof Group ? re.zh : re.endpoint(parsedTopic.endpoint);
++        const target = rawTarget ? view(rawTarget) : undefined;
+ 
+         if (!target) {
+             logger.error(`Device '${re.name}' has no endpoint '${parsedTopic.endpoint}'`);
+@@ -153,7 +194,7 @@
+             return;
+         }
+ 
+-        const device = re instanceof Device ? re.zh : undefined;
++        const device = re instanceof Device ? view(re.zh) : undefined;
+         const entitySettings = re.options;
+         const entityState = this.state.get(re);
+         const membersState =
+@@ -211,7 +252,7 @@
+                 endpointName = propertyEndpointMatch[2];
+                 key = propertyEndpointMatch[1];
+                 // biome-ignore lint/style/noNonNullAssertion: endpointName is always matched to an existing endpoint of the device since `propertyEndpointRegex` only contains valid endpoints for this device
+-                localTarget = re.endpoint(endpointName)!;
++                localTarget = view(re.endpoint(endpointName)!);
+                 endpointOrGroupID = localTarget.ID;
+             }
+ 
+diff --git a/lib/extension/groups.ts b/lib/extension/groups.ts
+--- a/lib/extension/groups.ts
++++ b/lib/extension/groups.ts
+@@ -5,6 +5,7 @@
+ import Device from "../model/device";
+ import Group from "../model/group";
+ import type {Zigbee2MQTTAPI, Zigbee2MQTTResponseEndpoints} from "../types/api";
++import {assertGroupMutable, beginGroupMutation, groupMembership, groupMutationVersion} from "../util/bmsGroupMembership";
+ import logger from "../util/logger";
+ import * as settings from "../util/settings";
+ import {stringify} from "../util/stringify";
+@@ -271,11 +272,45 @@
+         assert(resolvedDevice, "`resolvedDevice` is missing");
+         assert(resolvedEndpoint, "`resolvedEndpoint` is missing");
+ 
++        const membership = groupMembership(this.zigbee);
++        const affected = resolvedGroup ? [resolvedGroup] : [...this.zigbee.groupsIterator((group) => group.members.includes(resolvedEndpoint))];
++        const versions = affected.map((group) => [group.ID, groupMutationVersion(this.zigbee, group.ID)] as const);
++        const mutate = async (action: () => Promise<void>): Promise<void> => {
++            const operation = async (): Promise<void> => {
++                for (const [id, version] of versions) assertGroupMutable(this.zigbee, id, version);
++                const finish = beginGroupMutation(
++                    this.zigbee,
++                    affected.map((group) => group.ID),
++                );
++                try {
++                    membership?.invalidate(resolvedDevice.ID, resolvedEndpoint.ID);
++                    await action();
++                    if (membership) {
++                        const actual = await membership.verify(resolvedEndpoint);
++                        if (type !== "remove_all") assert(resolvedGroup);
++                        const expected = resolvedGroup
++                            ? type === "add"
++                                ? actual.has(resolvedGroup.ID)
++                                : !actual.has(resolvedGroup.ID)
++                            : actual.size === 0;
++                        if (!expected) {
++                            membership.invalidate(resolvedDevice.ID, resolvedEndpoint.ID);
++                            throw new Error("BMS: членство на устройстве не подтвердило изменение группы");
++                        }
++                    }
++                } finally {
++                    finish();
++                }
++            };
++            if (membership) await membership.withDeviceLock(resolvedDevice.ID, operation);
++            else await operation();
++        };
++
+         try {
+             if (type === "add") {
+                 assert(resolvedGroup, "`resolvedGroup` is missing");
+                 logger.info(`Adding endpoint '${resolvedEndpoint.ID}' of device '${resolvedDevice.name}' to group '${resolvedGroup.name}'`);
+-                await resolvedEndpoint.addToGroup(resolvedGroup.zh);
++                await mutate(() => resolvedEndpoint.addToGroup(resolvedGroup.zh));
+                 changedGroups.push(resolvedGroup);
+                 // biome-ignore lint/style/noNonNullAssertion: valid from resolved asserts
+                 const respPayload = {device: deviceKey!, endpoint: endpointKey!, group: groupKey!};
+@@ -283,7 +318,7 @@
+             } else if (type === "remove") {
+                 assert(resolvedGroup, "`resolvedGroup` is missing");
+                 logger.info(`Removing endpoint '${resolvedEndpoint.ID}' of device '${resolvedDevice.name}' from group '${resolvedGroup.name}'`);
+-                await resolvedEndpoint.removeFromGroup(resolvedGroup.zh);
++                await mutate(() => resolvedEndpoint.removeFromGroup(resolvedGroup.zh));
+                 changedGroups.push(resolvedGroup);
+                 // biome-ignore lint/style/noNonNullAssertion: valid from resolved asserts
+                 const respPayload = {device: deviceKey!, endpoint: endpointKey!, group: groupKey!};
+@@ -296,7 +331,7 @@
+                     changedGroups.push(group);
+                 }
+ 
+-                await resolvedEndpoint.removeFromAllGroups();
++                await mutate(() => resolvedEndpoint.removeFromAllGroups());
+                 // biome-ignore lint/style/noNonNullAssertion: valid from resolved asserts
+                 const respPayload = {device: deviceKey!, endpoint: endpointKey!};
+                 await this.publishResponse<"bridge/response/group/members/remove_all">(parsed.type, raw, respPayload);
+diff --git a/lib/extension/bridge.ts b/lib/extension/bridge.ts
+--- a/lib/extension/bridge.ts
++++ b/lib/extension/bridge.ts
+@@ -10,6 +10,7 @@
+ import Device from "../model/device";
+ import type Group from "../model/group";
+ import type {Zigbee2MQTTAPI, Zigbee2MQTTDevice, Zigbee2MQTTResponse, Zigbee2MQTTResponseEndpoints} from "../types/api";
++import {assertGroupMutable, beginGroupRemoval, groupMembership} from "../util/bmsGroupMembership";
+ import data from "../util/data";
+ import logger from "../util/logger";
+ import {objectAssignDeep} from "../util/objectAssignDeep";
+@@ -304,6 +305,12 @@
+         const friendlyName = typeof message === "object" ? message.friendly_name : message;
+         const ID = typeof message === "object" && message.id !== undefined ? message.id : null;
+         const group = settings.addGroup(friendlyName, ID);
++        try {
++            assertGroupMutable(this.zigbee, group.ID);
++        } catch (error) {
++            settings.removeGroup(group.ID);
++            throw error;
++        }
+         this.zigbee.createGroup(group.ID);
+         await this.publishGroups();
+         return utils.getResponse(message, {friendly_name: group.friendly_name, id: group.ID});
+@@ -708,6 +715,7 @@
+             blockForceLog = ` (force: ${force})`;
+         }
+ 
++        const finishRemoval = entity instanceof Device ? undefined : beginGroupRemoval(this.zigbee, entity.ID);
+         try {
+             logger.info(`Removing ${entityType} '${friendlyName}'${blockForceLog}`);
+ 
+@@ -730,7 +738,23 @@
+                     settings.removeDevice(entity.ID as string);
+                 }
+             } else {
+-                if (force) {
++                const membership = groupMembership(this.zigbee);
++                if (membership) {
++                    for (const endpoint of [...entity.zh.members]) {
++                        await membership.withDeviceLock(endpoint.deviceIeeeAddress, async () => {
++                            membership.invalidate(endpoint.deviceIeeeAddress, endpoint.ID);
++                            if (!force) {
++                                await endpoint.removeFromGroup(entity.zh);
++                                const actual = await membership.verify(endpoint);
++                                if (actual.has(entity.ID)) {
++                                    membership.invalidate(endpoint.deviceIeeeAddress, endpoint.ID);
++                                    throw new Error("BMS: устройство всё ещё состоит в удаляемой группе");
++                                }
++                            }
++                        });
++                    }
++                    entity.zh.removeFromDatabase();
++                } else if (force) {
+                     entity.zh.removeFromDatabase();
+                 } else {
+                     await entity.zh.removeFromNetwork();
+@@ -777,6 +801,8 @@
+             );
+         } catch (error) {
+             throw new Error(`Failed to remove ${entityType} '${friendlyName}'${blockForceLog} (${error})`);
++        } finally {
++            finishRemoval?.();
+         }
+     }
+ 
+diff --git a/test/extensions/bmsGroupThrottle.test.ts b/test/extensions/bmsGroupThrottle.test.ts
+--- a/test/extensions/bmsGroupThrottle.test.ts
++++ b/test/extensions/bmsGroupThrottle.test.ts
+@@ -11,7 +11,7 @@
+ import {clearGlobalStore} from "zigbee-herdsman-converters";
+ import {Controller} from "../../lib/controller";
+ import {loadTopicGetSetRegex} from "../../lib/extension/publish";
+-import {mergeGroupMessage} from "../../lib/util/bmsGroupThrottle";
++import {GroupThrottle, mergeGroupMessage} from "../../lib/util/bmsGroupThrottle";
+ import * as settings from "../../lib/util/settings";
+ import {stringify} from "../../lib/util/stringify";
+ 
+@@ -41,6 +41,8 @@
+         vi.useFakeTimers();
+         data.writeEmptyState();
+         controller = new Controller(vi.fn(), vi.fn());
++        // Физическое членство проверяет слой Tuya; здесь фиксируем подтверждённый стенд.
++        Object.assign(controller.zigbee, {[Symbol.for("bms.groupMembership")]: {isVerified: () => true}});
+         mockSleep.mock();
+         await controller.start();
+         await flushPromises();
+@@ -108,13 +110,13 @@
+         ]);
+         expect(published("group_1").at(-1)).toMatchObject({state: "ON", brightness: 59});
+         expect(published("bulb_color").at(-1)).toMatchObject({state: "ON", brightness: 59});
+-        expect(throttleLog()).toStrictEqual(["BMS: групповая к 'group_1' отложена на 900 мс (окно группы 1000 мс)"]);
+     });
+ 
+     it("does not lose a state change merged with later fields", async () => {
+         await set("group_1", {state: "ON", brightness: 100});
+         await set("group_1", {state: "OFF"});
+         await set("group_1", {color_temp: 300});
++        await wait(1000);
+         await wait(1000);
+         // Порядок полей внутри команды — штатный Z2M (при OFF state уходит последним); главное — OFF не потерян.
+         expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["moveToLevelWithOnOff", "moveToColorTemp", "off"]);
+@@ -152,10 +154,6 @@
+         expect(groups.group_with_tradfri.command).toHaveBeenCalledTimes(0);
+         await wait(1);
+         expect(groups.group_with_tradfri.command.mock.calls.map((c) => c[1])).toStrictEqual(["off"]);
+-        expect(throttleLog()).toStrictEqual([
+-            "BMS: групповая к 'group_with_tradfri' отложена на 8990 мс (бюджет сети 3 групповых за 9000 мс)",
+-            'BMS: групповая к \'group_with_tradfri\' объединена с отложенной (2 шт.): {"state":"OFF"}',
+-        ]);
+     });
+ 
+     it("never delays commands to single devices", async () => {
+@@ -171,6 +169,10 @@
+         await set("group_1", {state: "ON"});
+         await set("group_1", {state: "ON", brightness: 100});
+         await set("group_1", {state: "TOGGLE"});
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["on"]);
++        await wait(1000);
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["on", "moveToLevelWithOnOff"]);
++        await wait(1000);
+         expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["on", "moveToLevelWithOnOff", "toggle"]);
+     });
+ 
+@@ -194,7 +196,7 @@
+         ]);
+     });
+ 
+-    it("logs a deferred group at most once per second", async () => {
++    it("bounds slider sends without a per-message info log", async () => {
+         await set("group_1", {brightness: 11});
+         for (let i = 2; i < 30; i++) {
+             await wait(50);
+@@ -205,7 +207,7 @@
+             ["moveToLevelWithOnOff", 11],
+             ["moveToLevelWithOnOff", 30],
+         ]);
+-        expect(throttleLog()).toHaveLength(2);
++        expect(throttleLog()).toHaveLength(0);
+     });
+ 
+     it("behaves like upstream when turned off", async () => {
+@@ -218,4 +220,392 @@
+         ]);
+         expect(throttleLog()).toStrictEqual([]);
+     });
++    it("budgets every ZCL attempt in a mixed brightness and colour payload", async () => {
++        settings.set(["advanced", "bms_broadcast_budget"], 1);
++        await set("group_1", {brightness: 80, color_temp: 300});
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        await wait(8999);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        await wait(1);
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["moveToLevelWithOnOff", "moveToColorTemp"]);
++    });
++
++    it("queues twenty toggle actions without dropping or bypassing the sliding budget", async () => {
++        const times: number[] = [];
++        groups.group_1.command.mockImplementation(() => {
++            times.push(Date.now());
++            return Promise.resolve();
++        });
++        for (let i = 0; i < 20; i++) await set("group_1", {state: "TOGGLE"});
++        expect(times).toHaveLength(1);
++        await wait(30000);
++        expect(times).toHaveLength(20);
++        for (const time of times) expect(times.filter((t) => t > time - 9000 && t <= time).length).toBeLessThanOrEqual(8);
++        expect(groups.group_1.command.mock.calls.every((c) => c[1] === "toggle")).toBe(true);
++        groups.group_1.command.mockReset();
++    });
++
++    it("keeps a newer member command after an older delayed group without losing other members", async () => {
++        const order: string[] = [];
++        groups.group_1.command.mockImplementation((_cluster, command) => {
++            order.push(`group:${command}`);
++            return Promise.resolve();
++        });
++        bulbColor.command.mockImplementation((_cluster, command) => {
++            order.push(`member:${command}`);
++            return Promise.resolve();
++        });
++        await set("group_1", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        await set("bulb_color", {state: "ON"});
++        expect(order).toStrictEqual(["group:on"]);
++        await wait(1000);
++        expect(order).toStrictEqual(["group:on", "group:off", "member:on"]);
++        groups.group_1.command.mockReset();
++        bulbColor.command.mockReset();
++    });
++
++    it("seals older group intent when a newer member and another group intent intervene", async () => {
++        const order: string[] = [];
++        groups.group_1.command.mockImplementation((_cluster, command) => {
++            order.push(`group:${command}`);
++            return Promise.resolve();
++        });
++        bulbColor.command.mockImplementation((_cluster, command) => {
++            order.push(`member:${command}`);
++            return Promise.resolve();
++        });
++        await set("group_1", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        await set("bulb_color", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        await wait(2000);
++        expect(order).toStrictEqual(["group:on", "group:off", "member:on", "group:off"]);
++        groups.group_1.command.mockReset();
++        bulbColor.command.mockReset();
++    });
++
++    it("orders intersecting groups while an unrelated device remains responsive", async () => {
++        const order: string[] = [];
++        groups.group_2.members.push(bulbColor2, bulb2);
++        groups.group_1.command.mockImplementation((_cluster, command) => {
++            order.push(`A:${command}`);
++            return Promise.resolve();
++        });
++        groups.group_2.command.mockImplementation((_cluster, command) => {
++            order.push(`B:${command}`);
++            return Promise.resolve();
++        });
++        await set("group_1", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        await set("group_2", {state: "ON"});
++        await set("bulb", {state: "OFF"});
++        expect(bulb.command).toHaveBeenCalledTimes(1);
++        expect(order).toStrictEqual(["A:on"]);
++        await wait(1000);
++        expect(order).toStrictEqual(["A:on", "A:off", "B:on"]);
++        groups.group_1.command.mockReset();
++        groups.group_2.command.mockReset();
++    });
++
++    it("does not let a group overtake an in-flight unicast", async () => {
++        let complete!: () => void;
++        bulbColor.command.mockImplementationOnce(
++            () =>
++                new Promise<void>((r) => {
++                    complete = r;
++                }),
++        );
++        await set("bulb_color", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        await wait(2000);
++        expect(groups.group_1.command).not.toHaveBeenCalled();
++        complete();
++        await flushPromises();
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["off"]);
++    });
++
++    it("does not reorder a coalescer remainder behind the following group", async () => {
++        settings.set(["advanced", "bms_group_coalescing"], true);
++        let complete!: () => void;
++        const order: string[] = [];
++        bulbColor.command.mockImplementationOnce(
++            () =>
++                new Promise<void>((r) => {
++                    complete = r;
++                }),
++        );
++        bulbColor.command.mockImplementationOnce(() => {
++            order.push("member");
++            return Promise.resolve();
++        });
++        groups.group_1.command.mockImplementation(() => {
++            order.push("group");
++            return Promise.resolve();
++        });
++        await set("bulb_color", {state: "ON"});
++        await wait(50);
++        await set("bulb_color", {state: "OFF"});
++        await set("group_1", {state: "ON"});
++        expect(order).toStrictEqual([]);
++        complete();
++        await flushPromises();
++        expect(order).toStrictEqual(["member", "group"]);
++        groups.group_1.command.mockReset();
++    });
++    it("reports intent and API attempts separately without treating either as device delivery", async () => {
++        settings.set(["advanced", "bms_device_reports"], true);
++        await set("group_1", {brightness: 80, color_temp: 300});
++        await set("bulb", {state: "OFF"});
++        await wait(1000);
++        const events = published("bridge/bms/tx_event");
++        expect(events.filter((e) => e.kind === "mqtt_intent")).toHaveLength(2);
++        const attempts = events.filter((e) => e.evidence === "api_attempt");
++        expect(attempts.filter((e) => e.kind === "group_frame")).toHaveLength(2);
++        expect(attempts.filter((e) => e.kind === "unicast_frame")).toHaveLength(1);
++        expect(new Set(events.map((e) => e.session_id)).size).toBe(1);
++        expect(events.map((e) => e.sequence)).toStrictEqual([1, 2, 3, 4, 5]);
++    });
++    it("drains shutdown without bypassing the group budget", async () => {
++        const emitted: number[] = [];
++        const scheduler = new GroupThrottle(
++            controller.zigbee,
++            async () => {
++                await scheduler.wrap(groups.group_1 as unknown as zh.Group).command("genOnOff", "toggle", {});
++                emitted.push(Date.now());
++            },
++            () => ({state: "TOGGLE"}),
++        );
++        const topic = {ID: "group_1", endpoint: undefined, attribute: "", type: "set" as const};
++        for (let i = 0; i < 3; i++) scheduler.offer(topic, {topic: "zigbee2mqtt/group_1/set", message: "TOGGLE"});
++        await flushPromises();
++        const stopping = scheduler.stop();
++        expect(emitted).toHaveLength(1);
++        await wait(999);
++        expect(emitted).toHaveLength(1);
++        await wait(1001);
++        await stopping;
++        expect(emitted).toHaveLength(3);
++        expect(emitted[1] - emitted[0]).toBe(1000);
++        expect(emitted[2] - emitted[1]).toBe(1000);
++    });
++
++    it("preserves herdsman private getters, method receiver and constructor identity", async () => {
++        class Group {
++            groupID = 1234;
++            #value = 5;
++            get customClusters(): number {
++                return this.#value;
++            }
++            command(): Promise<number> {
++                return Promise.resolve(this.#value);
++            }
++        }
++        const original = new Group();
++        const scheduler = new GroupThrottle(
++            controller.zigbee,
++            () => Promise.resolve(),
++            () => undefined,
++        );
++        const wrapped = scheduler.wrap(original as unknown as zh.Group);
++        expect(wrapped.constructor).toBe(Group);
++        expect(wrapped.customClusters).toBe(5);
++        expect(await wrapped.command("genOnOff", "on", {})).toBe(5);
++        expect(original.customClusters).toBe(5);
++    });
++    it("strips measurement metadata before coalescing and records its ingress correlation", async () => {
++        settings.set(["advanced", "bms_device_reports"], true);
++        settings.set(["advanced", "bms_group_coalescing"], true);
++        await set("bulb_color", {state: "ON", __bms_command_id: "measure-a"});
++        await set("bulb_color_2", {state: "ON", __bms_command_id: "measure-b"});
++        await wait(50);
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["on"]);
++        expect(bulbColor.command).not.toHaveBeenCalled();
++        const intents = published("bridge/bms/tx_event").filter((e) => e.kind === "mqtt_intent");
++        expect(intents.map((e) => e.command_id)).toStrictEqual(["measure-a", "measure-b"]);
++        expect(intents.every((e) => typeof e.received_at === "number")).toBe(true);
++    });
++
++    it("cancels a queued group command if physical destinations changed while it waited", async () => {
++        mockLogger.error.mockClear();
++        await set("group_1", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        groups.group_1.members.push(bulb2);
++        await wait(1000);
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toStrictEqual(["on"]);
++        expect(mockLogger.error.mock.calls.some((call) => String(call[0]).includes("состав группы изменился"))).toBe(true);
++    });
++    it("does not inherit an old transition into a newer action", async () => {
++        expect(mergeGroupMessage({brightness: 200, transition: 30}, {state: "OFF"})).toStrictEqual({state: "OFF"});
++        expect(mergeGroupMessage({brightness: 200, transition: 30}, {brightness: 20})).toStrictEqual({brightness: 20});
++        expect(mergeGroupMessage({brightness: 200, transition: 30}, {brightness: 20, transition: 2})).toStrictEqual({brightness: 20, transition: 2});
++        await set("group_1", {state: "ON"});
++        await set("group_1", {brightness: 200, transition: 30});
++        await set("group_1", {state: "OFF"});
++        await wait(1000);
++        expect(groups.group_1.command.mock.calls.map((call) => call[1])).toStrictEqual(["on", "off"]);
++    });
++
++    it("counts nested meta.device and entity.getDevice endpoint calls once and preserves graph identity", async () => {
++        settings.set(["advanced", "bms_device_reports"], true);
++        const model = controller.zigbee.resolveEntity("bulb_color")!;
++        if (!model.isDevice() || !model.definition) throw new Error("test device missing");
++        const definition = model.definition;
++        model.definition = {
++            ...definition,
++            toZigbee: [
++                {
++                    key: ["state"],
++                    convertSet: async (entity, _key, _value, meta) => {
++                        const endpoint = entity as zh.Endpoint;
++                        const device = meta.device!;
++                        expect(device.getEndpoint(1)).toBe(endpoint);
++                        expect(endpoint.getDevice()).toBe(device);
++                        expect(device.endpoints.find((entry) => entry.ID === 1)).toBe(endpoint);
++                        await device.getEndpoint(1)!.command("genOnOff", "on", {});
++                        await endpoint.getDevice().getEndpoint(1)!.write("genOnOff", {onOff: 1});
++                        await device.endpoints.find((entry) => entry.ID === 1)!.read("genOnOff", ["onOff"]);
++                        await endpoint.getDevice().getEndpoint(1)!.command("genOnOff", "off", {});
++                    },
++                },
++            ],
++        };
++        try {
++            await set("bulb_color", {state: "ON"});
++            const attempts = published("bridge/bms/tx_event").filter((event) => event.kind === "unicast_frame");
++            expect(attempts.map((event) => event.operation)).toStrictEqual(["command", "write", "read", "command"]);
++        } finally {
++            model.definition = definition;
++        }
++    });
++
++    it("preserves nested native private getters and getDevice receivers", async () => {
++        class Device {
++            #endpoint = new Endpoint(this);
++            #model = "before";
++            get modelID(): string {
++                return this.#model;
++            }
++            set modelID(value: string) {
++                this.#model = value;
++            }
++            get endpoints(): Endpoint[] {
++                return [this.#endpoint];
++            }
++            getEndpoint(): Endpoint {
++                return this.#endpoint;
++            }
++        }
++        class Endpoint {
++            ID = 1;
++            deviceIeeeAddress = "test";
++            #owner: Device;
++            constructor(owner: Device) {
++                this.#owner = owner;
++            }
++            getDevice(): Device {
++                return this.#owner;
++            }
++            command(): Promise<Device> {
++                return Promise.resolve(this.#owner);
++            }
++        }
++        const report = vi.fn();
++        const scheduler = new GroupThrottle(
++            controller.zigbee,
++            () => Promise.resolve(),
++            () => undefined,
++            report,
++        );
++        const native = new Device();
++        const device = scheduler.view()(native as unknown as zh.Device);
++        const endpoint = device.getEndpoint(1)!;
++        device.modelID = "after";
++        expect(device.modelID).toBe("after");
++        expect(native.modelID).toBe("after");
++        expect(device.endpoints[0]).toBe(endpoint);
++        expect(endpoint.getDevice()).toBe(device);
++        expect(await endpoint.command("genOnOff", "on", {})).toBe(native);
++        expect(report).toHaveBeenCalledTimes(1);
++    });
++
++    it("cancels pending group traffic while a new member is already joining in hardware but not in the database", async () => {
++        await set("group_1", {state: "ON"});
++        await set("group_1", {state: "OFF"});
++        const key = Symbol.for("bms.groupMembership");
++        const oldRegistry = Reflect.get(controller.zigbee, key);
++        Object.assign(controller.zigbee, {
++            [key]: {
++                withDeviceLock: async (_ieee: string, task: () => Promise<void>) => {
++                    await task();
++                },
++                invalidate: vi.fn(),
++                verify: () => Promise.resolve(new Set([groups.group_1.groupID])),
++                isVerified: () => true,
++            },
++        });
++        let release!: () => void;
++        bulb2.addToGroup.mockImplementationOnce(
++            () =>
++                new Promise<void>((resolve) => {
++                    release = resolve;
++                }),
++        );
++        const joining = mockMQTTEvents.message("zigbee2mqtt/bridge/request/group/members/add", stringify({group: "group_1", device: "bulb_2"}));
++        await flushPromises();
++        expect(groups.group_1.members).not.toContain(bulb2);
++        await wait(1000);
++        expect(groups.group_1.command.mock.calls.map((call) => call[1])).toStrictEqual(["on"]);
++        release();
++        await joining;
++        await flushPromises();
++        Reflect.set(controller.zigbee, key, oldRegistry);
++    });
++    it.each([true, false])("cancels a queued group after existing-member invalidation (changing=%s)", async (changing) => {
++        const key = Symbol.for("bms.groupMembership");
++        const oldRegistry = Reflect.get(controller.zigbee, key);
++        let epoch = 0;
++        let active = false;
++        Reflect.set(controller.zigbee, key, {getEpoch: () => epoch, isChanging: () => active, isVerified: () => !active});
++        try {
++            await set("group_1", {state: "ON"});
++            await set("group_1", {state: "OFF"});
++            epoch += 1;
++            active = changing;
++            await wait(1000);
++            expect(groups.group_1.command.mock.calls.map((call) => call[1])).toStrictEqual(["on"]);
++        } finally {
++            Reflect.set(controller.zigbee, key, oldRegistry);
++        }
++    });
++
++    it("rejects group admission while an existing member is changing", async () => {
++        const key = Symbol.for("bms.groupMembership");
++        const oldRegistry = Reflect.get(controller.zigbee, key);
++        let changing = true;
++        Reflect.set(controller.zigbee, key, {getEpoch: () => 1, isChanging: () => changing, isVerified: () => !changing});
++        try {
++            await set("group_1", {state: "ON"});
++            changing = false;
++            await wait(1000);
++            expect(groups.group_1.command).not.toHaveBeenCalled();
++        } finally {
++            Reflect.set(controller.zigbee, key, oldRegistry);
++        }
++    });
++
++    it("normalizes an invalid fractional runtime budget instead of bypassing throttling", async () => {
++        const original = settings.get();
++        const configuration = vi.spyOn(settings, "get").mockReturnValue({...original, advanced: {...original.advanced, bms_broadcast_budget: 1.5}});
++        try {
++            await set("group_1", {state: "TOGGLE"});
++            await set("group_1", {state: "TOGGLE"});
++            await wait(8999);
++            expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++            await wait(1);
++            expect(groups.group_1.command).toHaveBeenCalledTimes(2);
++        } finally {
++            configuration.mockRestore();
++        }
++    });
+ });
+diff --git a/test/extensions/bmsGroupCoalescing.test.ts b/test/extensions/bmsGroupCoalescing.test.ts
+--- a/test/extensions/bmsGroupCoalescing.test.ts
++++ b/test/extensions/bmsGroupCoalescing.test.ts
+@@ -41,6 +41,8 @@
+         vi.useFakeTimers();
+         data.writeEmptyState();
+         controller = new Controller(vi.fn(), vi.fn());
++        // Физическое членство проверяет слой Tuya; здесь фиксируем подтверждённый стенд.
++        Object.assign(controller.zigbee, {[Symbol.for("bms.groupMembership")]: {isVerified: () => true}});
+         mockSleep.mock();
+         await controller.start();
+         await flushPromises();
+@@ -325,4 +327,15 @@
+         expect(groups.group_1.command).toHaveBeenCalledTimes(0);
+         expect(bulbColor.command).toHaveBeenCalledTimes(1);
+     });
++    it("falls back to unicast if physical group membership is unknown", async () => {
++        groups.group_1.members.push(bulbColor, bulbColor2);
++        Reflect.deleteProperty(controller.zigbee, Symbol.for("bms.groupMembership"));
++        await set("bulb_color", {state: "ON"});
++        await set("bulb_color_2", {state: "ON"});
++        await passWindow();
++        expect(groups.group_1.command).not.toHaveBeenCalled();
++        expect(bulbColor.command).toHaveBeenCalledTimes(1);
++        expect(bulbColor2.command).toHaveBeenCalledTimes(1);
++        Object.assign(controller.zigbee, {[Symbol.for("bms.groupMembership")]: {isVerified: () => true}});
++    });
+ });
+diff --git a/test/extensions/bmsGroupEndpoints.test.ts b/test/extensions/bmsGroupEndpoints.test.ts
+--- a/test/extensions/bmsGroupEndpoints.test.ts
++++ b/test/extensions/bmsGroupEndpoints.test.ts
+@@ -63,6 +63,8 @@
+         vi.useFakeTimers();
+         data.writeEmptyState();
+         controller = new Controller(vi.fn(), vi.fn());
++        // Физическое членство проверяет слой Tuya; здесь фиксируем подтверждённый стенд.
++        Object.assign(controller.zigbee, {[Symbol.for("bms.groupMembership")]: {isVerified: () => true}});
+         mockSleep.mock();
+         await controller.start();
+         await flushPromises();
+diff --git a/test/extensions/groups.test.ts b/test/extensions/groups.test.ts
+--- a/test/extensions/groups.test.ts
++++ b/test/extensions/groups.test.ts
+@@ -8,6 +8,7 @@
+ 
+ import {stringify} from "../../lib/util/stringify";
+ import * as zhcGlobalStore from "zigbee-herdsman-converters/lib/store";
++import {beginGroupRemoval} from "../../lib/util/bmsGroupMembership";
+ import {Controller} from "../../lib/controller";
+ import * as settings from "../../lib/util/settings";
+ 
+@@ -39,6 +40,7 @@
+     });
+ 
+     beforeEach(() => {
++        Reflect.deleteProperty(controller.zigbee, Symbol.for("bms.groupMembership"));
+         resetGroupMembers();
+         data.writeDefaultConfiguration();
+         settings.reRead();
+@@ -819,4 +821,82 @@
+             qos: 0,
+         });
+     });
++    it("BMS waits for cleanup lock and verifies membership before acknowledging bridge add", async () => {
++        const endpoint = devices.bulb_color.getEndpoint(1)!;
++        endpoint.addToGroup.mockClear();
++        let release!: () => void;
++        const cleanup = new Promise<void>((resolve) => {
++            release = resolve;
++        });
++        const invalidate = vi.fn();
++        const verify = vi.fn(() => Promise.resolve(new Set([groups.group_1.groupID])));
++        Object.assign(controller.zigbee, {
++            [Symbol.for("bms.groupMembership")]: {
++                withDeviceLock: async (_ieee: string, task: () => Promise<void>) => {
++                    await cleanup;
++                    await task();
++                },
++                invalidate,
++                verify,
++            },
++        });
++        const request = mockMQTTEvents.message("zigbee2mqtt/bridge/request/group/members/add", stringify({group: "group_1", device: "bulb_color"}));
++        await flushPromises();
++        expect(endpoint.addToGroup).not.toHaveBeenCalled();
++        expect(verify).not.toHaveBeenCalled();
++        release();
++        await request;
++        await flushPromises();
++        expect(endpoint.addToGroup).toHaveBeenCalledTimes(1);
++        expect(invalidate).toHaveBeenCalledWith(devices.bulb_color.ieeeAddr, 1);
++        expect(verify).toHaveBeenCalledWith(endpoint);
++        const response = mockMQTTPublishAsync.mock.calls.find((c) => c[0].endsWith("response/group/members/add"));
++        expect(JSON.parse(response![1]).status).toBe("ok");
++    });
++
++    it("BMS reports failed physical verification instead of successful database-only membership", async () => {
++        const invalidate = vi.fn();
++        Object.assign(controller.zigbee, {
++            [Symbol.for("bms.groupMembership")]: {
++                withDeviceLock: async (_ieee: string, task: () => Promise<void>) => {
++                    await task();
++                },
++                invalidate,
++                verify: () => Promise.resolve(new Set<number>()),
++            },
++        });
++        await mockMQTTEvents.message("zigbee2mqtt/bridge/request/group/members/add", stringify({group: "group_1", device: "bulb_color"}));
++        await flushPromises();
++        const response = mockMQTTPublishAsync.mock.calls.find((c) => c[0].endsWith("response/group/members/add"));
++        expect(JSON.parse(response![1]).status).toBe("error");
++        expect(invalidate).toHaveBeenCalledTimes(2);
++    });
++    it("BMS rejects a stale parsed group after waiting across a completed group removal", async () => {
++        const endpoint = devices.bulb_color.getEndpoint(1)!;
++        endpoint.addToGroup.mockClear();
++        let release!: () => void;
++        const held = new Promise<void>((resolve) => {
++            release = resolve;
++        });
++        Object.assign(controller.zigbee, {
++            [Symbol.for("bms.groupMembership")]: {
++                withDeviceLock: async (_ieee: string, task: () => Promise<void>) => {
++                    await held;
++                    await task();
++                },
++                invalidate: vi.fn(),
++                verify: () => Promise.resolve(new Set([groups.group_1.groupID])),
++            },
++        });
++        const adding = mockMQTTEvents.message("zigbee2mqtt/bridge/request/group/members/add", stringify({group: "group_1", device: "bulb_color"}));
++        await flushPromises();
++        const finish = beginGroupRemoval(controller.zigbee, groups.group_1.groupID);
++        finish();
++        release();
++        await adding;
++        await flushPromises();
++        expect(endpoint.addToGroup).not.toHaveBeenCalled();
++        const response = mockMQTTPublishAsync.mock.calls.find((call) => call[0].endsWith("response/group/members/add"));
++        expect(JSON.parse(response![1]).status).toBe("error");
++    });
+ });
+diff --git a/test/extensions/bridge.test.ts b/test/extensions/bridge.test.ts
+--- a/test/extensions/bridge.test.ts
++++ b/test/extensions/bridge.test.ts
+@@ -124,6 +124,7 @@
+                         adapter_delay: undefined,
+                         bms_group_coalescing: true,
+                         bms_group_coalescing_window: 50,
++                        bms_device_reports: false,
+                         bms_group_throttle: true,
+                         bms_group_throttle_window: 1000,
+                         bms_broadcast_budget: 8,
+@@ -3256,6 +3257,65 @@
+         );
+     });
+ 
++    it("BMS deletes a group through per-device locks and physical verification", async () => {
++        const group = groups.group_1;
++        const endpoint = devices.bulb_color.getEndpoint(1)!;
++        group.members.push(endpoint);
++        const verify = vi.fn(() => Promise.resolve(new Set<number>()));
++        const invalidate = vi.fn();
++        const withDeviceLock = vi.fn(async (_ieee: string, task: () => Promise<void>) => {
++            await task();
++        });
++        Object.assign(controller.zigbee, {[Symbol.for("bms.groupMembership")]: {withDeviceLock, invalidate, verify}});
++        try {
++            await mockMQTTEvents.message("zigbee2mqtt/bridge/request/group/remove", "group_1");
++            await flushPromises();
++            expect(withDeviceLock).toHaveBeenCalledWith(endpoint.deviceIeeeAddress, expect.any(Function));
++            expect(verify).toHaveBeenCalledWith(endpoint);
++            expect(invalidate).toHaveBeenCalledWith(endpoint.deviceIeeeAddress, endpoint.ID);
++            expect(group.removeFromDatabase).toHaveBeenCalled();
++        } finally {
++            Reflect.deleteProperty(controller.zigbee, Symbol.for("bms.groupMembership"));
++            group.removeFromDatabase.mockClear();
++        }
++    });
++
++    it("BMS rejects a new endpoint add while another endpoint is being removed with the group", async () => {
++        const group = groups.group_1;
++        const oldEndpoint = devices.bulb_color.getEndpoint(1)!;
++        const newEndpoint = devices.bulb_color_2.getEndpoint(1)!;
++        group.members.push(oldEndpoint);
++        newEndpoint.addToGroup.mockClear();
++        let release!: () => void;
++        oldEndpoint.removeFromGroup.mockImplementationOnce(
++            () =>
++                new Promise<void>((resolve) => {
++                    release = resolve;
++                }),
++        );
++        Object.assign(controller.zigbee, {
++            [Symbol.for("bms.groupMembership")]: {
++                withDeviceLock: async (_ieee: string, task: () => Promise<void>) => {
++                    await task();
++                },
++                invalidate: vi.fn(),
++                verify: () => Promise.resolve(new Set<number>()),
++            },
++        });
++        const removal = mockMQTTEvents.message("zigbee2mqtt/bridge/request/group/remove", "group_1");
++        await flushPromises();
++        await mockMQTTEvents.message("zigbee2mqtt/bridge/request/group/members/add", stringify({group: "group_1", device: "bulb_color_2"}));
++        await flushPromises();
++        expect(newEndpoint.addToGroup).not.toHaveBeenCalled();
++        const response = mockMQTTPublishAsync.mock.calls.find((call) => call[0].endsWith("response/group/members/add"));
++        expect(JSON.parse(response![1]).status).toBe("error");
++        release();
++        await removal;
++        await flushPromises();
++        Reflect.deleteProperty(controller.zigbee, Symbol.for("bms.groupMembership"));
++        group.removeFromDatabase.mockClear();
++    });
++
+     it("Should allow to remove group", async () => {
+         const group = groups.group_1;
+         const removeGroupFromLookup = vi.spyOn(controller.zigbee, "removeGroupFromLookup");

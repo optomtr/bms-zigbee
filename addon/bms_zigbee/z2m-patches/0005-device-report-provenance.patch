@@ -1,0 +1,222 @@
+BMS: optional receive-only device report provenance and source command correlation.
+Reports precede cache/debounce/post-processing; ordinary state cannot confirm execution.
+Also reject fractional broadcast budgets (the scheduler counts discrete API calls).
+
+diff --git a/lib/extension/receive.ts b/lib/extension/receive.ts
+--- a/lib/extension/receive.ts
++++ b/lib/extension/receive.ts
+@@ -1,4 +1,5 @@
+ import assert from "node:assert";
++import {randomUUID} from "node:crypto";
+ import bind from "bind-decorator";
+ import debounce from "debounce";
+ import throttle from "throttleit";
+@@ -12,13 +13,26 @@
+ type DebounceFunction = (() => void) & {clear(): void} & {flush(): void};
+ 
+ export default class Receive extends Extension {
++    private reportSession = "";
++    private reportSequence = 0;
++    private reportEnabled = false;
+     // TODO: move all to `Map`
+     private elapsed: {[s: string]: number} = {};
+     private debouncers: {[s: string]: {payload: KeyValue; publish: DebounceFunction}} = {};
+     private throttlers: {[s: string]: {publish: PublishEntityState}} = {};
+ 
+-    // biome-ignore lint/suspicious/useAwait: API
+     override async start(): Promise<void> {
++        this.reportEnabled = settings.get().advanced.bms_device_reports;
++        this.reportSession = randomUUID();
++        if (this.reportEnabled) {
++            await this.mqtt.publish(
++                "bridge/bms/capabilities",
++                stringify({schema: 1, device_reports: true, command_correlation: true, session_id: this.reportSession}),
++                {
++                    clientOptions: {retain: true, qos: 0},
++                },
++            );
++        }
+         this.eventBus.onPublishEntityState(this, this.onPublishEntityState);
+         this.eventBus.onDeviceMessage(this, this.onDeviceMessage);
+     }
+@@ -100,6 +114,7 @@
+     }
+ 
+     @bind async onDeviceMessage(data: eventdata.DeviceMessage): Promise<void> {
++        const receivedAt = Date.now();
+         /* v8 ignore start */
+         if (!data.device) return;
+         /* v8 ignore stop */
+@@ -180,6 +195,33 @@
+         }
+ 
+         if (!utils.objectIsEmpty(payload)) {
++            // BMS: только прямой результат входящего кадра, ДО cache_state/debounce/groupOptimistic.
++            // Отложенный callback конвертера сюда не попадает: он может публиковать вычисленное состояние.
++            if (this.reportEnabled) {
++                try {
++                    await this.mqtt.publish(
++                        "bridge/bms/device_report",
++                        stringify({
++                            schema: 1,
++                            source: "device",
++                            session_id: this.reportSession,
++                            sequence: ++this.reportSequence,
++                            received_at: receivedAt,
++                            ieee_address: data.device.ieeeAddr,
++                            friendly_name: data.device.name,
++                            endpoint: data.endpoint.ID,
++                            cluster: data.cluster,
++                            type: data.type,
++                            transaction_sequence_number: data.meta?.zclTransactionSequenceNumber,
++                            raw: data.data,
++                            payload,
++                        }),
++                        {clientOptions: {retain: false, qos: 0}, skipLog: true},
++                    );
++                } catch (error) {
++                    logger.warning(`BMS: diagnostic device report failed: ${error}`);
++                }
++            }
+             await publish(payload);
+         } else if (settings.get().advanced.last_seen && settings.get().advanced.last_seen !== "disable") {
+             // A message was received that produced no payload (e.g. a frame the converter has no data
+diff --git a/lib/types/api.ts b/lib/types/api.ts
+--- a/lib/types/api.ts
++++ b/lib/types/api.ts
+@@ -219,6 +219,8 @@
+         /** 3.0: default to false (JSON schema & settings `defaults`) */
+         enable_external_js: boolean;
+         /** BMS: склейка одинаковых команд устройствам в групповую команду (lib/util/bmsGroupCoalescing.ts) */
++        /** BMS: отдельные входящие отчёты для достоверного замера. */
++        bms_device_reports: boolean;
+         bms_group_coalescing: boolean;
+         /** BMS: окно склейки, мс */
+         bms_group_coalescing_window: number;
+diff --git a/lib/util/settings.schema.json b/lib/util/settings.schema.json
+--- a/lib/util/settings.schema.json
++++ b/lib/util/settings.schema.json
+@@ -825,6 +825,12 @@
+                     "default": true,
+                     "requiresRestart": true
+                 },
++                "bms_device_reports": {
++                    "type": "boolean",
++                    "default": false,
++                    "title": "BMS diagnostic device reports",
++                    "description": "Publish incoming converted device reports separately from cached/optimistic state for the BMS test harness. Requires restart."
++                },
+                 "bms_group_coalescing": {
+                     "type": "boolean",
+                     "title": "BMS: group command coalescing",
+@@ -853,8 +859,8 @@
+                     "default": 1000
+                 },
+                 "bms_broadcast_budget": {
+-                    "type": "number",
+-                    "title": "BMS: max group commands per budget window (whole network)",
++                    "type": "integer",
++                    "title": "BMS: max group ZCL API attempts per budget window (whole network)",
+                     "minimum": 1,
+                     "maximum": 15,
+                     "default": 8
+diff --git a/lib/util/settings.ts b/lib/util/settings.ts
+--- a/lib/util/settings.ts
++++ b/lib/util/settings.ts
+@@ -114,6 +114,7 @@
+         timestamp_format: "YYYY-MM-DD HH:mm:ss",
+         output: "json",
+         enable_external_js: true,
++        bms_device_reports: false,
+         bms_group_coalescing: true,
+         bms_group_coalescing_window: 50,
+         bms_group_throttle: true,
+diff --git a/test/extensions/bmsDeviceReports.test.ts b/test/extensions/bmsDeviceReports.test.ts
+new file mode 100644
+--- /dev/null
++++ b/test/extensions/bmsDeviceReports.test.ts
+@@ -0,0 +1,84 @@
++// biome-ignore assist/source/organizeImports: import mocks first
++import {afterAll, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
++import * as data from "../mocks/data";
++import {mockMQTTPublishAsync, events as mqttEvents} from "../mocks/mqtt";
++import * as mockSleep from "../mocks/sleep";
++import {flushPromises} from "../mocks/utils";
++import {devices, events as zhEvents} from "../mocks/zigbeeHerdsman";
++import {Controller} from "../../lib/controller";
++import * as settings from "../../lib/util/settings";
++
++describe("BMS device report provenance", () => {
++    let controller: Controller;
++    const reports = () => mockMQTTPublishAsync.mock.calls.filter((c) => c[0] === "zigbee2mqtt/bridge/bms/device_report");
++    beforeAll(async () => {
++        vi.useFakeTimers();
++        data.writeDefaultConfiguration();
++        settings.reRead();
++        settings.set(["advanced", "bms_device_reports"], true);
++        controller = new Controller(vi.fn(), vi.fn());
++        mockSleep.mock();
++        await controller.start();
++        await flushPromises();
++    });
++    beforeEach(() => {
++        controller.state.clear();
++        mockMQTTPublishAsync.mockClear();
++    });
++    afterAll(async () => {
++        mockSleep.restore();
++        await controller.stop();
++        await flushPromises();
++        vi.useRealTimers();
++    });
++    it("reports only fields returned for the incoming frame, not cached state", async () => {
++        const device = devices.bulb_color;
++        const resolved = controller.zigbee.resolveEntity(device.ieeeAddr)!;
++        controller.state.set(resolved, {state: "ON", brightness: 200});
++        const receivedAt = Date.now();
++        await zhEvents.message({
++            device,
++            endpoint: device.getEndpoint(1),
++            cluster: "genLevelCtrl",
++            type: "attributeReport",
++            data: {currentLevel: 70},
++            linkquality: 20,
++            meta: {zclTransactionSequenceNumber: 9},
++        });
++        await flushPromises();
++        expect(reports()).toHaveLength(1);
++        const packet = JSON.parse(reports()[0][1]);
++        expect(packet).toMatchObject({
++            schema: 1,
++            source: "device",
++            received_at: receivedAt,
++            endpoint: 1,
++            raw: {currentLevel: 70},
++            payload: {brightness: 70},
++        });
++        expect(packet.payload.state).toBeUndefined();
++        expect(reports()[0][2]).toMatchObject({retain: false, qos: 0});
++    });
++    it("optimistic publication and a direct MQTT command do not become device reports", async () => {
++        await mqttEvents.message("zigbee2mqtt/bulb_color/set", '{"state":"ON"}');
++        await vi.advanceTimersByTimeAsync(250);
++        await flushPromises();
++        expect(reports()).toHaveLength(0);
++    });
++    it("emits original report before debounce and ignores derived delayed callbacks", async () => {
++        settings.set(["devices", devices.bulb_color.ieeeAddr, "debounce"], 1);
++        await zhEvents.message({
++            device: devices.bulb_color,
++            endpoint: devices.bulb_color.getEndpoint(1),
++            cluster: "genOnOff",
++            type: "attributeReport",
++            data: {onOff: 0},
++            linkquality: 20,
++        });
++        await flushPromises();
++        expect(reports()).toHaveLength(1);
++        expect(JSON.parse(reports()[0][1]).payload).toMatchObject({state: "OFF"});
++        await vi.advanceTimersByTimeAsync(1100);
++        expect(reports()).toHaveLength(1);
++    });
++});

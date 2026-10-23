@@ -65,6 +65,11 @@ class Pair:
     far: bool = False              # дальнее, за повторителем (сценарий 3)
     tuya_device_id: str | None = None
     tuya_dp: str | None = None
+    ours_endpoint: int | None = None
+    ours_report_cluster: str | None = None
+    ours_report_field: str | None = None
+    ours_report_dp: int | None = None
+    ours_report_values: list | None = None
     ours_key: str = "state"
     ours_values: list = field(default_factory=list)
     tuya_values: list = field(default_factory=list)
@@ -166,12 +171,28 @@ def _pair(raw: dict, i: int) -> Pair:
         far=bool(raw.get("far", False)),
         tuya_device_id=tuya.get("device_id"),
         tuya_dp=str(tuya["dp"]) if tuya.get("dp") is not None else None,
+        ours_endpoint=ours.get("endpoint"),
+        ours_report_cluster=ours.get("report_cluster"),
+        ours_report_field=ours.get("report_field"),
+        ours_report_dp=ours.get("report_dp"),
+        ours_report_values=ours.get("report_values"),
         ours_key=raw.get("ours_key", defaults["ours_key"]),
         ours_values=list(raw.get("ours_values", defaults["ours_values"])),
         tuya_values=list(raw.get("tuya_values", defaults["tuya_values"])),
         ha_services=list(defaults["ha_services"]),
         ha_states=list(defaults["ha_states"]),
     )
+    if pair.ours_endpoint is not None and (type(pair.ours_endpoint) is not int or not 1 <= pair.ours_endpoint <= 240):
+        raise ConfigError(f"{where}.ours.endpoint: целое число 1…240")
+    if pair.ours_report_dp is not None and (type(pair.ours_report_dp) is not int or not 1 <= pair.ours_report_dp <= 255):
+        raise ConfigError(f"{where}.ours.report_dp: целое число 1…255")
+    if pair.ours_report_dp is not None and pair.ours_report_field is not None:
+        raise ConfigError(f"{where}.ours: report_dp и report_field взаимоисключающие")
+    if pair.ours_report_field is not None and (not isinstance(pair.ours_report_field, str) or not pair.ours_report_field or not pair.ours_report_cluster):
+        raise ConfigError(f"{where}.ours.report_field: нужен непустой ключ и report_cluster")
+    if pair.ours_report_dp is not None or pair.ours_report_field is not None:
+        if not isinstance(pair.ours_report_values, list) or len(pair.ours_report_values) != 2:
+            raise ConfigError(f"{where}.ours.report_values: два сырых значения [вкл, выкл]")
     for attr in ("ours_values", "tuya_values"):
         if len(getattr(pair, attr)) != 2:
             raise ConfigError(f"{where}.{attr}: ровно два значения - [вкл, выкл]")
