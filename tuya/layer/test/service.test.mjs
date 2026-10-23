@@ -408,3 +408,27 @@ test("cleanup: непроверенное removeAll не помечается у
     // Проверка вернула старую физическую группу. Это правда, но очищенным endpoint не считается.
     assert.ok(endpoint.hardwareGroups.has(7));
 });
+
+test("DP и инициализация используют общую очередь MCU; параллельные announce объединены", async () => {
+    const dev = await z2mDevice("_TZE200_bmsqueue1");
+    const {service, bus} = await start([dev]);
+    const pending = [];
+    service.zigbee[Symbol.for("bms.commandQueue")] = {runDevice: (ieee, task) => new Promise((resolve, reject) => pending.push({ieee, task, resolve, reject}))};
+    const dp = service.onMqttMessage({topic: `zigbee2mqtt/${dev.name}/set`, message: JSON.stringify({bms_dp: {dp: 1, type: "bool", value: true}})});
+    assert.equal(pending.length, 1);
+    assert.equal(dev.zh.endpoints[0].sent.length, 0);
+    const dpJob = pending.shift(); dpJob.resolve(await dpJob.task());
+    await dp;
+    const first = bus.h.deviceAnnounce({device: dev});
+    const second = bus.h.deviceAnnounce({device: dev});
+    await new Promise(r => setImmediate(r));
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].ieee, dev.zh.ieeeAddr);
+    pending.shift().reject(new Error("queue failed"));
+    await Promise.all([first, second]);
+    const third = bus.h.deviceAnnounce({device: dev});
+    await new Promise(r => setImmediate(r));
+    assert.equal(pending.length, 1, "после ошибки следующий announce может повторить инициализацию");
+    const job = pending.shift(); job.resolve(await job.task());
+    await third;
+});

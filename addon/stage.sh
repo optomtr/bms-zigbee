@@ -88,6 +88,9 @@ CORE_REVISION="$(tr -d '[:space:]' < "$REPO_ROOT/core/BMS_REVISION")"
 CORE_VERSION="$BASE_HERDSMAN-bms.$CORE_REVISION"
 CORE_TGZ="$CORE_DIST/zigbee-herdsman-$CORE_VERSION.tgz"
 [ -f "$CORE_TGZ" ] || die "нет обязательного $CORE_TGZ — сначала собрать ядро; fallback запрещён"
+EXPECTED_SHA="$(json_get "$VERSIONS_JSON" bms-core-sha256)" || die "в versions.json нет bms-core-sha256"
+ACTUAL_SHA="$(node -e 'const fs=require("fs"),c=require("crypto");console.log(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$CORE_TGZ")"
+[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || die "SHA ядра не совпадает с versions.json: ожидался $EXPECTED_SHA, получен $ACTUAL_SHA"
 {
     # Проверка, что это именно собранный пакет herdsman: Dockerfile ставит его как есть и не собирает.
     TGZ_LIST="$(tar -tzf "$CORE_TGZ" 2>/dev/null)" || die "$CORE_TGZ не читается как tgz"
@@ -155,6 +158,7 @@ fi
 [ "$LAYER_TOTAL" -gt 0 ] || note "слой Tuya пуст — образ соберётся без наших конвертеров и расширений"
 
 node "$ADDON_ROOT/tools/manifest.cjs"
+node "$ADDON_ROOT/tools/verify-stage.cjs"
 
 echo
 log "Готово. Дальше: образ собирает Home Assistant при установке (см. README.md), локально — docker build из bms_zigbee/."

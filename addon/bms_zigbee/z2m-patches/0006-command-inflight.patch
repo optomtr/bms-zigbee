@@ -1,0 +1,888 @@
+BMS package 2: keep converter operations and Tuya procedures ordered until completion.
+Applied after the preceding numbered patches to Zigbee2MQTT 2.14.2.
+
+diff --git a/lib/extension/publish.ts b/lib/extension/publish.ts
+index 72937d1..6185939 100644
+--- a/lib/extension/publish.ts
++++ b/lib/extension/publish.ts
+@@ -40,6 +40,11 @@ export default class Publish extends Extension {
+     // biome-ignore lint/suspicious/useAwait: API
+     override async start(): Promise<void> {
+         this.txSession = randomUUID();
++        Object.assign(this.zigbee, {
++            [Symbol.for("bms.commandQueue")]: {
++                runDevice: <T>(ieee: string, task: () => Promise<T>) => this.throttle.runDevice(ieee, task),
++            },
++        });
+         loadTopicGetSetRegex();
+         this.eventBus.onMQTTMessage(this, this.onMQTTMessage);
+     }
+@@ -109,6 +114,7 @@ export default class Publish extends Extension {
+         }
+     }
+ 
++    // biome-ignore lint/suspicious/useAwait: MQTT ingress acknowledges admission only
+     @bind async onMQTTMessage(data: eventdata.MQTTMessage): Promise<void> {
+         const parsedTopic = this.parseTopic(data.topic);
+ 
+@@ -132,7 +138,8 @@ export default class Publish extends Extension {
+             return;
+         }
+ 
+-        await this.publishOrThrottle(parsedTopic, data);
++        // MQTT ingress не ждёт бюджет; завершение отслеживается самим планировщиком/склейкой.
++        void this.publishOrThrottle(parsedTopic, data).catch((error) => logger.error(`BMS: publish failed: ${error}`));
+     }
+ 
+     @bind private reportTransmit(event: KeyValue): void {
+@@ -147,9 +154,9 @@ export default class Publish extends Extension {
+     }
+ 
+     @bind async publishOrThrottle(parsedTopic: ParsedTopic, data: eventdata.MQTTMessage): Promise<void> {
+-        if (!this.throttle.offer(parsedTopic, data)) {
+-            await this.publishParsed(parsedTopic, data);
+-        }
++        const done = this.throttle.submit(parsedTopic, data);
++        if (done !== undefined) await done;
++        else await this.publishParsed(parsedTopic, data);
+     }
+ 
+     @bind async publishParsed(
+@@ -178,194 +185,201 @@ export default class Publish extends Extension {
+             definition = re.membersDefinitions();
+         }
+         const view = this.throttle.view(expectedMembers, expectedVersion, expectedEpochs);
+-        const rawTarget = re instanceof Group ? re.zh : re.endpoint(parsedTopic.endpoint);
+-        const target = rawTarget ? view(rawTarget) : undefined;
+-
+-        if (!target) {
+-            logger.error(`Device '${re.name}' has no endpoint '${parsedTopic.endpoint}'`);
+-            return;
+-        }
+-
+-        // Convert the MQTT message to a Zigbee message.
+-        const message = this.parseMessage(parsedTopic, data);
++        try {
++            const rawTarget = re instanceof Group ? re.zh : re.endpoint(parsedTopic.endpoint);
++            const target = rawTarget ? view(rawTarget) : undefined;
+ 
+-        if (!message) {
+-            logger.error(`Invalid message '${message}', skipping...`);
+-            return;
+-        }
+-
+-        const device = re instanceof Device ? view(re.zh) : undefined;
+-        const entitySettings = re.options;
+-        const entityState = this.state.get(re);
+-        const membersState =
+-            re instanceof Group
+-                ? // biome-ignore lint/style/noNonNullAssertion: TODO: biome migration: might be a bit much assumed here?
+-                  Object.fromEntries(re.zh.members.map((e) => [e.deviceIeeeAddress, this.state.get(this.zigbee.resolveEntity(e.deviceIeeeAddress)!)]))
+-                : undefined;
+-        const converters = this.getDefinitionConverters(definition);
++            if (!target) {
++                logger.error(`Device '${re.name}' has no endpoint '${parsedTopic.endpoint}'`);
++                return;
++            }
+ 
+-        this.updateMessageHomeAssistant(message, entityState);
++            // Convert the MQTT message to a Zigbee message.
++            const message = this.parseMessage(parsedTopic, data);
+ 
+-        /**
+-         * Order state & brightness based on current bulb state
+-         *
+-         * Not all bulbs support setting the color/color_temp while it is off
+-         * this results in inconsistent behavior between different vendors.
+-         *
+-         * bulb on => move state & brightness to the back
+-         * bulb off => move state & brightness to the front
+-         */
+-        const entries = Object.entries(message);
+-        const sorter = typeof message.state === "string" && message.state.toLowerCase() === "off" ? 1 : -1;
+-        entries.sort((a) => (["state", "brightness", "brightness_percent"].includes(a[0]) ? sorter : sorter * -1));
+-
+-        // For each attribute call the corresponding converter
+-        const usedConverters: {[s: number]: zhc.Tz.Converter[]} = {};
+-        const toPublish: {[s: number | string]: KeyValue} = {};
+-        const toPublishEntity: {[s: number | string]: Device | Group} = {};
+-        const addToToPublish = (entity: Device | Group, payload: KeyValue): void => {
+-            const ID = entity.ID;
+-
+-            if (!(ID in toPublish)) {
+-                toPublish[ID] = {};
+-                toPublishEntity[ID] = entity;
++            if (!message) {
++                logger.error(`Invalid message '${message}', skipping...`);
++                return;
+             }
+ 
+-            toPublish[ID] = {...toPublish[ID], ...payload};
+-        };
+-
+-        const endpointNames = re instanceof Device ? re.getEndpointNames() : [];
+-        const propertyEndpointRegex = new RegExp(`^(.*?)_(${endpointNames.join("|")})$`);
+-        let scenesChanged = false;
+-
+-        for (const entry of entries) {
+-            let key = entry[0];
+-            const value = entry[1];
+-            let endpointName = parsedTopic.endpoint;
+-            let localTarget = target;
+-            let endpointOrGroupID = utils.isZHEndpoint(target) ? target.ID : target.groupID;
+-
+-            // When the key has a endpointName included (e.g. state_right), this will override the target.
+-            const propertyEndpointMatch = key.match(propertyEndpointRegex);
+-
+-            if (re instanceof Device && propertyEndpointMatch) {
+-                endpointName = propertyEndpointMatch[2];
+-                key = propertyEndpointMatch[1];
+-                // biome-ignore lint/style/noNonNullAssertion: endpointName is always matched to an existing endpoint of the device since `propertyEndpointRegex` only contains valid endpoints for this device
+-                localTarget = view(re.endpoint(endpointName)!);
+-                endpointOrGroupID = localTarget.ID;
+-            }
++            const device = re instanceof Device ? view(re.zh) : undefined;
++            const entitySettings = re.options;
++            const entityState = this.state.get(re);
++            const membersState =
++                re instanceof Group
++                    ? Object.fromEntries(
++                          // biome-ignore lint/style/noNonNullAssertion: group members resolve to devices
++                          re.zh.members.map((e) => [e.deviceIeeeAddress, this.state.get(this.zigbee.resolveEntity(e.deviceIeeeAddress)!)]),
++                      )
++                    : undefined;
++            const converters = this.getDefinitionConverters(definition);
++
++            this.updateMessageHomeAssistant(message, entityState);
++
++            /**
++             * Order state & brightness based on current bulb state
++             *
++             * Not all bulbs support setting the color/color_temp while it is off
++             * this results in inconsistent behavior between different vendors.
++             *
++             * bulb on => move state & brightness to the back
++             * bulb off => move state & brightness to the front
++             */
++            const entries = Object.entries(message);
++            const sorter = typeof message.state === "string" && message.state.toLowerCase() === "off" ? 1 : -1;
++            entries.sort((a) => (["state", "brightness", "brightness_percent"].includes(a[0]) ? sorter : sorter * -1));
++
++            // For each attribute call the corresponding converter
++            const usedConverters: {[s: number]: zhc.Tz.Converter[]} = {};
++            const toPublish: {[s: number | string]: KeyValue} = {};
++            const toPublishEntity: {[s: number | string]: Device | Group} = {};
++            const addToToPublish = (entity: Device | Group, payload: KeyValue): void => {
++                const ID = entity.ID;
++
++                if (!(ID in toPublish)) {
++                    toPublish[ID] = {};
++                    toPublishEntity[ID] = entity;
++                }
+ 
+-            if (usedConverters[endpointOrGroupID] === undefined) usedConverters[endpointOrGroupID] = [];
+-            // Match any key if the toZigbee converter defines no key.
+-            const converter = converters.find(
+-                (c) =>
+-                    (!c.key || c.key.includes(key)) && (re instanceof Group || !c.endpoints || (endpointName && c.endpoints.includes(endpointName))),
+-            );
+-
+-            if (parsedTopic.type === "set" && converter && usedConverters[endpointOrGroupID].includes(converter)) {
+-                // Use a converter for set only once
+-                // (e.g. light_onoff_brightness converters can convert state and brightness)
+-                continue;
+-            }
++                toPublish[ID] = {...toPublish[ID], ...payload};
++            };
+ 
+-            if (!converter) {
+-                logger.error(`No converter available for '${key}' on '${re.name}': (${stringify(message[key])})`);
+-                continue;
+-            }
++            const endpointNames = re instanceof Device ? re.getEndpointNames() : [];
++            const propertyEndpointRegex = new RegExp(`^(.*?)_(${endpointNames.join("|")})$`);
++            let scenesChanged = false;
++
++            for (const entry of entries) {
++                let key = entry[0];
++                const value = entry[1];
++                let endpointName = parsedTopic.endpoint;
++                let localTarget = target;
++                let endpointOrGroupID = utils.isZHEndpoint(target) ? target.ID : target.groupID;
++
++                // When the key has a endpointName included (e.g. state_right), this will override the target.
++                const propertyEndpointMatch = key.match(propertyEndpointRegex);
++
++                if (re instanceof Device && propertyEndpointMatch) {
++                    endpointName = propertyEndpointMatch[2];
++                    key = propertyEndpointMatch[1];
++                    // biome-ignore lint/style/noNonNullAssertion: endpointName is always matched to an existing endpoint of the device since `propertyEndpointRegex` only contains valid endpoints for this device
++                    localTarget = view(re.endpoint(endpointName)!);
++                    endpointOrGroupID = localTarget.ID;
++                }
+ 
+-            // If the endpoint_name name is a number, try to map it to a friendlyName
+-            if (!Number.isNaN(Number(endpointName)) && re.isDevice() && utils.isZHEndpoint(localTarget) && re.endpointName(localTarget)) {
+-                endpointName = re.endpointName(localTarget);
+-            }
++                if (usedConverters[endpointOrGroupID] === undefined) usedConverters[endpointOrGroupID] = [];
++                // Match any key if the toZigbee converter defines no key.
++                const converter = converters.find(
++                    (c) =>
++                        (!c.key || c.key.includes(key)) &&
++                        (re instanceof Group || !c.endpoints || (endpointName && c.endpoints.includes(endpointName))),
++                );
++
++                if (parsedTopic.type === "set" && converter && usedConverters[endpointOrGroupID].includes(converter)) {
++                    // Use a converter for set only once
++                    // (e.g. light_onoff_brightness converters can convert state and brightness)
++                    continue;
++                }
+ 
+-            // Converter didn't return a result, skip
+-            const entitySettingsKeyValue: KeyValue = entitySettings;
+-            const meta: zhc.Tz.Meta = {
+-                endpoint_name: endpointName,
+-                options: entitySettingsKeyValue,
+-                message: {...message},
+-                device,
+-                state: entityState,
+-                membersState,
+-                mapped: definition,
+-                /* v8 ignore start */
+-                deviceExposesChanged: (): void => {
+-                    if (re instanceof Device) this.eventBus.emitExposesAndDevicesChanged(re);
+-                },
+-                /* v8 ignore stop */
+-                /* v8 ignore next */
+-                publish: (payload: KeyValue) => this.publishEntityState(re, payload),
+-            };
++                if (!converter) {
++                    logger.error(`No converter available for '${key}' on '${re.name}': (${stringify(message[key])})`);
++                    continue;
++                }
+ 
+-            // Strip endpoint name from meta.message properties.
+-            if (endpointName) {
+-                for (const [key, value] of Object.entries(meta.message)) {
+-                    if (key.endsWith(endpointName)) {
+-                        delete meta.message[key];
+-                        const keyWithoutEndpoint = key.substring(0, key.length - endpointName.length - 1);
+-                        meta.message[keyWithoutEndpoint] = value;
++                // If the endpoint_name name is a number, try to map it to a friendlyName
++                if (!Number.isNaN(Number(endpointName)) && re.isDevice() && utils.isZHEndpoint(localTarget) && re.endpointName(localTarget)) {
++                    endpointName = re.endpointName(localTarget);
++                }
++
++                // Converter didn't return a result, skip
++                const entitySettingsKeyValue: KeyValue = entitySettings;
++                const meta: zhc.Tz.Meta = {
++                    endpoint_name: endpointName,
++                    options: entitySettingsKeyValue,
++                    message: {...message},
++                    device,
++                    state: entityState,
++                    membersState,
++                    mapped: definition,
++                    /* v8 ignore start */
++                    deviceExposesChanged: (): void => {
++                        if (re instanceof Device) this.eventBus.emitExposesAndDevicesChanged(re);
++                    },
++                    /* v8 ignore stop */
++                    /* v8 ignore next */
++                    publish: (payload: KeyValue) => this.publishEntityState(re, payload),
++                };
++
++                // Strip endpoint name from meta.message properties.
++                if (endpointName) {
++                    for (const [key, value] of Object.entries(meta.message)) {
++                        if (key.endsWith(endpointName)) {
++                            delete meta.message[key];
++                            const keyWithoutEndpoint = key.substring(0, key.length - endpointName.length - 1);
++                            meta.message[keyWithoutEndpoint] = value;
++                        }
+                     }
+                 }
+-            }
+ 
+-            try {
+-                if (parsedTopic.type === "set" && converter.convertSet) {
+-                    logger.debug(`Publishing '${parsedTopic.type}' '${key}' to '${re.name}'`);
+-                    const result = await converter.convertSet(localTarget, key, value, meta);
+-                    const optimistic = entitySettings.optimistic === undefined || entitySettings.optimistic;
+-
+-                    if (result?.state && optimistic) {
+-                        const msg = result.state;
+-
+-                        if (endpointName) {
+-                            for (const key of Object.keys(msg)) {
+-                                msg[`${key}_${endpointName}`] = msg[key];
+-                                delete msg[key];
++                try {
++                    if (parsedTopic.type === "set" && converter.convertSet) {
++                        logger.debug(`Publishing '${parsedTopic.type}' '${key}' to '${re.name}'`);
++                        const result = await converter.convertSet(localTarget, key, value, meta);
++                        const optimistic = entitySettings.optimistic === undefined || entitySettings.optimistic;
++
++                        if (result?.state && optimistic) {
++                            const msg = result.state;
++
++                            if (endpointName) {
++                                for (const key of Object.keys(msg)) {
++                                    msg[`${key}_${endpointName}`] = msg[key];
++                                    delete msg[key];
++                                }
+                             }
+-                        }
+ 
+-                        // filter out attribute listed in filtered_optimistic
+-                        utils.filterProperties(entitySettings.filtered_optimistic, msg);
++                            // filter out attribute listed in filtered_optimistic
++                            utils.filterProperties(entitySettings.filtered_optimistic, msg);
+ 
+-                        addToToPublish(re, msg);
+-                    }
++                            addToToPublish(re, msg);
++                        }
+ 
+-                    if (result?.membersState && optimistic) {
+-                        for (const [ieeeAddr, state] of Object.entries(result.membersState)) {
+-                            // biome-ignore lint/style/noNonNullAssertion: might be a bit much assumed here?
+-                            addToToPublish(this.zigbee.resolveEntity(ieeeAddr)!, state);
++                        if (result?.membersState && optimistic) {
++                            for (const [ieeeAddr, state] of Object.entries(result.membersState)) {
++                                // biome-ignore lint/style/noNonNullAssertion: might be a bit much assumed here?
++                                addToToPublish(this.zigbee.resolveEntity(ieeeAddr)!, state);
++                            }
+                         }
++                    } else if (parsedTopic.type === "get" && converter.convertGet) {
++                        logger.debug(`Publishing get '${parsedTopic.type}' '${key}' to '${re.name}'`);
++                        await converter.convertGet(localTarget, key, meta);
++                    } else {
++                        logger.error(`No converter available for '${parsedTopic.type}' '${key}' (${message[key]})`);
++                        continue;
+                     }
+-                } else if (parsedTopic.type === "get" && converter.convertGet) {
+-                    logger.debug(`Publishing get '${parsedTopic.type}' '${key}' to '${re.name}'`);
+-                    await converter.convertGet(localTarget, key, meta);
+-                } else {
+-                    logger.error(`No converter available for '${parsedTopic.type}' '${key}' (${message[key]})`);
+-                    continue;
++                } catch (error) {
++                    const message = `Publish '${parsedTopic.type}' '${key}' to '${re.name}' failed: '${error}'`;
++                    logger.error(message);
++                    // biome-ignore lint/style/noNonNullAssertion: always Error
++                    logger.debug((error as Error).stack!);
+                 }
+-            } catch (error) {
+-                const message = `Publish '${parsedTopic.type}' '${key}' to '${re.name}' failed: '${error}'`;
+-                logger.error(message);
+-                // biome-ignore lint/style/noNonNullAssertion: always Error
+-                logger.debug((error as Error).stack!);
+-            }
+ 
+-            usedConverters[endpointOrGroupID].push(converter);
++                usedConverters[endpointOrGroupID].push(converter);
+ 
+-            if (!scenesChanged && converter.key) {
+-                scenesChanged = converter.key.some((k) => SCENE_CONVERTER_KEYS.includes(k));
++                if (!scenesChanged && converter.key) {
++                    scenesChanged = converter.key.some((k) => SCENE_CONVERTER_KEYS.includes(k));
++                }
+             }
+-        }
+ 
+-        for (const [ID, payload] of Object.entries(toPublish)) {
+-            if (!utils.objectIsEmpty(payload)) {
+-                await this.publishEntityState(toPublishEntity[ID], payload);
++            for (const [ID, payload] of Object.entries(toPublish)) {
++                if (!utils.objectIsEmpty(payload)) {
++                    await this.publishEntityState(toPublishEntity[ID], payload);
++                }
+             }
+-        }
+ 
+-        if (scenesChanged) {
+-            this.eventBus.emitScenesChanged({entity: re});
++            if (scenesChanged) {
++                this.eventBus.emitScenesChanged({entity: re});
++            }
++        } finally {
++            await view.settle();
+         }
+     }
+ 
+diff --git a/lib/util/bmsGroupThrottle.ts b/lib/util/bmsGroupThrottle.ts
+index 03b6c12..50446aa 100644
+--- a/lib/util/bmsGroupThrottle.ts
++++ b/lib/util/bmsGroupThrottle.ts
+@@ -1,9 +1,11 @@
+ // BMS: порядок намерений и бюджет фактических групповых вызовов ZCL.
+ // Считаем попытки command/read/write, а не MQTT: один конвертер может отправить несколько кадров.
++
+ import type Device from "../model/device";
+ import Group from "../model/group";
+ import type Zigbee from "../zigbee";
+ import {assertGroupMutable, groupMembership, groupMutationVersion} from "./bmsGroupMembership";
++import {BmsOperationQueue} from "./bmsOperationQueue";
+ import logger from "./logger";
+ import * as settings from "./settings";
+ import {stringify} from "./stringify";
+@@ -28,6 +30,7 @@ interface Job {
+     started: boolean;
+     done: Promise<void>;
+     resolve: () => void;
++    execute?: () => Promise<void>;
+ }
+ 
+ const MERGEABLE = new Set(["state", "brightness", "brightness_percent", "color_temp", "color_temp_percent", "color", "transition"]);
+@@ -67,6 +70,7 @@ export function mergeGroupMessage(pending: KeyValue, next: KeyValue): KeyValue {
+ 
+ export class GroupThrottle {
+     private jobs: Job[] = [];
++    private operations = new BmsOperationQueue();
+     private lastSent = new Map<number, number>();
+     private sentTimes: number[] = [];
+     private timer: NodeJS.Timeout | undefined;
+@@ -83,12 +87,16 @@ export class GroupThrottle {
+     ) {}
+ 
+     offer(topic: ThrottleTopic, data: eventdata.MQTTMessage): boolean {
+-        if (!settings.get().advanced.bms_group_throttle) return false;
++        return this.submit(topic, data) !== undefined;
++    }
++
++    // Приём MQTT и завершение отправки — разные события. Handle живёт до конца процедуры.
++    submit(topic: ThrottleTopic, data: eventdata.MQTTMessage): Promise<void> | undefined {
+         const entity = this.zigbee.resolveEntity(topic.ID);
+-        if (!entity) return false;
++        if (!entity) return undefined;
+         if (this.stopped) {
+             logger.warning(`BMS: команда '${data.topic}' отклонена при остановке`);
+-            return true;
++            return Promise.resolve();
+         }
+         this.admitted += 1;
+         const message = this.parse(topic, data);
+@@ -98,7 +106,7 @@ export class GroupThrottle {
+         const ieeeAddresses = group ? [...new Set(group.zh.members.map((member) => member.deviceIeeeAddress))] : [];
+         if (ieeeAddresses.some((ieee) => membership?.isChanging?.(ieee))) {
+             logger.error(`BMS: состав группы '${group?.name}' проверяется/изменяется; команда отменена, повторите намерение`);
+-            return true;
++            return Promise.resolve();
+         }
+         const getEpoch = membership?.getEpoch?.bind(membership);
+         const epochs = getEpoch ? ieeeAddresses.map((ieee) => [ieee, getEpoch(ieee)] as [string, number]) : undefined;
+@@ -107,6 +115,7 @@ export class GroupThrottle {
+             group ? [`group:${group.ID}`, ...group.zh.members.map((member) => member.deviceIeeeAddress)] : [(entity as Device).ID],
+         );
+         const mergeable =
++            settings.get().advanced.bms_group_throttle &&
+             !!group &&
+             topic.type === "set" &&
+             topic.endpoint === undefined &&
+@@ -135,7 +144,7 @@ export class GroupThrottle {
+             previous.data = {...data, message: stringify(previous.message)};
+             previous.topic = {...topic, attribute: ""};
+             this.counters();
+-            return true;
++            return previous.done;
+         }
+         let resolve!: () => void;
+         const done = new Promise<void>((r) => {
+@@ -156,14 +165,54 @@ export class GroupThrottle {
+         });
+         this.pump();
+         this.counters();
+-        return true;
++        return done;
+     }
+ 
+     // Proxy принадлежит одному publish, исходный объект herdsman не изменяется.
+     // Привязка остальных методов к исходному объекту сохраняет приватное состояние модели.
+-    view(members?: string[], version?: number, epochs?: [string, number][]): <T extends zh.Group | zh.Endpoint | zh.Device>(entity: T) => T {
++    view(members?: string[], version?: number, epochs?: [string, number][]) {
+         const cache = new WeakMap<object, object>();
+-        return <T extends zh.Group | zh.Endpoint | zh.Device>(entity: T): T => this.wrap(entity, members, cache, version, epochs);
++        const pending = new Set<Promise<unknown>>();
++        const track = (promise: Promise<unknown>): void => {
++            pending.add(promise);
++            void promise.then(
++                () => pending.delete(promise),
++                () => pending.delete(promise),
++            );
++        };
++        const view = <T extends zh.Group | zh.Endpoint | zh.Device>(entity: T): T => this.wrap(entity, members, cache, version, epochs, track);
++        return Object.assign(view, {
++            // Promise.all конвертера может завершиться первой ошибкой, пока второй вызов ещё идёт.
++            settle: async (): Promise<void> => {
++                while (pending.size) await Promise.allSettled([...pending]);
++            },
++        });
++    }
++
++    runDevice<T>(ieee: string, task: () => Promise<T>): Promise<T> {
++        if (this.stopped) return Promise.reject(new Error("BMS: планировщик остановлен"));
++        return new Promise<T>((resolve, reject) => {
++            let doneResolve!: () => void;
++            const done = new Promise<void>((r) => {
++                doneResolve = r;
++            });
++            this.jobs.push({
++                topic: {ID: ieee, endpoint: undefined, attribute: "", type: "set"},
++                data: {topic: `BMS/${ieee}`, message: ""},
++                resources: new Set([ieee]),
++                started: false,
++                done,
++                resolve: doneResolve,
++                execute: async () => {
++                    try {
++                        resolve(await task());
++                    } catch (error) {
++                        reject(error);
++                    }
++                },
++            });
++            this.pump();
++        });
+     }
+ 
+     wrap<T extends zh.Group | zh.Endpoint | zh.Device>(
+@@ -172,6 +221,7 @@ export class GroupThrottle {
+         cache = new WeakMap<object, object>(),
+         version?: number,
+         epochs?: [string, number][],
++        track?: (promise: Promise<unknown>) => void,
+     ): T {
+         const cached = cache.get(entity);
+         if (cached) return cached as T;
+@@ -181,51 +231,60 @@ export class GroupThrottle {
+                 // Getter herdsman может читать #private: receiver обязан быть исходным объектом.
+                 const value = Reflect.get(target, property, target);
+                 if ((property === "members" || property === "endpoints") && Array.isArray(value)) {
+-                    return value.map((endpoint: zh.Endpoint) => this.wrap(endpoint, members, cache, version, epochs));
++                    return value.map((endpoint: zh.Endpoint) => this.wrap(endpoint, members, cache, version, epochs, track));
+                 }
+                 if (typeof value !== "function" || property === "constructor") return value;
+                 if (property === "getDevice" || property === "getEndpoint") {
+                     return (...args: unknown[]) => {
+                         const nested = Reflect.apply(value, target, args);
+-                        return nested ? this.wrap(nested, members, cache, version, epochs) : nested;
++                        return nested ? this.wrap(nested, members, cache, version, epochs, track) : nested;
+                     };
+                 }
+                 if (!["command", "write", "read", "commandResponse", "zclCommand"].includes(String(property))) return value.bind(target);
+-                return async (...args: unknown[]) => {
++                return (...args: unknown[]) => {
+                     const group = "groupID" in target;
+                     const endpoint = target as unknown as zh.Endpoint;
+-                    if (group) {
+-                        await this.reserve(target.groupID);
+-                        assertGroupMutable(this.zigbee, target.groupID, version);
+-                        const membership = groupMembership(this.zigbee);
+-                        if (epochs?.some(([ieee, epoch]) => membership?.isChanging?.(ieee) || membership?.getEpoch?.(ieee) !== epoch)) {
+-                            throw new Error("BMS: членство участника изменилось во время ожидания; команда отменена");
++                    const resources = group
++                        ? [`group:${target.groupID}`, ...(target.members ?? []).map((e) => e.deviceIeeeAddress)]
++                        : [endpoint.deviceIeeeAddress];
++                    const operation = this.operations.run(resources, async () => {
++                        if (group) {
++                            await this.reserve(target.groupID);
++                            assertGroupMutable(this.zigbee, target.groupID, version);
++                            const membership = groupMembership(this.zigbee);
++                            if (epochs?.some(([ieee, epoch]) => membership?.isChanging?.(ieee) || membership?.getEpoch?.(ieee) !== epoch)) {
++                                throw new Error("BMS: членство участника изменилось во время ожидания; команда отменена");
++                            }
++                            const current = this.zigbee.resolveEntity(target.groupID);
++                            if (members && (!(current instanceof Group) || current.zh !== (target as unknown as zh.Group))) {
++                                throw new Error("BMS: группа удалена или пересоздана; команда отменена");
++                            }
++                            if (
++                                members &&
++                                stringify(target.members.map((member) => `${member.deviceIeeeAddress}/${member.ID}`).sort()) !== stringify(members)
++                            ) {
++                                throw new Error("BMS: состав группы изменился во время ожидания; команда отменена, повторите намерение");
++                            }
+                         }
+-                        const current = this.zigbee.resolveEntity(target.groupID);
+-                        if (members && (!(current instanceof Group) || current.zh !== (target as unknown as zh.Group))) {
+-                            throw new Error("BMS: группа удалена или пересоздана; команда отменена");
++                        if (group) {
++                            this.attempts += 1;
++                            this.counters();
+                         }
+-                        if (
+-                            members &&
+-                            stringify(target.members.map((member) => `${member.deviceIeeeAddress}/${member.ID}`).sort()) !== stringify(members)
+-                        ) {
+-                            throw new Error("BMS: состав группы изменился во время ожидания; команда отменена, повторите намерение");
+-                        }
+-                    }
+-                    if (group) {
+-                        this.attempts += 1;
+-                        this.counters();
+-                    }
+-                    this.report({
+-                        kind: group ? "group_frame" : "unicast_frame",
+-                        evidence: "api_attempt",
+-                        target: group ? target.groupID : endpoint.deviceIeeeAddress,
+-                        endpoint: group ? undefined : endpoint.ID,
+-                        operation: property,
+-                        cluster: typeof args[0] === "string" || typeof args[0] === "number" ? args[0] : undefined,
+-                        command: property === "command" || property === "commandResponse" ? args[1] : undefined,
++                        this.report({
++                            kind: group ? "group_frame" : "unicast_frame",
++                            evidence: "api_attempt",
++                            target: group ? target.groupID : endpoint.deviceIeeeAddress,
++                            endpoint: group ? undefined : endpoint.ID,
++                            operation: property,
++                            cluster: typeof args[0] === "string" || typeof args[0] === "number" ? args[0] : undefined,
++                            command: property === "command" || property === "commandResponse" ? args[1] : undefined,
++                        });
++                        return Reflect.apply(value, target, args);
+                     });
+-                    return Reflect.apply(value, target, args);
++                    track?.(operation);
++                    // И отделённая конвертером операция должна оставить видимую ошибку.
++                    void operation.catch((error) => logger.error(`BMS: ZCL '${String(property)}' failed: ${error}`));
++                    return operation;
+                 };
+             },
+         });
+@@ -253,6 +312,7 @@ export class GroupThrottle {
+     private waitFor(id: number): number {
+         const now = Date.now();
+         const a = settings.get().advanced;
++        if (!a.bms_group_throttle) return 0;
+         const budget = Number.isFinite(a.bms_broadcast_budget) ? Math.max(1, Math.floor(a.bms_broadcast_budget)) : 8;
+         while (this.sentTimes.length && this.sentTimes[0] <= now - a.bms_broadcast_budget_window) this.sentTimes.shift();
+         const last = this.lastSent.get(id);
+@@ -289,7 +349,7 @@ export class GroupThrottle {
+             }
+             job.started = true;
+             // Запуск синхронный до первого await: слот ZCL резервируется до следующего job.
+-            void this.send(job.topic, job.data, job.members, job.version, job.epochs)
++            void (job.execute ? job.execute() : this.send(job.topic, job.data, job.members, job.version, job.epochs))
+                 .catch((error) => logger.error(`BMS: отправка '${job.data.topic}' не удалась: ${error}`))
+                 .finally(() => {
+                     this.jobs.splice(this.jobs.indexOf(job), 1);
+diff --git a/lib/util/bmsOperationQueue.ts b/lib/util/bmsOperationQueue.ts
+new file mode 100644
+index 0000000..97a1f8f
+--- /dev/null
++++ b/lib/util/bmsOperationQueue.ts
+@@ -0,0 +1,35 @@
++// BMS: адаптерная очередь NWK не гарантирует порядок целых вызовов конвертера.
++// Держим конфликтующие IEEE до завершения Promise, включая вложенный Promise.all.
++export class BmsOperationQueue {
++    private tails = new Map<string, Promise<unknown>>();
++
++    run<T>(resources: string[], task: () => Promise<T>): Promise<T> {
++        const keys = [...new Set(resources)];
++        const previous = [
++            ...new Set(
++                keys.flatMap((key) => {
++                    const tail = this.tails.get(key);
++                    return tail ? [tail] : [];
++                }),
++            ),
++        ];
++        let resolve!: (value: T) => void;
++        let reject!: (error: unknown) => void;
++        const result = new Promise<T>((yes, no) => {
++            resolve = yes;
++            reject = no;
++        });
++        for (const key of keys) this.tails.set(key, result);
++        void (async () => {
++            if (previous.length) await Promise.allSettled(previous);
++            try {
++                resolve(await task());
++            } catch (error) {
++                reject(error);
++            } finally {
++                for (const key of keys) if (this.tails.get(key) === result) this.tails.delete(key);
++            }
++        })();
++        return result;
++    }
++}
+diff --git a/test/bmsOperationQueue.test.ts b/test/bmsOperationQueue.test.ts
+new file mode 100644
+index 0000000..62f3567
+--- /dev/null
++++ b/test/bmsOperationQueue.test.ts
+@@ -0,0 +1,59 @@
++import {describe, expect, it} from "vitest";
++import {BmsOperationQueue} from "../lib/util/bmsOperationQueue";
++
++describe("BMS in-flight operations", () => {
++    it("serializes one MCU across endpoints but leaves unrelated devices parallel", async () => {
++        const queue = new BmsOperationQueue();
++        const order: string[] = [];
++        let release!: () => void;
++        const a = queue.run(["ieee-a"], async () => {
++            order.push("a1");
++            await new Promise<void>((r) => {
++                release = r;
++            });
++        });
++        const b = queue.run(["ieee-a"], () => {
++            order.push("a2");
++            return Promise.resolve();
++        });
++        await queue.run(["ieee-b"], () => {
++            order.push("b");
++            return Promise.resolve();
++        });
++        expect(order).toEqual(["a1", "b"]);
++        release();
++        await Promise.all([a, b]);
++        expect(order).toEqual(["a1", "b", "a2"]);
++    });
++    it("holds intersecting groups until completion and releases all resources after failure", async () => {
++        const queue = new BmsOperationQueue();
++        const order: string[] = [];
++        let fail!: (error: Error) => void;
++        const first = queue.run(
++            ["g1", "a", "b", "a"],
++            () =>
++                new Promise<void>((_r, reject) => {
++                    fail = reject;
++                }),
++        );
++        const caught = first.catch(() => order.push("failed"));
++        const second = queue.run(["g2", "b", "c"], () => {
++            order.push("g2");
++            return Promise.resolve();
++        });
++        const third = queue.run(["c"], () => {
++            order.push("c");
++            return Promise.resolve();
++        });
++        expect(order).toEqual([]);
++        fail(new Error("busy"));
++        await Promise.all([caught, second, third]);
++        expect(order).toEqual(["failed", "g2", "c"]);
++        await queue.run(["a", "b", "c"], () => {
++            order.push("released");
++            return Promise.resolve();
++        });
++        await queue.run([], async () => {});
++        expect(order.at(-1)).toBe("released");
++    });
++});
+diff --git a/test/extensions/bmsGroupThrottle.test.ts b/test/extensions/bmsGroupThrottle.test.ts
+index 9b03368..a9e1a89 100644
+--- a/test/extensions/bmsGroupThrottle.test.ts
++++ b/test/extensions/bmsGroupThrottle.test.ts
+@@ -10,6 +10,7 @@ import {devices, groups, resetGroupMembers} from "../mocks/zigbeeHerdsman";
+ 
+ import {clearGlobalStore} from "zigbee-herdsman-converters";
+ import {Controller} from "../../lib/controller";
++import type Device from "../../lib/model/device";
+ import {loadTopicGetSetRegex} from "../../lib/extension/publish";
+ import {GroupThrottle, mergeGroupMessage} from "../../lib/util/bmsGroupThrottle";
+ import * as settings from "../../lib/util/settings";
+@@ -608,4 +609,101 @@ describe("BMS: group command rate limit", () => {
+             configuration.mockRestore();
+         }
+     });
++    it("waits for calls detached by a converter before releasing the group/member barrier", async () => {
++        const model = controller.zigbee.resolveEntity("bulb_color") as Device;
++        const original = model.definition!;
++        let release!: () => void;
++        bulbColor.command.mockImplementationOnce(
++            () =>
++                new Promise<void>((r) => {
++                    release = r;
++                }),
++        );
++        model.definition = {
++            ...original,
++            toZigbee: [
++                {
++                    key: ["state"],
++                    convertSet: (entity) => {
++                        void entity.command("genOnOff", "on", {});
++                        return Promise.resolve();
++                    },
++                },
++            ],
++        };
++        try {
++            await set("bulb_color", {state: "ON"});
++            await set("group_1", {state: "OFF"});
++            await wait(2000);
++            expect(groups.group_1.command).not.toHaveBeenCalled();
++            release();
++            await flushPromises();
++            expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        } finally {
++            release?.();
++            model.definition = original;
++        }
++    });
++
++    it("keeps nested group API calls single-flight even beyond the rate window", async () => {
++        const scheduler = new GroupThrottle(
++            controller.zigbee,
++            () => Promise.resolve(),
++            () => undefined,
++        );
++        let release!: () => void;
++        groups.group_1.command.mockImplementationOnce(
++            () =>
++                new Promise<void>((r) => {
++                    release = r;
++                }),
++        );
++        const group = scheduler.view()(groups.group_1 as unknown as zh.Group);
++        const first = group.command("genOnOff", "on", {});
++        const second = group.command("genOnOff", "off", {});
++        await flushPromises();
++        await wait(2000);
++        expect(groups.group_1.command).toHaveBeenCalledTimes(1);
++        release();
++        await Promise.all([first, second]);
++        expect(groups.group_1.command.mock.calls.map((c) => c[1])).toEqual(["on", "off"]);
++    });
++
++    it("returns completion handles and queues extension MCU procedures with user commands", async () => {
++        settings.set(["advanced", "bms_group_throttle"], false);
++        let release!: () => void;
++        const order: string[] = [];
++        const scheduler = new GroupThrottle(
++            controller.zigbee,
++            () => {
++                order.push("user");
++                return Promise.resolve();
++            },
++            () => ({state: "ON"}),
++        );
++        const extension = scheduler.runDevice(
++            devices.bulb.ieeeAddr,
++            () =>
++                new Promise<void>((r) => {
++                    release = r;
++                }),
++        );
++        const done = scheduler.submit({ID: "bulb", endpoint: undefined, attribute: "", type: "set"}, {topic: "zigbee2mqtt/bulb/set", message: "ON"});
++        let completed = false;
++        void done?.then(() => {
++            completed = true;
++        });
++        await flushPromises();
++        expect(completed).toBe(false);
++        expect(order).toEqual([]);
++        release();
++        await extension;
++        await done;
++        expect(completed).toBe(true);
++        expect(order).toEqual(["user"]);
++        await expect(scheduler.runDevice("other", () => Promise.reject(new Error("failure")))).rejects.toThrow("failure");
++        await expect(scheduler.runDevice("other", async () => 7)).resolves.toBe(7);
++        await scheduler.stop();
++        await expect(scheduler.runDevice("other", async () => 8)).rejects.toThrow("остановлен");
++    });
+ });
