@@ -7,7 +7,7 @@ name: BMS Zigbee                       # BMS: своё имя
 # BMS: версия = <версия Z2M из versions.json>-bms.<номер нашей сборки>.
 # Часть до «-» Dockerfile берёт как версию Zigbee2MQTT (${BUILD_VERSION%-*}), поэтому
 # менять её руками нельзя: stage.sh сам подтягивает её из versions.json.
-version: 2.14.2-bms.9
+version: 2.14.2-bms.10
 slug: bms_zigbee                       # BMS: свой slug, чтобы жить рядом с официальным Z2M
 description: Zigbee2MQTT с нашим Zigbee-ядром и слоем Tuya для координатора SMLIGHT SLZB-06M
 url: https://github.com/optomtr/bms-zigbee  # BMS: наш репозиторий вместо официального

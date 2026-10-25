@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "build_version": "2.14.2-bms.9",
+  "build_version": "2.14.2-bms.10",
   "zigbee2mqtt": "2.14.2",
   "converters": "26.115.1",
   "herdsman": "10.10.0-bms.3",
@@ -14,6 +14,7 @@
   "vendor_sha256": "e990da61731f3d4d7c46cecaf74ab60bccfd6a14483f5e5f36be107e7b966e8e",
   "required_extensions": [
     "bms-area-groups.mjs",
+    "bms-self-check.mjs",
     "bms-tuya-service.mjs"
   ],
   "core_files": {
@@ -168,7 +169,7 @@
     "0007-extension-status.patch",
     "0008-friendly-frontend.patch"
   ],
-  "source_tree_sha256": "428c89fe1ba66b476db0c64f0e963b9dd1c12349b300349555a4dae770f7ff82",
+  "source_tree_sha256": "df67519407ef3b4f5add504e3515e9bef2297489b48e13958aa6811f0317d0ea",
   "files": {
     "vendor/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "vendor/zigbee-herdsman.tgz": "e990da61731f3d4d7c46cecaf74ab60bccfd6a14483f5e5f36be107e7b966e8e",
@@ -186,8 +187,10 @@
     "bms-layer/external_extensions/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "bms-layer/external_extensions/bms-area-groups.mjs": "3f5416e431d8f68bc4aba3a68291ebde337d76b0a02465c12245dd46c2966606",
     "bms-layer/external_extensions/bms-lib/group-membership.mjs": "4984e6c1dba7fc2447b99ef46a4af1ca5665712d7cb03ca00d70e3d4b4c78397",
+    "bms-layer/external_extensions/bms-self-check.mjs": "40380cc6d60407a9633745d4df5fb42a072b4975815ac2281a052ef8b3c8a809",
     "bms-layer/external_extensions/bms-tuya-service.mjs": "4258e0c148984bde2ef3774aa60270cd573394857345acb0b0e88d9c55400729",
-    "rootfs/docker-entrypoint.sh": "9400184a150af59ff86e37a2a72edd3366e18623fa454b42d91f060f4f4b58d5",
+    "rootfs/.claude-flow/data/pending-insights.jsonl": "1082dd4cc7ed422e5632a29328db8db5b4cbd879c0b1b107402acad114187427",
+    "rootfs/docker-entrypoint.sh": "15f7e1ced7cba9666cd21b230a80f8f4c0edfa5d1e77059b06345fe48e2ed061",
     "rootfs/opt/bms/coordinator.sh": "2950ff2c680297176f8b6c0936e2e08cfb2208085f66276e9b45309096f4bc12",
     "rootfs/opt/bms/seed-config.js": "6df8e26f2c16a1a7bd3b509e4cd1b5fef0ba45992dc59b445dcca727e8004ccc",
     "rootfs/opt/bms/verify-build.js": "ccdd1c5ef76a25e3879f17600be50139f48deb4ad5f568a86dce105190e0e66d",

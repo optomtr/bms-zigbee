@@ -101,6 +101,8 @@ fi
 # BMS: загрузчик публикует degraded, если обязательный файл не импортировался/не запустился.
 export BMS_FRONTEND_PATH=/opt/bms-ui
 export BMS_REQUIRED_EXTENSIONS="$(node -p 'require("/opt/bms-build-manifest.json").required_extensions.join(",")')"
+# BMS: версия сборки — по ней bms-self-check.mjs понимает «это обновление» и проверяет сеть один раз.
+export BMS_ADDON_VERSION="$(node -p 'require("/opt/bms-build-manifest.json").build_version')"
 export NODE_PATH=/app/node_modules
 export ZIGBEE2MQTT_CONFIG_FRONTEND_ENABLED='true'
 export ZIGBEE2MQTT_CONFIG_FRONTEND_PORT='8099'

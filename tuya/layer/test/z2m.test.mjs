@@ -117,9 +117,10 @@ test("Z2M загрузил наши файлы своим механизмом: 
         "Loaded external converter 'bms-models.mjs'.",
         // bms-area-groups без SUPERVISOR_TOKEN грузится и тихо выключается (его проверки — area-groups*.test.mjs).
         "Loaded external extension 'bms-area-groups.mjs'.",
+        "Loaded external extension 'bms-self-check.mjs'.",
         "Loaded external extension 'bms-tuya-service.mjs'.",
     ]);
-    assert.deepEqual(added, ["BmsAreaGroups", "BmsTuyaService"]);
+    assert.deepEqual(added, ["BmsAreaGroups", "BmsSelfCheck", "BmsTuyaService"]);
     for (const kind of ["external_converters", "external_extensions"]) {
         const files = fs.readdirSync(path.join(dataDir, kind));
         assert.ok(fs.lstatSync(path.join(dataDir, kind, "node_modules")).isSymbolicLink(), `${kind}: ссылки node_modules нет`);
