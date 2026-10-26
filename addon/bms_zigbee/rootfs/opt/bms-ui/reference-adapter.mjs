@@ -19,6 +19,26 @@ const toast = document.createElement("div");
 toast.id = "toast";
 toast.setAttribute("role", "status");
 document.body.append(toast);
+function refreshExtra() {
+	const section = extraDialog.dataset.bmsSection;
+	if (
+		!api ||
+		!extraDialog.open ||
+		!section ||
+		extraDialog.querySelector("input:focus,select:focus,textarea:focus")
+	)
+		return;
+	const body = extraDialog.querySelector(".dialog-body");
+	if (body) {
+		const top = extraDialog.scrollTop;
+		body.replaceChildren(
+			section === "diagnostics"
+				? api.diagnostics()
+				: api.groupPage(section === "rooms"),
+		);
+		extraDialog.scrollTop = top;
+	}
+}
 function syncTheme() {
 	const theme = view?.props.theme ?? "light";
 	extraDialog.className = `root ${theme} bms-extra sheet`;
@@ -254,6 +274,7 @@ window.BMS_ORIGINAL = {
 	update(store) {
 		if (demo) syncDemo(store);
 		else syncLive(store);
+		refreshExtra();
 		syncTheme();
 	},
 };
@@ -301,6 +322,7 @@ async function extra(section) {
 			"Состояние выбранного хаба.",
 			api.h("div", { class: "dialog-body" }, api.diagnostics()),
 		);
+	extraDialog.dataset.bmsSection = section;
 }
 async function detail(id) {
 	await ensure();

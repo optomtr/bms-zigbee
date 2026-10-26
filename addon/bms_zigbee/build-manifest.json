@@ -169,7 +169,7 @@
     "0007-extension-status.patch",
     "0008-friendly-frontend.patch"
   ],
-  "source_tree_sha256": "639bec132d7064c50a2a4527a45a94b58172069fc74f8360785e28014ac449ba",
+  "source_tree_sha256": "9f811d6c3255973bc5f8f847543da6bf6eb9aae0d0c0927b4e9463040d1a7abb",
   "files": {
     "vendor/.gitkeep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "vendor/zigbee-herdsman.tgz": "e990da61731f3d4d7c46cecaf74ab60bccfd6a14483f5e5f36be107e7b966e8e",
@@ -194,7 +194,7 @@
     "rootfs/opt/bms/seed-config.js": "6df8e26f2c16a1a7bd3b509e4cd1b5fef0ba45992dc59b445dcca727e8004ccc",
     "rootfs/opt/bms/verify-build.js": "ccdd1c5ef76a25e3879f17600be50139f48deb4ad5f568a86dce105190e0e66d",
     "rootfs/opt/bms-ui/REACT-LICENSE.txt": "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85",
-    "rootfs/opt/bms-ui/app.mjs": "63ba139f200901eb9b905bf7d18f7466d82ac22448022039415b1eb1473a07a5",
+    "rootfs/opt/bms-ui/app.mjs": "46a000ed241d85323e48562839bae2fce7659625142ec35a57c34ae8fc70c470",
     "rootfs/opt/bms-ui/demo.mjs": "086ae5938e82077ee18b62eda85b0b15ce7ba7289b5b2baca6ff16d4233feabb",
     "rootfs/opt/bms-ui/desktop.html": "f8ca259a75c9ce63fb18e648d288f8f072fb6b700da0954ef94e0bc5514966e8",
     "rootfs/opt/bms-ui/extras.css": "bfd74ea0e447c77db6550b2c40b2876166798c1f75cedc9bd99e5a9bb63c82a3",
@@ -202,7 +202,7 @@
     "rootfs/opt/bms-ui/iphone.html": "d9494593377c1cb06cba73fe07a84abbb0acc8d1083d7f4e9352efe25febc6b2",
     "rootfs/opt/bms-ui/model.mjs": "222e3cbcceac4e0fb41c8bab3dab4b8e854d06fde022f374eb059afbc659f7e4",
     "rootfs/opt/bms-ui/network.mjs": "09cec5f78446ea5b81ff77a9d09aea59a02db482fff8f6f9670f03ea69e8cf81",
-    "rootfs/opt/bms-ui/reference-adapter.mjs": "6db35ae29bf1e5b6b32f8d29a85c706adf34e54039772f94a153d6b365d5c064",
+    "rootfs/opt/bms-ui/reference-adapter.mjs": "b352a3897ae21341053d95b93d9d1e671c356938e53253cf0486aba985ac320d",
     "rootfs/opt/bms-ui/select-layout.js": "14da8722d840bf481f2dca81085a0148485e2e89c43d34f70a3cc0e457807f1e"
   }
 }

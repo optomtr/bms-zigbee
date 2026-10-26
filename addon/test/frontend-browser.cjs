@@ -70,7 +70,6 @@ const references=path.resolve(__dirname,'../design-reference');
   await expect(page.getByRole('dialog')).not.toBeVisible();assert.equal(sent.at(-1).payload.force,false);
   await page.getByRole('button',{name:'Диагностика',exact:true}).click();
   wire.send(JSON.stringify({topic:'bms/self_check',payload:{total:2,ok:1,version:'test',at:'2026-10-27T10:00:00Z',avgMs:120,maxMs:200,failed:[]}}));
-  await page.keyboard.press('Escape');await page.getByRole('button',{name:'Диагностика',exact:true}).click();
   await expect(page.getByText('1 из 2',{exact:true})).toBeVisible();await page.keyboard.press('Escape');
   const atMap=sent.length;await page.getByRole('tab',{name:'Карта сети',exact:true}).click();assert.equal(sent.length,atMap);
   await page.getByRole('button',{name:'Обновить карту',exact:true}).click();

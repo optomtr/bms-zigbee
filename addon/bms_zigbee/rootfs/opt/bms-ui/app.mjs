@@ -207,6 +207,7 @@ async function perform(action, payload, control, success) {
 	}
 }
 function modal(title, sub, ...body) {
+	delete dialog.dataset.bmsSection;
 	lastFocus = document.activeElement;
 	dialog.replaceChildren(
 		h(
