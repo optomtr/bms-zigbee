@@ -4,15 +4,15 @@ import {
 	groupSwitchable,
 	isRoom,
 	label,
-	mainState,
 	members,
 	roomName,
 	validName,
 	wsURL,
 } from "./model.mjs";
-import { mapGraph, safeServer } from "./network.mjs";
 
 const $ = (q, root = document) => root.querySelector(q);
+const original = window.BMS_ORIGINAL;
+const baseLocation = original?.baseLocation ?? location;
 const h = (tag, attrs = {}, ...children) => {
 	const el = document.createElement(tag);
 	for (const [key, value] of Object.entries(attrs)) {
@@ -75,16 +75,6 @@ function icon(name) {
 	svg.append(p);
 	return svg;
 }
-const nav = [
-	["overview", "hub", "Хабы"],
-	["devices", "devices", "Устройства"],
-	["rooms", "rooms", "Комнаты"],
-	["groups", "groups", "Группы"],
-	["map", "groups", "Карта сети"],
-	["diagnostics", "pulse", "Диагностика"],
-	["logs", "list", "Журнал"],
-	["broker", "server", "Брокер"],
-];
 const demo = new URL(location.href).searchParams.get("demo") === "1";
 const store = {
 	devices: [],
@@ -106,12 +96,7 @@ const store = {
 	messages: [],
 	selfCheck: null,
 };
-let page = nav.some((n) => n[0] === location.hash.slice(1))
-	? location.hash.slice(1)
-	: "overview";
-let search = "",
-	filter = "all",
-	socket,
+let socket,
 	retry,
 	token = new URL(location.href).searchParams.get("token") ?? "",
 	toastTimer,
@@ -255,415 +240,20 @@ function blank(title, text, action) {
 		action,
 	);
 }
-function hubName() {
-	return "Хаб · BMS Zigbee";
-}
-function go(id) {
-	location.hash = id;
-}
-function appearance() {
-	const control = h(
-		"select",
-		{
-			"aria-label": "Тема оформления",
-			onchange: (e) => {
-				document.documentElement.className = `root ${e.target.value}`;
-				document.querySelector('meta[name="theme-color"]').content =
-					e.target.value === "dark" ? "#000000" : "#F2F2F7";
-			},
-		},
-		h("option", { value: "light" }, "Светлая"),
-		h("option", { value: "dark" }, "Тёмная"),
-	);
-	return h("label", { class: "appearance" }, "Тема", control);
-}
-function anotherHub() {
-	const input = h("input", {
-		type: "url",
-		id: "hub-url",
-		placeholder: "http://192.168.1.20:8080",
-		required: true,
-	});
-	modal(
-		"Другой хаб",
-		"Каждый координатор работает в отдельном экземпляре BMS Zigbee.",
-		h(
-			"form",
-			{
-				onsubmit: (e) => {
-					e.preventDefault();
-					try {
-						const url = new URL(input.value);
-						if (
-							!["http:", "https:"].includes(url.protocol) ||
-							url.username ||
-							url.password
-						)
-							throw new Error();
-						location.assign(url.href);
-					} catch {
-						$("#dialog-error").textContent =
-							"Введите HTTP или HTTPS адрес без пароля в ссылке.";
-					}
-				},
-			},
-			h(
-				"div",
-				{ class: "dialog-body" },
-				h("label", { for: "hub-url" }, "Адрес интерфейса хаба"),
-				input,
-				h(
-					"p",
-					{ class: "fine-print" },
-					"Для нового координатора сначала установите и настройте отдельное дополнение. Здесь можно открыть его веб-интерфейс.",
-				),
-			),
-			h(
-				"footer",
-				{ class: "dialog-footer" },
-				h("button", { type: "submit", class: "button primary" }, "Открыть хаб"),
-			),
-		),
-	);
-}
-function restartHub() {
-	modal(
-		"Перезапустить хаб?",
-		"На время перезапуска управление устройствами будет недоступно.",
-		h(
-			"footer",
-			{ class: "dialog-footer" },
-			button("Отмена", () => dialog.close()),
-			button(
-				"Перезапустить",
-				(e) =>
-					perform("restart", {}, e.currentTarget, "Запрос перезапуска принят."),
-				"button primary",
-				{ "data-live": "", disabled: !online() },
-			),
-		),
-	);
-}
-function shell() {
-	const advanced = new URL("?advanced=1", location.href);
-	document.documentElement.className = "root light";
-	$("#app").replaceChildren(
-		h(
-			"header",
-			{ class: "app-header" },
-			h(
-				"div",
-				{},
-				h(
-					"nav",
-					{ class: "breadcrumb", "aria-label": "Навигация" },
-					h("a", { href: "#overview" }, "BMS"),
-					"›",
-					h("a", { href: "#overview" }, "Интеграции"),
-					"›",
-					h("span", {}, "Zigbee"),
-				),
-				h("h1", {}, "Zigbee2MQTT"),
-				h("p", {}, "Координатор, устройства и состояние вашей Zigbee-сети."),
-			),
-			h(
-				"div",
-				{ class: "header-actions" },
-				button([icon("pulse"), "Подключение"], () => go("broker")),
-				button([icon("plus"), "Другой хаб"], anotherHub, "button primary"),
-			),
-		),
-		h("div", { id: "connection-alert", role: "status" }),
-		h("div", { class: "metrics", id: "summary" }),
-		h(
-			"div",
-			{ class: "broker-strip panel" },
-			h("span", { class: "icotile ti-gray" }, icon("server")),
-			h(
-				"div",
-				{},
-				h("strong", {}, "MQTT-брокер"),
-				h("small", { id: "broker-address" }, "Ожидаем параметры"),
-			),
-			h("span", { id: "connection", class: "connection" }, "Подключение…"),
-		),
-		h(
-			"div",
-			{ class: "workspace-grid" },
-			h(
-				"aside",
-				{ class: "hubs-pane" },
-				h("h2", { class: "ghead" }, "Хабы"),
-				h(
-					"div",
-					{ class: "group" },
-					h(
-						"div",
-						{ class: "row hubrow selected" },
-						button(
-							[
-								h("span", { class: "icotile ti-green" }, icon("hub")),
-								h(
-									"span",
-									{ class: "hub-label" },
-									h("strong", {}, hubName()),
-									h("small", { id: "hub-status" }, "Ожидаем данные"),
-								),
-								icon("arrow"),
-							],
-							() => go("devices"),
-							"hub-hit",
-						),
-					),
-					h(
-						"div",
-						{ class: "row" },
-						button(
-							[icon("plus"), "Другой хаб…"],
-							anotherHub,
-							"hub-hit add-hub",
-						),
-					),
-				),
-				h(
-					"p",
-					{ class: "gfoot" },
-					"Выберите хаб, чтобы открыть устройства, комнаты и карту сети.",
-				),
-				h(
-					"div",
-					{ class: "sidebar-tools" },
-					appearance(),
-					h(
-						"a",
-						{ href: advanced.href, class: "advanced-link" },
-						icon("settings"),
-						"Расширенные настройки",
-					),
-				),
-			),
-			h(
-				"section",
-				{ class: "hub-workspace" },
-				h(
-					"div",
-					{ class: "hub-header panel" },
-					button(
-						[icon("back"), "Хабы"],
-						() => go("overview"),
-						"back mobile-back",
-					),
-					h(
-						"div",
-						{ class: "hub-heading" },
-						h(
-							"div",
-							{},
-							h(
-								"span",
-								{ class: "connection", id: "hub-connection" },
-								"Подключение…",
-							),
-							h("h2", {}, hubName()),
-							h("p", { class: "mono", id: "hub-meta" }, "BMS Zigbee"),
-						),
-						h(
-							"div",
-							{ class: "hub-actions" },
-							button(
-								[icon("plus"), "Добавить устройство"],
-								pairing,
-								"button secondary",
-								{ "data-live": "", id: "add-device" },
-							),
-							button(
-								[icon("refresh"), "Перезапустить"],
-								restartHub,
-								"button secondary",
-								{ "data-live": "" },
-							),
-						),
-					),
-					h(
-						"nav",
-						{ class: "hub-tabs", "aria-label": "Раздел хаба" },
-						nav
-							.filter(([id]) => !["overview", "logs", "broker"].includes(id))
-							.map(([id, i, title]) =>
-								h(
-									"a",
-									{
-										class: "nav-link",
-										href: `#${id}`,
-										"aria-label": title,
-										"data-page": id,
-									},
-									icon(i),
-									title,
-									id === "devices"
-										? h("span", { id: "device-count", class: "nav-count" }, "—")
-										: null,
-								),
-							),
-					),
-				),
-				h("main", { id: "content", tabindex: "-1" }),
-			),
-		),
-		h(
-			"nav",
-			{ class: "bottom-nav", "aria-label": "Основное меню" },
-			nav
-				.filter(([id]) => ["overview", "logs", "broker"].includes(id))
-				.map(([id, i, title]) =>
-					h(
-						"a",
-						{
-							class: "nav-link",
-							href: `#${id}`,
-							"aria-label": title,
-							"data-page": id,
-						},
-						icon(i),
-						title,
-					),
-				),
-		),
-	);
-}
-
 function scheduleRender() {
 	clearTimeout(renderTimer);
-	renderTimer = setTimeout(() => {
-		if (!["INPUT", "SELECT"].includes(document.activeElement?.tagName))
-			render();
-		else {
-			// Поиск сохраняет фокус, но состояние карточек и блокировка offline не должны ждать blur.
-			updateDeviceList();
-			for (const control of document.querySelectorAll(
-				"[data-device][data-live]",
-			)) {
-				control.disabled =
-					!online() ||
-					store.availability[control.dataset.device] === "offline" ||
-					control.dataset.busy === "true";
-			}
-		}
-	}, 150);
+	renderTimer = setTimeout(render, 150);
 }
 function render() {
-	for (const link of document.querySelectorAll("[data-page]")) {
-		link.classList.toggle(
-			"active",
-			link.dataset.page === page ||
-				(page === "overview" && link.dataset.page === "devices") ||
-				(link.dataset.page === "overview" &&
-					!["logs", "broker"].includes(page)),
-		);
-		if (
-			link.dataset.page === page ||
-			(page === "overview" && link.dataset.page === "devices") ||
-			(link.dataset.page === "overview" && !["logs", "broker"].includes(page))
-		)
-			link.setAttribute("aria-current", "page");
-		else link.removeAttribute("aria-current");
+	original?.update(store);
+	for (const control of document.querySelectorAll("[data-live]")) {
+		const off = control.dataset.device
+			? store.availability[control.dataset.device] === "offline"
+			: control.dataset.offline === "true";
+		control.disabled = !online() || off || control.dataset.busy === "true";
 	}
-	document.documentElement.dataset.page = page;
-	$("#summary").replaceChildren(
-		metric(
-			store.connected ? (online() ? "1 из 1" : "0 из 1") : "—",
-			"Хабы в сети",
-			"Текущий экземпляр",
-			"hub",
-		),
-		metric(
-			store.received ? store.devices.length : "—",
-			"Устройства",
-			"В Zigbee-сети",
-			"devices",
-		),
-		metric(
-			store.messages.filter((t) => Date.now() - t < 60000).length,
-			"Событий за минуту",
-			"Наблюдения этой вкладки",
-			"list",
-		),
-		metric(
-			typeof store.info?.permit_join !== "boolean"
-				? "—"
-				: store.info.permit_join
-					? "Открыто"
-					: "Закрыто",
-			"Сопряжение",
-			"Подключение устройств",
-			"signal",
-		),
-	);
-	$("#broker-address").textContent = safeServer(
-		store.info?.config?.mqtt?.server,
-	);
-	$("#hub-status").textContent =
-		`${online() ? "В сети" : "Нет подключения"} · ${store.received ? store.devices.length : "—"} устр. · канал ${store.info?.network?.channel ?? "—"}`;
-	$("#hub-meta").textContent =
-		`${store.info?.config?.mqtt?.base_topic ?? "Топик не получен"} · ${store.info?.config?.serial?.adapter ?? "адаптер не получен"}`;
-	$("#hub-connection").textContent = online() ? "В сети" : "Нет подключения";
-	$("#hub-connection").className = `connection ${online() ? "ok" : "waiting"}`;
-	$("#device-count").textContent = store.received ? store.devices.length : "—";
-	const connected = online();
-	$("#connection").className = `connection ${connected ? "ok" : "waiting"}`;
-	$("#connection").textContent = demo
-		? "Демо · без подключения"
-		: connected
-			? "BMS на связи"
-			: store.connected
-				? "Ожидаем данные"
-				: "Нет подключения";
-	$("#connection-alert").replaceChildren(
-		...(demo
-			? [
-					h(
-						"div",
-						{ class: "notice demo" },
-						"Демонстрационные устройства. Действия здесь не управляют вашим домом.",
-					),
-				]
-			: !connected
-				? [
-						h(
-							"div",
-							{ class: "notice warning" },
-							"Нет актуального подключения. Управление временно недоступно.",
-							button("Подключиться", () => connect(), "text-button"),
-							button("Ввести токен", auth, "text-button"),
-						),
-					]
-				: []),
-	);
-	for (const control of document.querySelectorAll("[data-live]"))
-		control.disabled = !connected || control.dataset.busy === "true";
-	const view =
-		page === "overview"
-			? overview()
-			: page === "devices"
-				? devicePage()
-				: page === "rooms"
-					? groupPage(true)
-					: page === "groups"
-						? groupPage(false)
-						: page === "map"
-							? networkPage()
-							: page === "logs"
-								? logPage()
-								: page === "broker"
-									? brokerPage()
-									: diagnostics();
-	$("#content").replaceChildren(view);
-	for (const control of document.querySelectorAll("[data-live]"))
-		control.disabled =
-			!connected ||
-			control.dataset.offline === "true" ||
-			control.dataset.busy === "true";
 }
+
 function heading(kicker, title, text, action) {
 	return h(
 		"div",
@@ -677,19 +267,6 @@ function heading(kicker, title, text, action) {
 		),
 		action,
 	);
-}
-function metric(value, name, sub, i) {
-	return h(
-		"div",
-		{ class: "metric" },
-		h("span", { class: "metric-icon" }, icon(i)),
-		h("strong", {}, value),
-		h("span", {}, name),
-		h("small", {}, sub),
-	);
-}
-function overview() {
-	return devicePage();
 }
 function networkCard() {
 	const state = store.extensions?.status;
@@ -750,177 +327,6 @@ function networkCard() {
 			"button dark",
 		),
 	);
-}
-function kind(d) {
-	const f = features(d);
-	return f.some((v) => v.name === "brightness")
-		? "bulb"
-		: f.some((v) => v.name === "state")
-			? "power"
-			: "sensor";
-}
-function deviceCard(d) {
-	const state = store.states[d.friendly_name] ?? {},
-		mode = mainState(d, state),
-		off = unavailable(d),
-		fs = controls(d).filter((f) => f.name === "state");
-	const room = store.groups
-		.filter(isRoom)
-		.find((g) =>
-			(g.members ?? []).some((m) => m.ieee_address === d.ieee_address),
-		);
-	const reads = features(d).filter(
-		(f) =>
-			["temperature", "humidity", "battery"].includes(f.name) &&
-			state[f.property] != null,
-	);
-	return h(
-		"article",
-		{ class: `device-card ${kind(d)} ${mode === "on" && !off ? "is-on" : ""}` },
-		h(
-			"div",
-			{ class: "card-top" },
-			h("span", { class: `device-icon ${kind(d)}` }, icon(kind(d))),
-			off
-				? tag("Нет связи", "amber")
-				: mode === "on"
-					? tag("Включено", "green")
-					: mode === "off"
-						? tag("Выключено")
-						: tag(
-								store.availability[d.friendly_name] === "online"
-									? "На связи"
-									: "Нет статуса",
-							),
-		),
-		button(d.friendly_name, () => deviceDetail(d), "device-name"),
-		h(
-			"p",
-			{ class: "card-room" },
-			room ? roomName(room) : (d.definition?.model ?? "Устройство"),
-		),
-		h(
-			"div",
-			{ class: "card-bottom" },
-			reads.length
-				? h(
-						"span",
-						{ class: "sensor-values" },
-						reads
-							.slice(0, 2)
-							.map((f) => `${state[f.property]}${f.unit ?? ""}`)
-							.join(" · "),
-					)
-				: h(
-						"span",
-						{
-							class: "link-value",
-							title:
-								"LQI — последнее известное качество приёма, не процент доставки",
-						},
-						icon("signal"),
-						state.linkquality ?? "—",
-					),
-			fs.length === 1
-				? button(
-						icon("power"),
-						() =>
-							command(d.friendly_name, {
-								[fs[0].property]:
-									mode === "on" ? fs[0].value_off : fs[0].value_on,
-							}),
-						`power-button ${mode === "on" ? "on" : ""}`,
-						{
-							"aria-label": `${mode === "on" ? "Выключить" : "Включить"} ${d.friendly_name}`,
-							"aria-pressed": String(mode === "on"),
-							"data-live": "",
-							"data-offline": off,
-							"data-device": d.friendly_name,
-						},
-					)
-				: button("Открыть", () => deviceDetail(d), "text-button"),
-		),
-	);
-}
-function devicePage() {
-	const input = h("input", {
-		type: "search",
-		placeholder: "Название, модель или производитель…",
-		"aria-label": "Поиск устройств",
-		value: search,
-		oninput: (e) => {
-			search = e.target.value;
-			updateDeviceList();
-		},
-	});
-	const result = h(
-		"div",
-		{},
-		heading(
-			"УСТРОЙСТВА",
-			"Устройства",
-			"Состояние и управление устройствами выбранного хаба.",
-		),
-		h(
-			"div",
-			{ class: "toolbar" },
-			h("label", { class: "search" }, icon("search"), input),
-			h(
-				"div",
-				{ class: "filter-tabs", "aria-label": "Фильтр устройств" },
-				[
-					["all", "Все"],
-					["on", "Включены"],
-					["offline", "Без связи"],
-				].map(([value, title]) =>
-					button(
-						title,
-						() => {
-							filter = value;
-							render();
-						},
-						`filter ${filter === value ? "selected" : ""}`,
-						{ "aria-pressed": String(filter === value) },
-					),
-				),
-			),
-		),
-		h("div", { id: "device-list", class: "device-grid full-grid" }),
-	);
-	queueMicrotask(updateDeviceList);
-	return result;
-}
-function updateDeviceList() {
-	const list = $("#device-list");
-	if (!list) return;
-	const filtered = store.devices.filter(
-		(d) =>
-			[d.friendly_name, d.definition?.model, d.definition?.vendor]
-				.join(" ")
-				.toLowerCase()
-				.includes(search.toLowerCase()) &&
-			(filter === "all" ||
-				(filter === "offline" && unavailable(d)) ||
-				(filter === "on" &&
-					mainState(d, store.states[d.friendly_name]) === "on")),
-	);
-	list.replaceChildren(
-		...(filtered.length
-			? filtered.map(deviceCard)
-			: [
-					blank(
-						"Ничего не найдено",
-						search
-							? "Попробуйте другое название или сбросьте фильтр."
-							: store.received
-								? "В этой категории пока нет устройств."
-								: "Ожидаем данные от BMS Zigbee.",
-					),
-				]),
-	);
-	list.querySelectorAll("[data-live]").forEach((c) => {
-		c.disabled = !online() || c.dataset.offline === "true";
-	});
 }
 function roomCard(g) {
 	return h(
@@ -1042,7 +448,14 @@ function deviceDetail(d) {
 						max: f.value_max,
 						step: f.value_step ?? 1,
 						value: current ?? f.value_min,
-						oninput: (e) => (output.textContent = e.target.value),
+						oninput: (e) => {
+							output.textContent = e.target.value;
+							e.target.style.setProperty(
+								"--level",
+								`${(100 * (Number(e.target.value) - f.value_min)) / (f.value_max - f.value_min)}%`,
+							);
+						},
+						style: `--level:${(100 * ((current ?? f.value_min) - f.value_min)) / (f.value_max - f.value_min)}%`,
 						onchange: (e) =>
 							command(d.friendly_name, {
 								[f.property]: Number(e.target.value),
@@ -1639,7 +1052,7 @@ function diagnostics() {
 		h(
 			"a",
 			{
-				href: new URL("?advanced=1", location.href).href,
+				href: new URL("?advanced=1", baseLocation.href).href,
 				class: "button secondary advanced-access",
 			},
 			icon("settings"),
@@ -1677,246 +1090,6 @@ function dataRows(rows) {
 		),
 	);
 }
-function brokerPage() {
-	const config = store.info?.config;
-	return h(
-		"div",
-		{},
-		heading(
-			"MQTT",
-			"Подключение",
-			"Параметры подключённого экземпляра BMS Zigbee.",
-		),
-		h(
-			"div",
-			{ class: "diagnostic-grid" },
-			h(
-				"section",
-				{ class: "panel" },
-				h("h2", {}, "Брокер"),
-				dataRows([
-					["Сервер", safeServer(config?.mqtt?.server)],
-					["Базовый топик", config?.mqtt?.base_topic],
-					[
-						"Данные Z2M",
-						online() ? "Поступают через WebSocket" : "Нет подключения",
-					],
-					["Клиент ID", config?.mqtt?.client_id],
-				]),
-				h(
-					"p",
-					{ class: "fine-print" },
-					"Это параметры из bridge/info. Отдельный запрос MQTT ping не выполняется. Учётные данные скрыты.",
-				),
-			),
-			h(
-				"section",
-				{ class: "panel" },
-				h("h2", {}, "Координатор"),
-				dataRows([
-					["Адаптер", config?.serial?.adapter],
-					["Канал", store.info?.network?.channel],
-					["PAN ID", store.info?.network?.pan_id],
-					["Версия Z2M", store.info?.version],
-					["Ядро", store.info?.zigbee_herdsman?.version],
-				]),
-			),
-		),
-		h(
-			"div",
-			{ class: "page-actions" },
-			button("Переподключить интерфейс", () => {
-				if (demo) toast("Демо: подключение к серверу не требуется.");
-				else connect();
-			}),
-			h(
-				"a",
-				{
-					class: "button secondary",
-					href: new URL("?advanced=1", location.href).href,
-				},
-				icon("settings"),
-				"Расширенные настройки",
-			),
-		),
-	);
-}
-function logPage() {
-	return h(
-		"div",
-		{},
-		heading(
-			"ЖУРНАЛ",
-			"Журнал",
-			"Предупреждения и ошибки, полученные после открытия вкладки.",
-		),
-		h(
-			"section",
-			{ class: "panel log-panel" },
-			store.logs.length
-				? h(
-						"ol",
-						{},
-						store.logs.map((row) =>
-							h("li", {}, h("time", {}, row.time), h("span", {}, row.message)),
-						),
-					)
-				: blank(
-						"Сообщений пока нет",
-						"Ошибки до открытия вкладки здесь не отображаются. Полный журнал доступен в дополнении Home Assistant.",
-					),
-		),
-		h(
-			"p",
-			{ class: "fine-print" },
-			"Максимум 50 записей. Наличие подключения к интерфейсу не подтверждает доставку команд устройствам.",
-		),
-	);
-}
-async function scanMap() {
-	if (store.mapBusy) return;
-	store.mapBusy = true;
-	store.mapError = "";
-	render();
-	try {
-		let data;
-		if (demo) {
-			const sample = await import("./demo.mjs");
-			data = { value: sample.topology };
-		} else
-			data = await request(
-				"networkmap",
-				{ type: "raw", routes: false },
-				120000,
-			);
-		store.map = mapGraph(data.value);
-		store.mapAt = new Date().toLocaleTimeString("ru-RU");
-	} catch (error) {
-		store.mapError = error.message;
-	} finally {
-		store.mapBusy = false;
-		render();
-	}
-}
-function networkPage() {
-	const graph = store.map;
-	const map = h("div", {
-		class: "map-canvas",
-		role: "group",
-		"aria-label": "Узлы и связи из ответа координатора",
-	});
-	if (graph) {
-		const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-		svg.setAttribute("viewBox", "0 0 100 100");
-		svg.setAttribute("preserveAspectRatio", "none");
-		svg.setAttribute("aria-hidden", "true");
-		for (const link of graph.links) {
-			const line = document.createElementNS(svg.namespaceURI, "line");
-			for (const [key, value] of Object.entries({
-				x1: link.from.x,
-				y1: link.from.y,
-				x2: link.to.x,
-				y2: link.to.y,
-			}))
-				line.setAttribute(key, String(value));
-			line.setAttribute(
-				"class",
-				link.lqi == null
-					? ""
-					: link.lqi > 140
-						? "lqi-high"
-						: link.lqi >= 80
-							? "lqi-mid"
-							: "lqi-low",
-			);
-			svg.append(line);
-		}
-		map.append(svg);
-		for (const node of graph.nodes) {
-			const target = store.devices.find((d) => d.ieee_address === node.id);
-			const el = button(
-				[
-					icon(node.type === "Coordinator" ? "hub" : "devices"),
-					h("span", {}, node.name),
-				],
-				() => {
-					modal(
-						node.name,
-						"Узел из последнего ответа networkmap",
-						h(
-							"div",
-							{ class: "dialog-body" },
-							dataRows([
-								["IEEE", node.id],
-								["Тип", node.type],
-								["Получено", store.mapAt],
-								...graph.links
-									.filter((l) => l.from.id === node.id || l.to.id === node.id)
-									.map((l) => [
-										`${l.from.name} → ${l.to.name}`,
-										`LQI ${l.lqi ?? "нет данных"}`,
-									]),
-							]),
-						),
-						h(
-							"footer",
-							{ class: "dialog-footer" },
-							target
-								? button(
-										"Открыть устройство",
-										() => deviceDetail(target),
-										"button primary",
-									)
-								: button("Готово", () => dialog.close()),
-						),
-					);
-				},
-				`map-node ${node.type === "Coordinator" ? "coordinator" : ""}`,
-			);
-			el.style.left = `${node.x}%`;
-			el.style.top = `${node.y}%`;
-			map.append(el);
-		}
-	}
-	return h(
-		"div",
-		{},
-		heading(
-			"КАРТА",
-			"Карта сети",
-			"Связи из таблиц соседей. Расположение узлов на экране условное.",
-			button(
-				[icon("refresh"), store.mapBusy ? "Получаем карту…" : "Обновить карту"],
-				scanMap,
-				"button secondary",
-				{
-					"data-live": "",
-					"data-busy": String(store.mapBusy),
-					disabled: !online() || store.mapBusy,
-				},
-			),
-		),
-		store.mapError
-			? h("p", { class: "notice warning", role: "alert" }, store.mapError)
-			: null,
-		graph
-			? map
-			: blank(
-					store.mapBusy ? "Опрос устройств…" : "Карта ещё не получена",
-					store.mapBusy
-						? "Запрос может занять до двух минут. Можно перейти в другой раздел."
-						: "Нажмите «Обновить карту». Опрос выполняется только по вашему запросу.",
-				),
-		graph
-			? h(
-					"p",
-					{ class: "fine-print" },
-					`${demo ? "Демонстрационная топология · " : ""}Получено ${store.mapAt}. Узлов: ${graph.nodes.length}, связей: ${graph.links.length}.${graph.truncated ? " Показаны первые 200 узлов." : ""} Отсутствие связи в таблице не доказывает, что устройство недоступно.`,
-				)
-			: null,
-	);
-}
-
 function auth() {
 	const input = h("input", {
 		type: "password",
@@ -2046,7 +1219,7 @@ function connect() {
 	store.connected = false;
 	store.ready = false;
 	render();
-	socket = new WebSocket(wsURL(location, token));
+	socket = new WebSocket(wsURL(baseLocation, token));
 	socket.onopen = () => {
 		store.connected = true;
 		render();
@@ -2077,18 +1250,12 @@ function connect() {
 	};
 	socket.onerror = () => {};
 }
-window.addEventListener("hashchange", () => {
-	page = nav.some((n) => n[0] === location.hash.slice(1))
-		? location.hash.slice(1)
-		: "overview";
-	render();
-	$("#content").focus({ preventScroll: true });
-	window.scrollTo(0, 0);
-});
-shell();
+window.addEventListener("hashchange", () =>
+	original?.openSection?.(location.hash.slice(1)),
+);
 setInterval(scheduleRender, 10000);
 if (demo) {
-	const sample = await import("./demo.mjs");
+	const sample = original?.demoData ?? (await import("./demo.mjs"));
 	Object.assign(store, {
 		devices: sample.devices,
 		groups: sample.groups,
@@ -2108,3 +1275,19 @@ if (demo) {
 	render();
 	connect();
 }
+
+export {
+	store,
+	command,
+	request,
+	pairing,
+	deviceDetail,
+	groupDetail,
+	groupPage,
+	diagnostics,
+	auth,
+	modal,
+	h,
+	render,
+	connect,
+};
