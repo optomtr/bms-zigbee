@@ -122,9 +122,58 @@ export const states = Object.fromEntries(
 	]),
 );
 export const info = {
+	config: {
+		mqtt: { server: "mqtt://demo-broker:1883", base_topic: "zigbee2mqtt" },
+		serial: { adapter: "ember" },
+	},
 	version: "2.14.2",
 	zigbee_herdsman: { version: "10.10.0-bms.3" },
 	network: { channel: 15 },
 	config: { advanced: { bms_device_reports: true, transmit_power: 13 } },
 	permit_join: false,
+};
+
+// Явные фиктивные связи для демонстрации: не вычисляются по расстоянию или LQI.
+export const topology = {
+	nodes: [
+		{
+			ieeeAddr: "demo-coordinator",
+			friendlyName: "Координатор",
+			type: "Coordinator",
+		},
+		...devices
+			.slice(0, 5)
+			.map((d) => ({
+				ieeeAddr: d.ieee_address,
+				friendlyName: d.friendly_name,
+				type: d.type,
+			})),
+	],
+	links: [
+		{
+			source: { ieeeAddr: "demo-coordinator" },
+			target: { ieeeAddr: devices[0].ieee_address },
+			linkquality: 180,
+		},
+		{
+			source: { ieeeAddr: "demo-coordinator" },
+			target: { ieeeAddr: devices[1].ieee_address },
+			linkquality: 160,
+		},
+		{
+			source: { ieeeAddr: devices[0].ieee_address },
+			target: { ieeeAddr: devices[2].ieee_address },
+			linkquality: 110,
+		},
+		{
+			source: { ieeeAddr: devices[1].ieee_address },
+			target: { ieeeAddr: devices[3].ieee_address },
+			linkquality: 90,
+		},
+		{
+			source: { ieeeAddr: devices[3].ieee_address },
+			target: { ieeeAddr: devices[4].ieee_address },
+			linkquality: 70,
+		},
+	],
 };

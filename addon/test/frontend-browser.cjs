@@ -1,5 +1,5 @@
 // BMS: изолированный браузерный стенд; WebSocket заменён, команд живому дому нет.
-const {chromium, expect} = require('playwright/test');
+const {chromium, webkit, expect} = require('playwright/test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
@@ -21,7 +21,7 @@ const root = path.resolve(__dirname, '../bms_zigbee/rootfs/opt/bms-ui');
     const url = `http://127.0.0.1:${server.address().port}/ingress/test/`;
     let browser;
     try {
-        browser = await chromium.launch({headless: !!process.env.CI});
+        browser = await (process.env.BMS_UI_BROWSER === 'webkit' ? webkit : chromium).launch({headless: !!process.env.CI});
         const page = await browser.newPage({viewport: {width: 1440, height: 1000}});
         const errors = [], sent = [];
         let wire, responseError = false;
@@ -31,7 +31,7 @@ const root = path.resolve(__dirname, '../bms_zigbee/rootfs/opt/bms-ui');
             ws.onMessage(message => {
                 const msg = JSON.parse(message); sent.push(msg);
                 if (msg.topic.startsWith('bridge/request/')) {
-                    ws.send(JSON.stringify({topic: msg.topic.replace('/request/', '/response/'),payload: {transaction:msg.payload.transaction,status:responseError?'error':'ok',data:{}}}));
+                    ws.send(JSON.stringify({topic: msg.topic.replace('/request/', '/response/'),payload: {transaction:msg.payload.transaction,status:responseError?'error':'ok',data:msg.topic.endsWith('/networkmap')?{value:sample.topology}:{}}}));
                 }
             });
             for (const [topic,payload] of Object.entries({'bridge/state':{state:'online'},'bridge/info':sample.info,'bridge/devices':sample.devices,'bridge/groups':sample.groups,'bridge/bms/extensions':{status:'ready'},...sample.states})) ws.send(JSON.stringify({topic,payload}));
@@ -94,11 +94,39 @@ const root = path.resolve(__dirname, '../bms_zigbee/rootfs/opt/bms-ui');
         await expect(page.getByRole('dialog')).not.toBeVisible();
         assert.equal(sent.at(-1).topic,'bridge/request/permit_join');assert.equal(sent.at(-1).payload.time,60);
         await page.getByRole('link',{name:'Диагностика',exact:true}).click();
-        await expect(page.getByRole('heading',{name:'Разберёмся спокойно.'})).toBeVisible();
+        await expect(page.getByRole('heading',{name:'Диагностика'})).toBeVisible();
         await expect(page.getByRole('link',{name:'Расширенные настройки',exact:true}).last()).toHaveAttribute('href',/advanced=1/);
+        wire.send(JSON.stringify({topic:'bms/self_check',payload:{total:2,ok:1,version:'test',at:'2026-10-27T10:00:00Z',avgMs:120,maxMs:200,failed:['Не ответившее реле']}}));
+        await expect(page.getByText('1 из 2',{exact:true})).toBeVisible();
+        const beforeRestart=sent.length;
+        await page.getByRole('button',{name:'Перезапустить',exact:true}).click();
+        assert.equal(sent.length,beforeRestart,'restart requires confirmation');
+        await page.getByRole('dialog').getByRole('button',{name:'Отмена',exact:true}).click();
+        assert.equal(sent.length,beforeRestart);
+        // Карта не сканирует сеть при входе; запрос только по явному действию.
+        const beforeMap=sent.length;
+        await page.getByRole('link',{name:'Карта сети',exact:true}).click();
+        assert.equal(sent.length,beforeMap);
+        responseError=true;
+        await page.getByRole('button',{name:'Обновить карту',exact:true}).click();
+        await expect(page.getByRole('alert')).toContainText('Не удалось');
+        responseError=false;
+        await page.getByRole('button',{name:'Обновить карту',exact:true}).click();
+        await expect(page.locator('.map-node')).toHaveCount(sample.topology.nodes.length);
+        assert.equal(sent.at(-1).topic,'bridge/request/networkmap');
+        assert.equal(sent.at(-1).payload.routes,false);
+        await page.getByRole('link',{name:'Брокер',exact:true}).click();
+        await expect(page.getByRole('heading',{name:'Подключение',exact:true})).toBeVisible();
+        // Offline конкретного устройства блокирует его кнопку, даже если сервер на связи.
+        await page.getByRole('link',{name:'Устройства',exact:true}).click();
+        await page.getByLabel('Поиск устройств').fill('');
+        wire.send(JSON.stringify({topic:'Торшер у дивана/availability',payload:{state:'offline'}}));
+        await expect(page.getByRole('button',{name:'Выключить Торшер у дивана',exact:true})).toBeDisabled();
+        wire.send(JSON.stringify({topic:'Торшер у дивана/availability',payload:{state:'online'}}));
+        await expect(page.getByRole('button',{name:'Выключить Торшер у дивана',exact:true})).toBeEnabled();
         // Имена из MQTT — текст, не HTML.
         wire.send(JSON.stringify({topic:'bridge/devices',payload:[{...sample.devices[0],friendly_name:'<img src=x onerror=alert(1)>'}]}));
-        await page.getByRole('link',{name:'Обзор',exact:true}).click();
+        await page.getByRole('link',{name:'Хабы',exact:true}).click();
         await expect(page.getByRole('button',{name:'<img src=x onerror=alert(1)>',exact:true})).toBeVisible();
         assert.equal(await page.locator('img').count(),0);
         const atDisconnect=sent.length;
@@ -121,20 +149,36 @@ const root = path.resolve(__dirname, '../bms_zigbee/rootfs/opt/bms-ui');
         const demoPage=await browser.newPage();let demoSockets=0;
         demoPage.on('websocket',()=>demoSockets++);
         await demoPage.goto(url+'?demo=1');
-        await expect(demoPage.getByRole('heading',{name:'Дома всё под рукой.'})).toBeVisible();
+        await expect(demoPage.getByRole('heading',{name:'Zigbee2MQTT',exact:true})).toBeVisible();
         const shots=process.env.PW_ARTIFACT_DIR;
         if(shots){fs.mkdirSync(shots,{recursive:true});await demoPage.screenshot({path:path.join(shots,'overview-desktop.png'),fullPage:true});}
         await demoPage.setViewportSize({width:390,height:844});
         await demoPage.emulateMedia({reducedMotion:'reduce'});
-        for(const name of ['Обзор','Устройства','Комнаты','Группы','Диагностика']) {
+        await demoPage.getByRole('button',{name:/Хаб · BMS Zigbee/}).click();
+        for(const name of ['Устройства','Комнаты','Группы','Карта сети','Диагностика','Журнал','Брокер']) {
             await demoPage.getByRole('link',{name:new RegExp(`^${name}`)}).click();
             assert.equal(await demoPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${name}: mobile overflow`);
         }
-        await demoPage.getByRole('link',{name:'Обзор',exact:true}).click();
+        await demoPage.getByRole('link',{name:'Хабы',exact:true}).click();
         if(shots)await demoPage.screenshot({path:path.join(shots,'overview-mobile.png'),fullPage:true});
+        await demoPage.getByLabel('Тема оформления').selectOption('dark');
+        await expect(demoPage.locator('html')).toHaveClass('root dark');
+        if(shots)await demoPage.screenshot({path:path.join(shots,'overview-mobile-dark.png'),fullPage:true});
+        await demoPage.getByRole('button',{name:/Хаб · BMS Zigbee/}).click();
+        await demoPage.getByRole('link',{name:'Карта сети',exact:true}).click();
+        await demoPage.getByRole('button',{name:'Обновить карту',exact:true}).click();
+        await expect(demoPage.locator('.map-node')).toHaveCount(sample.topology.nodes.length);
+        for(const width of [320,768,1024,1920]) {
+            await demoPage.setViewportSize({width,height:900});
+            for(const screen of ['devices','rooms','groups','map','diagnostics','logs','broker']) {
+                await demoPage.goto(url+`?demo=1#${screen}`);
+                await expect(demoPage.locator('html')).toHaveAttribute('data-page',screen);
+                assert.equal(await demoPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${screen}: overflow at ${width}px`);
+            }
+        }
         assert.equal(demoSockets,0);
         assert.deepEqual(errors,[]);
-        console.log('BMS UI browser checks passed: controls, batching, groups, requests/errors, pairing, search, auth, offline, XSS, demo, mobile.');
+        console.log((process.env.BMS_UI_BROWSER||'chromium')+' BMS UI browser checks passed: controls, batching, groups, requests/errors, pairing, search, auth, offline, XSS, demo, mobile.');
     } finally {
         if(browser)await browser.close();
         await new Promise(r=>server.close(r));
