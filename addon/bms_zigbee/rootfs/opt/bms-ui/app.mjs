@@ -4,7 +4,6 @@ import {
 	groupSwitchable,
 	isRoom,
 	label,
-	mainState,
 	members,
 	roomName,
 	validName,
@@ -12,11 +11,18 @@ import {
 } from "./model.mjs";
 
 const $ = (q, root = document) => root.querySelector(q);
+const original = window.BMS_ORIGINAL;
+const baseLocation = original?.baseLocation ?? location;
 const h = (tag, attrs = {}, ...children) => {
 	const el = document.createElement(tag);
 	for (const [key, value] of Object.entries(attrs)) {
 		if (key.startsWith("on")) el.addEventListener(key.slice(2), value);
 		else if (key === "class") el.className = value;
+		else if (
+			(key.startsWith("data-") || key.startsWith("aria-")) &&
+			value != null
+		)
+			el.setAttribute(key, String(value));
 		else if (value !== false && value != null)
 			el.setAttribute(key, value === true ? "" : value);
 	}
@@ -28,6 +34,11 @@ const h = (tag, attrs = {}, ...children) => {
 	return el;
 };
 const paths = {
+	hub: "M9 8V4h6v4M7 8h10v13H7zM10 13h4M10 17h4",
+	server: "M3 4h18v7H3zM3 14h18v7H3zM7 7.5h.01M7 17.5h.01",
+	list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+	back: "m15 4-8 8 8 8",
+	refresh: "M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5",
 	home: "M3 11 12 3l9 8M5 10v11h14V10M9 21v-7h6v7",
 	devices: "M8 3h8v18H8zM11 17h2M3 8h2v10H3M19 6h2v12h-2",
 	rooms: "M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z",
@@ -64,13 +75,6 @@ function icon(name) {
 	svg.append(p);
 	return svg;
 }
-const nav = [
-	["overview", "home", "Обзор"],
-	["devices", "devices", "Устройства"],
-	["rooms", "rooms", "Комнаты"],
-	["groups", "groups", "Группы"],
-	["diagnostics", "pulse", "Диагностика"],
-];
 const demo = new URL(location.href).searchParams.get("demo") === "1";
 const store = {
 	devices: [],
@@ -85,13 +89,14 @@ const store = {
 	traffic: Object.create(null),
 	logs: [],
 	counters: null,
+	map: null,
+	mapAt: null,
+	mapError: "",
+	mapBusy: false,
+	messages: [],
+	selfCheck: null,
 };
-let page = nav.some((n) => n[0] === location.hash.slice(1))
-	? location.hash.slice(1)
-	: "overview";
-let search = "",
-	filter = "all",
-	socket,
+let socket,
 	retry,
 	token = new URL(location.href).searchParams.get("token") ?? "",
 	toastTimer,
@@ -142,6 +147,8 @@ function send(topic, payload) {
 }
 function command(entity, payload) {
 	try {
+		if (store.availability[entity] === "offline")
+			throw new Error("Устройство без связи. Команда не отправлена.");
 		send(`${entity}/set`, payload);
 		if (demo) {
 			store.states[entity] = { ...store.states[entity], ...payload };
@@ -156,7 +163,7 @@ function command(entity, payload) {
 		toast(error.message, true);
 	}
 }
-function request(action, payload) {
+function request(action, payload, timeout = 15000) {
 	if (demo)
 		return Promise.reject(
 			new Error(
@@ -169,10 +176,10 @@ function request(action, payload) {
 			pending.delete(transaction);
 			reject(
 				new Error(
-					"Нет ответа за 15 секунд. Проверьте результат перед повторной попыткой.",
+					`Нет ответа за ${timeout / 1000} секунд. Проверьте результат перед повторной попыткой.`,
 				),
 			);
-		}, 15000);
+		}, timeout);
 		pending.set(transaction, { resolve, reject, timer, action });
 		try {
 			send(`bridge/request/${action}`, { ...payload, transaction });
@@ -200,6 +207,7 @@ async function perform(action, payload, control, success) {
 	}
 }
 function modal(title, sub, ...body) {
+	delete dialog.dataset.bmsSection;
 	lastFocus = document.activeElement;
 	dialog.replaceChildren(
 		h(
@@ -233,165 +241,20 @@ function blank(title, text, action) {
 		action,
 	);
 }
-function shell() {
-	const advanced = new URL(location.href);
-	advanced.search = "?advanced=1";
-	advanced.hash = "";
-	$("#app").replaceChildren(
-		h(
-			"aside",
-			{ class: "sidebar" },
-			h(
-				"a",
-				{
-					class: "brand",
-					href: "#overview",
-					"aria-label": "BMS Zigbee — обзор",
-				},
-				h("span", { class: "brand-symbol" }, icon("groups")),
-				h("span", {}, "bms", h("small", {}, "ZIGBEE")),
-			),
-			h(
-				"div",
-				{ class: "workspace" },
-				h("span", { class: "workspace-icon" }, icon("home")),
-				h(
-					"div",
-					{},
-					h("strong", {}, "Мой дом"),
-					h("small", {}, "Умный дом рядом"),
-				),
-			),
-			h("span", { class: "nav-label" }, "УПРАВЛЕНИЕ"),
-			h(
-				"nav",
-				{ "aria-label": "Основное меню" },
-				nav.map(([id, i, t]) =>
-					h(
-						"a",
-						{ class: "nav-link", href: `#${id}`, "data-page": id },
-						icon(i),
-						t,
-						id === "devices"
-							? h("span", { id: "device-count", class: "nav-count" }, "—")
-							: null,
-					),
-				),
-			),
-			h(
-				"div",
-				{ class: "sidebar-bottom" },
-				h(
-					"div",
-					{ class: "support-card" },
-					icon("help"),
-					h("strong", {}, "Всё под рукой"),
-					h("p", {}, "Устройства, комнаты и состояние сети — в одном месте."),
-				),
-				h(
-					"a",
-					{ href: advanced.href, class: "advanced-link" },
-					icon("settings"),
-					"Расширенные настройки",
-					h("span", {}, "↗"),
-				),
-			),
-		),
-		h(
-			"div",
-			{ class: "main-wrap" },
-			h(
-				"header",
-				{ class: "topbar" },
-				h(
-					"div",
-					{ class: "breadcrumb" },
-					"Мой дом",
-					h("span", {}, "/"),
-					h("strong", { id: "crumb" }, "Обзор"),
-				),
-				h(
-					"div",
-					{ class: "topbar-right" },
-					demo ? tag("Демонстрация", "purple") : null,
-					h("span", { id: "connection", class: "connection" }, "Подключение…"),
-					button(
-						[icon("plus"), "Добавить устройство"],
-						pairing,
-						"button primary",
-						{ "data-live": "", id: "add-device" },
-					),
-				),
-			),
-			h("div", { id: "connection-alert", role: "status" }),
-			h("main", { id: "content", tabindex: "-1" }),
-		),
-	);
-}
 function scheduleRender() {
 	clearTimeout(renderTimer);
-	renderTimer = setTimeout(() => {
-		if (!["INPUT", "SELECT"].includes(document.activeElement?.tagName))
-			render();
-	}, 150);
+	renderTimer = setTimeout(render, 150);
 }
 function render() {
-	for (const link of document.querySelectorAll("[data-page]")) {
-		link.classList.toggle("active", link.dataset.page === page);
-		if (link.dataset.page === page) link.setAttribute("aria-current", "page");
-		else link.removeAttribute("aria-current");
+	original?.update(store);
+	for (const control of document.querySelectorAll("[data-live]")) {
+		const off = control.dataset.device
+			? store.availability[control.dataset.device] === "offline"
+			: control.dataset.offline === "true";
+		control.disabled = !online() || off || control.dataset.busy === "true";
 	}
-	$("#crumb").textContent = nav.find((n) => n[0] === page)[2];
-	$("#device-count").textContent = store.received ? store.devices.length : "—";
-	const connected = online();
-	$("#connection").className = `connection ${connected ? "ok" : "waiting"}`;
-	$("#connection").textContent = demo
-		? "Демо · без подключения"
-		: connected
-			? "BMS на связи"
-			: store.connected
-				? "Ожидаем данные"
-				: "Нет подключения";
-	$("#connection-alert").replaceChildren(
-		...(demo
-			? [
-					h(
-						"div",
-						{ class: "notice demo" },
-						"Демонстрационные устройства. Действия здесь не управляют вашим домом.",
-					),
-				]
-			: !connected
-				? [
-						h(
-							"div",
-							{ class: "notice warning" },
-							"Нет актуального подключения. Управление временно недоступно.",
-							button("Подключиться", () => connect(), "text-button"),
-							button("Ввести токен", auth, "text-button"),
-						),
-					]
-				: []),
-	);
-	for (const control of document.querySelectorAll("[data-live]"))
-		control.disabled = !connected || control.dataset.busy === "true";
-	const view =
-		page === "overview"
-			? overview()
-			: page === "devices"
-				? devicePage()
-				: page === "rooms"
-					? groupPage(true)
-					: page === "groups"
-						? groupPage(false)
-						: diagnostics();
-	$("#content").replaceChildren(view);
-	for (const control of document.querySelectorAll("[data-live]"))
-		control.disabled =
-			!connected ||
-			control.dataset.offline === "true" ||
-			control.dataset.busy === "true";
 }
+
 function heading(kicker, title, text, action) {
 	return h(
 		"div",
@@ -404,128 +267,6 @@ function heading(kicker, title, text, action) {
 			h("p", {}, text),
 		),
 		action,
-	);
-}
-function metric(value, name, sub, i) {
-	return h(
-		"div",
-		{ class: "metric" },
-		h("span", { class: "metric-icon" }, icon(i)),
-		h("strong", {}, value),
-		h("span", {}, name),
-		h("small", {}, sub),
-	);
-}
-function overview() {
-	const devices = store.devices,
-		rooms = store.groups.filter(isRoom),
-		offline = devices.filter(unavailable).length;
-	const active = devices.filter(
-		(d) => mainState(d, store.states[d.friendly_name]) === "on",
-	).length;
-	return h(
-		"div",
-		{},
-		heading(
-			"ВАШЕ ПРОСТРАНСТВО",
-			"Дома всё под рукой.",
-			"Свет, комфорт и связь — начните с того, что нужно сейчас.",
-		),
-		h(
-			"div",
-			{ class: "metrics" },
-			metric(
-				store.received ? devices.length : "—",
-				"Устройств",
-				"В вашей Zigbee-сети",
-				"devices",
-			),
-			metric(
-				store.received ? active : "—",
-				"Включено",
-				"По последним данным",
-				"bulb",
-			),
-			metric(
-				store.received ? rooms.length : "—",
-				"Комнат",
-				"Из Home Assistant",
-				"rooms",
-			),
-			metric(
-				store.received ? offline : "—",
-				"Без связи",
-				"По последнему статусу",
-				"signal",
-			),
-		),
-		h(
-			"div",
-			{ class: "overview-layout" },
-			h(
-				"div",
-				{},
-				sectionTitle(
-					"Комнаты",
-					"Управление привычными пространствами",
-					button(
-						"Все комнаты →",
-						() => (location.hash = "rooms"),
-						"text-button",
-					),
-				),
-				rooms.length
-					? h("div", { class: "room-grid" }, rooms.slice(0, 4).map(roomCard))
-					: blank(
-							"Здесь появятся комнаты",
-							"Назначьте устройства комнатам в Home Assistant. BMS покажет синхронизированные группы.",
-						),
-				sectionTitle(
-					"Устройства",
-					"Быстрый доступ к вашему дому",
-					button(
-						"Все устройства →",
-						() => (location.hash = "devices"),
-						"text-button",
-					),
-				),
-				devices.length
-					? h(
-							"div",
-							{ class: "device-grid" },
-							devices.slice(0, 6).map(deviceCard),
-						)
-					: blank(
-							store.received
-								? "Добавьте первое устройство"
-								: "Ожидаем список устройств",
-							store.received
-								? "Переведите устройство в режим сопряжения и откройте подключение."
-								: "Данные появятся после подключения к BMS Zigbee.",
-						),
-			),
-			h(
-				"aside",
-				{ class: "overview-aside" },
-				networkCard(),
-				h(
-					"div",
-					{ class: "tip-card" },
-					h("span", { class: "eyebrow" }, "ПОЛЕЗНО ЗНАТЬ"),
-					h("h3", {}, "Одна комната. Одно действие."),
-					h(
-						"p",
-						{},
-						"Группа позволяет управлять несколькими устройствами вместе. Комнаты из Home Assistant синхронизируются автоматически.",
-					),
-					button(
-						["Посмотреть группы", icon("arrow")],
-						() => (location.hash = "groups"),
-						"text-button",
-					),
-				),
-			),
-		),
 	);
 }
 function networkCard() {
@@ -588,180 +329,10 @@ function networkCard() {
 		),
 	);
 }
-function kind(d) {
-	const f = features(d);
-	return f.some((v) => v.name === "brightness")
-		? "bulb"
-		: f.some((v) => v.name === "state")
-			? "power"
-			: "sensor";
-}
-function deviceCard(d) {
-	const state = store.states[d.friendly_name] ?? {},
-		mode = mainState(d, state),
-		off = unavailable(d),
-		fs = controls(d).filter((f) => f.name === "state");
-	const room = store.groups
-		.filter(isRoom)
-		.find((g) =>
-			(g.members ?? []).some((m) => m.ieee_address === d.ieee_address),
-		);
-	const reads = features(d).filter(
-		(f) =>
-			["temperature", "humidity", "battery"].includes(f.name) &&
-			state[f.property] != null,
-	);
+function roomCard(g) {
 	return h(
 		"article",
-		{ class: `device-card ${mode === "on" && !off ? "is-on" : ""}` },
-		h(
-			"div",
-			{ class: "card-top" },
-			h("span", { class: `device-icon ${kind(d)}` }, icon(kind(d))),
-			off
-				? tag("Нет связи", "amber")
-				: mode === "on"
-					? tag("Включено", "green")
-					: mode === "off"
-						? tag("Выключено")
-						: tag(
-								store.availability[d.friendly_name] === "online"
-									? "На связи"
-									: "Нет статуса",
-							),
-		),
-		button(d.friendly_name, () => deviceDetail(d), "device-name"),
-		h(
-			"p",
-			{ class: "card-room" },
-			room ? roomName(room) : (d.definition?.model ?? "Устройство"),
-		),
-		h(
-			"div",
-			{ class: "card-bottom" },
-			reads.length
-				? h(
-						"span",
-						{ class: "sensor-values" },
-						reads
-							.slice(0, 2)
-							.map((f) => `${state[f.property]}${f.unit ?? ""}`)
-							.join(" · "),
-					)
-				: h(
-						"span",
-						{
-							class: "link-value",
-							title:
-								"LQI — последнее известное качество приёма, не процент доставки",
-						},
-						icon("signal"),
-						state.linkquality ?? "—",
-					),
-			fs.length === 1
-				? button(
-						icon("power"),
-						() =>
-							command(d.friendly_name, {
-								[fs[0].property]:
-									mode === "on" ? fs[0].value_off : fs[0].value_on,
-							}),
-						`power-button ${mode === "on" ? "on" : ""}`,
-						{
-							"aria-label": `${mode === "on" ? "Выключить" : "Включить"} ${d.friendly_name}`,
-							"aria-pressed": String(mode === "on"),
-							"data-live": "",
-							"data-offline": off,
-						},
-					)
-				: button("Открыть", () => deviceDetail(d), "text-button"),
-		),
-	);
-}
-function devicePage() {
-	const input = h("input", {
-		type: "search",
-		placeholder: "Название, модель или производитель…",
-		"aria-label": "Поиск устройств",
-		value: search,
-		oninput: (e) => {
-			search = e.target.value;
-			updateDeviceList();
-		},
-	});
-	const result = h(
-		"div",
-		{},
-		heading(
-			"УСТРОЙСТВА",
-			"Всё на своих местах.",
-			"Найдите устройство и настройте его под себя.",
-		),
-		h(
-			"div",
-			{ class: "toolbar" },
-			h("label", { class: "search" }, icon("search"), input),
-			h(
-				"div",
-				{ class: "filter-tabs", "aria-label": "Фильтр устройств" },
-				[
-					["all", "Все"],
-					["on", "Включены"],
-					["offline", "Без связи"],
-				].map(([value, title]) =>
-					button(
-						title,
-						() => {
-							filter = value;
-							render();
-						},
-						`filter ${filter === value ? "selected" : ""}`,
-						{ "aria-pressed": String(filter === value) },
-					),
-				),
-			),
-		),
-		h("div", { id: "device-list", class: "device-grid full-grid" }),
-	);
-	queueMicrotask(updateDeviceList);
-	return result;
-}
-function updateDeviceList() {
-	const list = $("#device-list");
-	if (!list) return;
-	const filtered = store.devices.filter(
-		(d) =>
-			[d.friendly_name, d.definition?.model, d.definition?.vendor]
-				.join(" ")
-				.toLowerCase()
-				.includes(search.toLowerCase()) &&
-			(filter === "all" ||
-				(filter === "offline" && unavailable(d)) ||
-				(filter === "on" &&
-					mainState(d, store.states[d.friendly_name]) === "on")),
-	);
-	list.replaceChildren(
-		...(filtered.length
-			? filtered.map(deviceCard)
-			: [
-					blank(
-						"Ничего не найдено",
-						search
-							? "Попробуйте другое название или сбросьте фильтр."
-							: store.received
-								? "В этой категории пока нет устройств."
-								: "Ожидаем данные от BMS Zigbee.",
-					),
-				]),
-	);
-	list
-		.querySelectorAll("[data-live]")
-		.forEach((c) => (c.disabled = !online() || c.dataset.offline === "true"));
-}
-function roomCard(g, index = 0) {
-	return h(
-		"article",
-		{ class: `room-card tone-${index % 4}` },
+		{ class: "room-card" },
 		h(
 			"div",
 			{ class: "room-top" },
@@ -793,7 +364,7 @@ function groupPage(rooms) {
 		{},
 		heading(
 			rooms ? "КОМНАТЫ" : "ГРУППЫ",
-			rooms ? "Каждому пространству — своё." : "Управляйте вместе.",
+			rooms ? "Комнаты" : "Группы",
 			rooms
 				? "Комнаты из Home Assistant. Их состав обновляется автоматически."
 				: "Объедините свет и реле для одного общего действия.",
@@ -828,6 +399,7 @@ function deviceDetail(d) {
 		{
 			"data-live": "",
 			"data-offline": unavailable(d),
+			"data-device": d.friendly_name,
 			disabled: !online() || unavailable(d),
 		},
 		controls(d).map((f) => {
@@ -877,7 +449,14 @@ function deviceDetail(d) {
 						max: f.value_max,
 						step: f.value_step ?? 1,
 						value: current ?? f.value_min,
-						oninput: (e) => (output.textContent = e.target.value),
+						oninput: (e) => {
+							output.textContent = e.target.value;
+							e.target.style.setProperty(
+								"--level",
+								`${(100 * (Number(e.target.value) - f.value_min)) / (f.value_max - f.value_min)}%`,
+							);
+						},
+						style: `--level:${(100 * ((current ?? f.value_min) - f.value_min)) / (f.value_max - f.value_min)}%`,
 						onchange: (e) =>
 							command(d.friendly_name, {
 								[f.property]: Number(e.target.value),
@@ -1296,6 +875,39 @@ function pairing() {
 		),
 	);
 }
+function selfCheckPanel() {
+	const result = store.selfCheck;
+	return h(
+		"section",
+		{ class: "panel" },
+		h("h2", {}, "Самопроверка после обновления"),
+		result
+			? dataRows([
+					["Ответили", `${result.ok} из ${result.total}`],
+					["Версия", result.version],
+					["Когда", result.at],
+					["Средний ответ", `${result.avgMs ?? 0} мс`],
+					["Максимальный ответ", `${result.maxMs ?? 0} мс`],
+					[
+						"Не ответили",
+						Array.isArray(result.failed)
+							? result.failed.join(", ") || "Нет"
+							: "Нет данных",
+					],
+				])
+			: h(
+					"p",
+					{ class: "fine-print" },
+					"Результат ещё не получен. Проверка выполняется дополнением после обновления.",
+				),
+		h(
+			"p",
+			{ class: "fine-print" },
+			"Проверяется чтение атрибута у устройств с питанием от сети. Спящие батарейные устройства не входят в результат. Это результат на указанное время.",
+		),
+	);
+}
+
 function diagnostics() {
 	const status = store.extensions?.status;
 	const report = () => ({
@@ -1307,6 +919,7 @@ function diagnostics() {
 		extensions: store.extensions?.status,
 		observed_api_events: store.traffic,
 		last_counters: store.counters,
+		last_self_check: store.selfCheck,
 		limits:
 			"Счётчики относятся к последним полученным выборкам; UI-state не подтверждает физическое исполнение.",
 	});
@@ -1315,8 +928,8 @@ function diagnostics() {
 		{},
 		heading(
 			"ДИАГНОСТИКА",
-			"Разберёмся спокойно.",
-			"Сначала факты о связи. Затем — следующий шаг.",
+			"Диагностика",
+			"Подключение, счётчики и события выбранного хаба.",
 			button(
 				[icon("down"), "Скачать сводку"],
 				() => {
@@ -1336,6 +949,7 @@ function diagnostics() {
 			"div",
 			{ class: "diagnostic-grid" },
 			networkCard(),
+			selfCheckPanel(),
 			h(
 				"section",
 				{ class: "panel" },
@@ -1439,7 +1053,7 @@ function diagnostics() {
 		h(
 			"a",
 			{
-				href: new URL("?advanced=1", location.href).href,
+				href: new URL("?advanced=1", baseLocation.href).href,
 				class: "button secondary advanced-access",
 			},
 			icon("settings"),
@@ -1465,6 +1079,15 @@ function diagnostics() {
 						{ class: "muted" },
 						"Пока нет сообщений. Это не означает, что ошибок не было до открытия вкладки.",
 					),
+		),
+	);
+}
+function dataRows(rows) {
+	return h(
+		"dl",
+		{ class: "readings" },
+		rows.map(([name, value]) =>
+			h("div", {}, h("dt", {}, name), h("dd", {}, value ?? "Нет данных")),
 		),
 	);
 }
@@ -1512,6 +1135,10 @@ function auth() {
 	);
 }
 function receive({ topic, payload }) {
+	store.messages.push(Date.now());
+	store.messages = store.messages
+		.filter((t) => Date.now() - t < 60000)
+		.slice(-10000);
 	if (topic.startsWith("bridge/response/")) {
 		const item = pending.get(payload?.transaction);
 		if (item && topic === `bridge/response/${item.action}`) {
@@ -1534,6 +1161,12 @@ function receive({ topic, payload }) {
 	} else if (topic === "bridge/groups" && Array.isArray(payload))
 		store.groups = payload;
 	else if (topic === "bridge/bms/extensions") store.extensions = payload;
+	else if (
+		topic === "bms/self_check" &&
+		Number.isInteger(payload?.total) &&
+		Number.isInteger(payload?.ok)
+	)
+		store.selfCheck = payload;
 	else if (
 		topic === "bridge/bms/tx_event" &&
 		payload.schema === 1 &&
@@ -1587,7 +1220,7 @@ function connect() {
 	store.connected = false;
 	store.ready = false;
 	render();
-	socket = new WebSocket(wsURL(location, token));
+	socket = new WebSocket(wsURL(baseLocation, token));
 	socket.onopen = () => {
 		store.connected = true;
 		render();
@@ -1618,16 +1251,12 @@ function connect() {
 	};
 	socket.onerror = () => {};
 }
-window.addEventListener("hashchange", () => {
-	page = nav.some((n) => n[0] === location.hash.slice(1))
-		? location.hash.slice(1)
-		: "overview";
-	render();
-	$("#content").focus({ preventScroll: true });
-});
-shell();
+window.addEventListener("hashchange", () =>
+	original?.openSection?.(location.hash.slice(1)),
+);
+setInterval(scheduleRender, 10000);
 if (demo) {
-	const sample = await import("./demo.mjs");
+	const sample = original?.demoData ?? (await import("./demo.mjs"));
 	Object.assign(store, {
 		devices: sample.devices,
 		groups: sample.groups,
@@ -1647,3 +1276,19 @@ if (demo) {
 	render();
 	connect();
 }
+
+export {
+	store,
+	command,
+	request,
+	pairing,
+	deviceDetail,
+	groupDetail,
+	groupPage,
+	diagnostics,
+	auth,
+	modal,
+	h,
+	render,
+	connect,
+};

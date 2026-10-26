@@ -1,0 +1,439 @@
+/* Только недостающие формы BMS. Размеры, палитра, движение и шрифты основных HTML не переопределяются. */
+dialog.bms-extra {
+	background: var(--sheet);
+	position: fixed;
+	border: 0;
+	padding: 0;
+	color: var(--label);
+	font-family: var(--sans);
+	max-height: 85dvh;
+	max-width: 560px;
+	width: calc(100vw - 32px);
+	overflow: auto;
+}
+dialog.bms-extra::backdrop {
+	background: var(--scrim);
+	backdrop-filter: blur(6px);
+}
+.bms-extra .dialog-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 16px;
+	border-bottom: 1px solid var(--sep);
+}
+.bms-extra .dialog-head h2 {
+	margin: 0;
+	font-size: 22px;
+	line-height: 28px;
+}
+.bms-extra .dialog-head p {
+	font-size: 13px;
+	color: var(--label2);
+	margin: 6px 0 0;
+	line-height: 18px;
+}
+.bms-extra .icon-button {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	flex: none;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: var(--fill2);
+	color: var(--label2);
+}
+.bms-extra svg {
+	width: 20px;
+	height: 20px;
+	flex: none;
+}
+.bms-extra .dialog-body {
+	padding: 20px 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+.bms-extra .dialog-footer {
+	display: flex;
+	justify-content: flex-end;
+	gap: 10px;
+	padding: 12px 16px;
+	border-top: 1px solid var(--sep);
+	flex-wrap: wrap;
+}
+.bms-extra .button,
+.bms-extra .text-button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	min-height: 44px;
+	border: 0;
+	padding: 0 18px;
+	border-radius: 999px;
+	background: var(--fill2);
+	color: var(--accent);
+	font-size: 15px;
+	line-height: 20px;
+	font-weight: 600;
+	cursor: pointer;
+	transition: transform 0.45s cubic-bezier(0.25, 1.6, 0.4, 1);
+}
+.bms-extra .button:active,
+.bms-extra .text-button:active {
+	transform: scale(0.93);
+}
+.bms-extra .primary {
+	background: var(--accent-fill);
+	color: #fff;
+}
+.bms-extra .danger {
+	color: var(--red);
+}
+.bms-extra .text-button {
+	background: none;
+	padding: 0 6px;
+}
+.bms-extra .control-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	min-height: 62px;
+	padding: 12px 0;
+	border-bottom: 1px solid var(--sep);
+	font-size: 17px;
+}
+.bms-extra fieldset {
+	border: 0;
+	padding: 0;
+	margin: 0;
+	min-width: 0;
+}
+.bms-extra input:not([type="range"]),
+.bms-extra select {
+	min-height: 44px;
+	border: 0;
+	background: var(--grp);
+	color: var(--label);
+	border-radius: 10px;
+	padding: 10px 12px;
+	font-size: 17px;
+	max-width: 100%;
+}
+.bms-extra input:not([type="range"]) {
+	width: 100%;
+}
+.bms-extra .range-wrap {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	max-width: 65%;
+	font-size: 15px;
+}
+.bms-extra .range-wrap input {
+	appearance: none;
+	-webkit-appearance: none;
+	min-width: 80px;
+	width: 100%;
+	height: 8px;
+	border: 0;
+	border-radius: 999px;
+	padding: 0;
+	background: linear-gradient(
+		to right,
+		var(--accent) 0 var(--level, 0%),
+		var(--fill) var(--level, 0%) 100%
+	);
+	cursor: pointer;
+}
+.bms-extra input[type="range"]::-webkit-slider-thumb {
+	appearance: none;
+	width: 28px;
+	height: 28px;
+	border: 0;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow:
+		0 3px 8px #00000026,
+		0 3px 1px #0000000f;
+	transition: transform 0.35s cubic-bezier(0.3, 1.5, 0.45, 1);
+}
+.bms-extra input[type="range"]::-webkit-slider-thumb:active {
+	transform: scale(1.12);
+}
+.bms-extra input[type="range"]::-moz-range-thumb {
+	width: 28px;
+	height: 28px;
+	border: 0;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 3px 8px #00000026;
+}
+.bms-extra .readings,
+.bms-extra .network-card dl {
+	background: var(--grp);
+	border-radius: 12px;
+	padding: 0 16px;
+	margin: 0;
+}
+.bms-extra .readings > div,
+.bms-extra .network-card dl > div {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 12px 0;
+	border-bottom: 1px solid var(--sep);
+	font-size: 15px;
+}
+.bms-extra dt,
+.bms-extra .fine-print,
+.bms-extra .muted {
+	color: var(--label2);
+}
+.bms-extra dd {
+	margin: 0;
+	text-align: right;
+	overflow-wrap: anywhere;
+}
+.bms-extra .fine-print,
+.bms-extra .muted {
+	font-size: 13px;
+	line-height: 18px;
+}
+.bms-extra .dialog-error,
+.bms-extra .form-error {
+	font-size: 13px;
+	color: var(--red);
+	margin: 0 16px 16px;
+}
+.bms-extra .dialog-error:empty {
+	display: none;
+}
+.bms-extra .group-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+.bms-extra .member-list {
+	padding: 0;
+	margin: 0;
+}
+.bms-extra .member-row {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+	padding: 12px 0;
+	border-bottom: 1px solid var(--sep);
+}
+.bms-extra .room-grid {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+.bms-extra .room-card,
+.bms-extra .panel,
+.bms-extra .network-card {
+	background: var(--grp);
+	padding: 16px;
+	border-radius: 12px;
+	margin: 12px 0;
+}
+.bms-extra .room-top,
+.bms-extra .room-footer {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+}
+.bms-extra .room-title {
+	font-size: 20px;
+	line-height: 25px;
+	font-weight: 600;
+	border: 0;
+	background: none;
+	padding: 10px 0;
+	color: var(--label);
+}
+.bms-extra .room-count,
+.bms-extra .room-card p {
+	font-size: 13px;
+	color: var(--label2);
+}
+.bms-extra .room-power {
+	width: 44px;
+	height: 44px;
+	border: 0;
+	border-radius: 50%;
+	background: var(--fill2);
+	color: var(--accent);
+}
+.bms-extra .page-heading h1 {
+	font-size: 22px;
+	margin: 0 0 8px;
+}
+.bms-extra .page-heading p,
+.bms-extra .section-title p {
+	font-size: 13px;
+	color: var(--label2);
+}
+.bms-extra .page-heading .eyebrow {
+	display: none;
+}
+.bms-extra .page-heading .button {
+	margin-top: 12px;
+}
+.bms-extra .network-heading {
+	display: flex;
+	justify-content: space-between;
+}
+.bms-extra .network-card h2,
+.bms-extra .panel h2,
+.bms-extra .section-title h2 {
+	font-size: 18px;
+}
+.bms-extra .diagnostic-item {
+	display: flex;
+	gap: 10px;
+	padding: 12px 0;
+}
+.bms-extra .diagnostic-item p {
+	font-size: 13px;
+	color: var(--label2);
+}
+.bms-extra .event-metrics {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 16px;
+}
+.bms-extra .event-metrics > div {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	font-size: 13px;
+}
+.bms-extra .event-metrics strong {
+	font-family: var(--round);
+	font-size: 28px;
+}
+.bms-extra .mono {
+	font-family: var(--mono);
+	overflow-wrap: anywhere;
+}
+.bms-extra .steps {
+	padding-left: 22px;
+	line-height: 1.6;
+}
+.bms-extra .empty {
+	text-align: center;
+	padding: 20px 8px;
+	font-size: 15px;
+}
+.bms-extra .empty h2 {
+	font-size: 20px;
+}
+.bms-extra .log-panel ol {
+	padding: 0;
+	list-style: none;
+	font-size: 13px;
+}
+.bms-extra .log-panel li {
+	padding: 10px 0;
+	border-bottom: 1px solid var(--sep);
+	overflow-wrap: anywhere;
+}
+.bms-extra .log-panel time {
+	display: block;
+	color: var(--label2);
+}
+.bms-extra .tag {
+	font-size: 13px;
+	color: var(--label2);
+}
+.bms-extra .tag.green {
+	color: var(--green);
+}
+.bms-extra .notice {
+	padding: 12px;
+	border-radius: 10px;
+	background: var(--fill2);
+	font-size: 13px;
+}
+.bms-extra .notice.warning {
+	color: var(--orange);
+}
+#toast:empty {
+	display: none;
+}
+#toast {
+	position: fixed;
+	z-index: 150;
+	bottom: 88px;
+	left: 50%;
+	transform: translateX(-50%) translateY(10px);
+	opacity: 0;
+	pointer-events: none;
+	max-width: calc(100vw - 32px);
+	background: #1c1c1e;
+	color: white;
+	border-radius: 14px;
+	padding: 14px 20px;
+	font:
+		15px / 20px -apple-system,
+		BlinkMacSystemFont,
+		Inter,
+		sans-serif;
+	transition:
+		transform 0.3s cubic-bezier(0.2, 1.1, 0.3, 1),
+		opacity 0.3s;
+}
+#toast.visible {
+	opacity: 1;
+	transform: translateX(-50%);
+}
+.bms-extra button:disabled,
+.bms-extra fieldset:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+.bms-extra :focus-visible {
+	outline: 3px solid var(--accent);
+	outline-offset: 2px;
+}
+.bms-tools a {
+	text-decoration: none;
+}
+@media (max-width: 600px) {
+	dialog.bms-extra {
+		width: 100%;
+		max-width: 100%;
+		margin: 0;
+		inset: auto 0 0;
+		border-radius: 14px 14px 0 0;
+		animation: up 0.5s cubic-bezier(0.2, 1.1, 0.3, 1);
+		padding-bottom: env(safe-area-inset-bottom);
+	}
+	.bms-extra .control-row {
+		flex-wrap: wrap;
+	}
+	.bms-extra .range-wrap {
+		max-width: 100%;
+		width: 100%;
+		padding: 10px 0;
+	}
+	.bms-extra .dialog-head h2 {
+		font-size: 20px;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.bms-extra * {
+		transition-duration: 0.01ms !important;
+		animation-duration: 0.01ms !important;
+	}
+}

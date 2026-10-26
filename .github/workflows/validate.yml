@@ -28,9 +28,11 @@ jobs:
         run: node --test addon/test/*.test.cjs
       - name: Browser checks for BMS UI (isolated WebSocket)
         run: |
-          npm install --prefix addon/.work/browser-check --no-audit --no-fund playwright@1.62.1
-          addon/.work/browser-check/node_modules/.bin/playwright install --with-deps chromium
+          npm install --prefix addon/.work/browser-check --no-audit --no-fund playwright@1.62.1 @biomejs/biome@2.5.11 pngjs@7.0.0 pixelmatch@7.1.0
+          addon/.work/browser-check/node_modules/.bin/biome lint addon/bms_zigbee/rootfs/opt/bms-ui/app.mjs addon/bms_zigbee/rootfs/opt/bms-ui/demo.mjs addon/bms_zigbee/rootfs/opt/bms-ui/network.mjs addon/bms_zigbee/rootfs/opt/bms-ui/reference-adapter.mjs addon/bms_zigbee/rootfs/opt/bms-ui/select-layout.js
+          addon/.work/browser-check/node_modules/.bin/playwright install --with-deps chromium webkit
           NODE_PATH="$PWD/addon/.work/browser-check/node_modules" node addon/test/frontend-browser.cjs
+          BMS_UI_BROWSER=webkit NODE_PATH="$PWD/addon/.work/browser-check/node_modules" node addon/test/frontend-browser.cjs
       - name: Clean core patches, build and tests
         run: bash core/build.sh
       - name: Clean Z2M patches, build and tests
