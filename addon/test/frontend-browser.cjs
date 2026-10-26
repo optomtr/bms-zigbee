@@ -150,6 +150,7 @@ const root = path.resolve(__dirname, '../bms_zigbee/rootfs/opt/bms-ui');
         demoPage.on('websocket',()=>demoSockets++);
         await demoPage.goto(url+'?demo=1');
         await expect(demoPage.getByRole('heading',{name:'Zigbee2MQTT',exact:true})).toBeVisible();
+        await expect(demoPage.locator('#broker-address')).toHaveText('mqtt://demo-broker:1883');
         const shots=process.env.PW_ARTIFACT_DIR;
         if(shots){fs.mkdirSync(shots,{recursive:true});await demoPage.screenshot({path:path.join(shots,'overview-desktop.png'),fullPage:true});}
         await demoPage.setViewportSize({width:390,height:844});

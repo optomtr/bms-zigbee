@@ -918,11 +918,11 @@ function updateDeviceList() {
 					),
 				]),
 	);
-	list
-		.querySelectorAll("[data-live]")
-		.forEach((c) => (c.disabled = !online() || c.dataset.offline === "true"));
+	list.querySelectorAll("[data-live]").forEach((c) => {
+		c.disabled = !online() || c.dataset.offline === "true";
+	});
 }
-function roomCard(g, index = 0) {
+function roomCard(g) {
 	return h(
 		"article",
 		{ class: "room-card" },

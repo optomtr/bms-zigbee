@@ -125,11 +125,11 @@ export const info = {
 	config: {
 		mqtt: { server: "mqtt://demo-broker:1883", base_topic: "zigbee2mqtt" },
 		serial: { adapter: "ember" },
+		advanced: { bms_device_reports: true, transmit_power: 13 },
 	},
 	version: "2.14.2",
 	zigbee_herdsman: { version: "10.10.0-bms.3" },
 	network: { channel: 15 },
-	config: { advanced: { bms_device_reports: true, transmit_power: 13 } },
 	permit_join: false,
 };
 
@@ -141,13 +141,11 @@ export const topology = {
 			friendlyName: "Координатор",
 			type: "Coordinator",
 		},
-		...devices
-			.slice(0, 5)
-			.map((d) => ({
-				ieeeAddr: d.ieee_address,
-				friendlyName: d.friendly_name,
-				type: d.type,
-			})),
+		...devices.slice(0, 5).map((d) => ({
+			ieeeAddr: d.ieee_address,
+			friendlyName: d.friendly_name,
+			type: d.type,
+		})),
 	],
 	links: [
 		{
